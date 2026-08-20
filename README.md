@@ -23,7 +23,7 @@ Prerequisites: Docker Desktop, Python 3.13 + `uv`, Node 22 (pnpm via `corepack e
 docker compose -f infra/docker-compose.yml up -d
 
 # 2. Python API
-uv sync
+uv sync --all-packages
 uv run --package resolvegrid-api alembic -c apps/api/alembic.ini upgrade head
 uv run --package resolvegrid-api uvicorn resolvegrid_api.main:app --reload --app-dir apps/api/src
 
