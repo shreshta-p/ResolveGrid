@@ -1,6 +1,6 @@
 # ResolveGrid
 
-Internal IT service-management + AI-ops platform for the fictional company **Kestrel Softworks, Inc.** — a local-first, production-shaped agentic RAG system with role-aware surfaces, durable human-in-the-loop approvals, and real observability/cost accounting. See `C:\Dev\ResolveGrid\plan.md` for the full specification and `docs/PROGRESS.md` for current build status.
+Internal IT service-management + AI-ops platform for the fictional company **Kestrel Softworks, Inc.** — a local-first, production-shaped agentic RAG system with role-aware surfaces, durable human-in-the-loop approvals, and real observability/cost accounting. See `plan.md` for the full specification and `docs/PROGRESS.md` for current build status.
 
 ## Stack
 

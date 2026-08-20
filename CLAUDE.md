@@ -26,4 +26,4 @@ Lean index only — durable instructions, invariants, and links. Do not duplicat
 - `docs/PROGRESS.md` — the single status ledger
 
 ## Full specification
-`C:\Dev\ResolveGrid\plan.md` — original master spec. `C:\Users\shres\.claude\plans\follow-the-instructions-in-snazzy-sutton.md` — approved architecture/phase plan.
+`plan.md` — original master spec. `docs/PLAN_APPROVED.md` — approved architecture/phase plan.
