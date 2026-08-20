@@ -11,7 +11,7 @@ Lean index only — durable instructions, invariants, and links. Do not duplicat
 
 ## Critical commands
 - `docker compose -f infra/docker-compose.yml up -d` — start local infra
-- `uv sync` — install/sync Python workspace
+- `uv sync --all-packages` — install/sync Python workspace
 - `pnpm install` — install Node workspace (run `corepack enable` once first)
 - `make help` — list all cross-cutting commands
 
