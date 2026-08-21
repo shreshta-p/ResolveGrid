@@ -29,9 +29,9 @@ docker exec resolvegrid-postgres psql -U resolvegrid -d resolvegrid -c "\dt" | g
 echo "== 3/6: FastAPI /health =="
 uv run --package resolvegrid-api uvicorn resolvegrid_api.main:app --app-dir apps/api/src --port 8000 &
 API_PID=$!
+trap 'kill "$API_PID" 2>/dev/null || true' EXIT
 sleep 3
 curl -sf http://localhost:8000/health | grep -q '"status":"ok"'
-kill $API_PID
 
 echo "== 4/6: OTel collector received the startup span =="
 docker compose -f infra/docker-compose.yml logs otel-collector | grep -q "api.startup"
