@@ -9,6 +9,8 @@ config = context.config
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
+# No SQLAlchemy ORM models exist yet, so autogenerate has nothing to diff
+# against. Wire this to Base.metadata once models land (Phase 2+).
 target_metadata = None
 
 database_url = os.environ.get(

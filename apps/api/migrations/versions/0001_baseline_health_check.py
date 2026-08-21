@@ -1,5 +1,9 @@
 """baseline health_check table
 
+Pipeline smoke-test table only, proving Alembic can author and apply
+migrations against the real dockerized Postgres — not real domain schema.
+Real tables land starting Phase 2 (org/identity model).
+
 Revision ID: 0001
 Revises:
 Create Date: 2026-08-20
