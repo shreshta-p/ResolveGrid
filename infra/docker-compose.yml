@@ -1,3 +1,5 @@
+name: resolvegrid
+
 services:
   postgres:
     image: pgvector/pgvector:pg16
@@ -50,6 +52,10 @@ services:
       timeout: 5s
       retries: 10
 
+  # No healthcheck: this image is fully distroless (single "otelcol-contrib" entrypoint
+  # binary, no shell, no wget/curl/nc), so there is no in-container tool to probe with.
+  # This is a deliberate, understood gap, not an oversight -- Task 9's smoke test must
+  # skip health-checking this container by name rather than treat its blank status as ready.
   otel-collector:
     image: otel/opentelemetry-collector-contrib:latest
     container_name: resolvegrid-otel-collector
