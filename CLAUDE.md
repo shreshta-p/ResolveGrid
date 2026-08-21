@@ -23,6 +23,11 @@ Lean index only — durable instructions, invariants, and links. Do not duplicat
 - `docs/EVALUATIONS.md` — golden dataset & grading methodology
 - `docs/TELEMETRY_COST.md` — telemetry/cost schema
 - `docs/SECURITY.md` — threat model
+- `docs/API_CONTRACTS.md` — shared typed tool/event/eval-case schemas
+- `docs/DESIGN_SYSTEM.md` — visual direction, design tokens
+- `docs/EXPERIMENT_REGISTRY.md` — before/after experiment protocol and results
+- `docs/RUNBOOKS.md` — operational runbooks (tool compensation/rollback, etc.)
+- `docs/DECISION_LOG.md` — dated architecture/scope decisions with rationale
 - `docs/PROGRESS.md` — the single status ledger
 
 ## Full specification
