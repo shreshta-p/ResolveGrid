@@ -1,5 +1,7 @@
 packages:
   - "apps/*"
   - "packages/*"
+# unrs-resolver: transitive dep of eslint-config-next's import resolver;
+# postinstall only downloads a prebuilt native binary for the current platform.
 allowBuilds:
   unrs-resolver: true
