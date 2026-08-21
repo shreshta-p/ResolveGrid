@@ -32,7 +32,7 @@ services:
       retries: 10
 
   ollama:
-    image: ollama/ollama:latest
+    image: ollama/ollama:0.32.15
     container_name: resolvegrid-ollama
     restart: unless-stopped
     ports:
@@ -57,7 +57,7 @@ services:
   # This is a deliberate, understood gap, not an oversight -- Task 9's smoke test must
   # skip health-checking this container by name rather than treat its blank status as ready.
   otel-collector:
-    image: otel/opentelemetry-collector-contrib:latest
+    image: otel/opentelemetry-collector-contrib:0.159.0
     container_name: resolvegrid-otel-collector
     restart: unless-stopped
     command: ["--config=/etc/otel-collector-config.yaml"]
