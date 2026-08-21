@@ -9,3 +9,6 @@ members = ["apps/api", "packages/telemetry"]
 
 [tool.uv]
 package = false
+
+[tool.pytest.ini_options]
+addopts = "--import-mode=importlib"
