@@ -12,7 +12,7 @@ import argparse
 import os
 
 from faker import Faker
-from sqlalchemy import create_engine, delete
+from sqlalchemy import create_engine, delete, update
 from sqlalchemy.orm import Session
 
 from resolvegrid_api.models import Department, Employee, Location, RoleAssignment, Team
@@ -35,7 +35,17 @@ def generate_org(session: Session, seed: int, num_employees: int = 75) -> None:
     fake = Faker()
     Faker.seed(seed)
 
-    # Wipe existing rows for idempotency, in FK-safe (child-first) order.
+    if num_employees < 1:
+        raise ValueError("num_employees must be at least 1")
+
+    # Wipe existing rows for idempotency. Team and Employee mutually
+    # reference each other (Employee.team_id -> team.id, Team.lead_employee_id
+    # -> employee.id), so Team.lead_employee_id must be nulled out before
+    # Employee can be safely deleted -- this generator never actually sets
+    # lead_employee_id today, so the update is a no-op in practice, but
+    # without it this delete order breaks the moment any future code
+    # populates a team lead (the same circular FK Task 3 hit on insert).
+    session.execute(update(Team).values(lead_employee_id=None))
     session.execute(delete(RoleAssignment))
     session.execute(delete(Employee))
     session.execute(delete(Team))
