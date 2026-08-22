@@ -24,7 +24,7 @@ done
 echo "== 2/6: alembic migration applied =="
 export DATABASE_URL="postgresql+psycopg://resolvegrid:resolvegrid_dev@localhost:5433/resolvegrid"
 uv run --package resolvegrid-api alembic -c apps/api/alembic.ini upgrade head
-docker exec resolvegrid-postgres psql -U resolvegrid -d resolvegrid -c "\dt" | grep -q health_check
+docker exec resolvegrid-postgres psql -U resolvegrid -d resolvegrid -c "\dt" | grep -q employee
 
 echo "== 3/6: FastAPI /health =="
 uv run --package resolvegrid-api uvicorn resolvegrid_api.main:app --app-dir apps/api/src --port 8000 &
