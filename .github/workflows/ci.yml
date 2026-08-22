@@ -12,14 +12,42 @@ jobs:
   api:
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: resolvegrid
+          POSTGRES_PASSWORD: resolvegrid_dev
+          POSTGRES_DB: resolvegrid
+        ports:
+          - 5433:5432
+        options: >-
+          --health-cmd "pg_isready -U resolvegrid -d resolvegrid"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgresql+psycopg://resolvegrid:resolvegrid_dev@localhost:5433/resolvegrid
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v3
         with:
           version: "0.8.13"
       - run: uv sync --all-packages
+      - run: uv run --package resolvegrid-api alembic -c apps/api/alembic.ini upgrade head
       - run: uv run --package resolvegrid-api pytest apps/api/tests -v
       - run: uv run --package resolvegrid-telemetry pytest packages/telemetry/tests -v
+
+  authz:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v3
+        with:
+          version: "0.8.13"
+      - run: uv sync --all-packages
+      - run: uv run --package resolvegrid-authz pytest packages/authz/tests -v
 
   web:
     runs-on: ubuntu-latest
