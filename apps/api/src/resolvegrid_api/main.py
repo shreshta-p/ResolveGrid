@@ -5,6 +5,8 @@ from fastapi import FastAPI
 from opentelemetry import trace
 from resolvegrid_telemetry import init_tracing
 
+from resolvegrid_api.routers import directory
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
@@ -18,6 +20,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
 
 app = FastAPI(title="ResolveGrid API", lifespan=lifespan)
+app.include_router(directory.router)
 
 
 @app.get("/health")

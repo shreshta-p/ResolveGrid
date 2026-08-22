@@ -7,6 +7,7 @@ dependencies = [
     "fastapi>=0.115",
     "uvicorn[standard]>=0.32",
     "resolvegrid-telemetry",
+    "resolvegrid-authz",
     "alembic>=1.13",
     "psycopg[binary]>=3.2",
     "sqlalchemy>=2.0",
@@ -14,6 +15,7 @@ dependencies = [
 
 [tool.uv.sources]
 resolvegrid-telemetry = { workspace = true }
+resolvegrid-authz = { workspace = true }
 
 [dependency-groups]
 dev = [
