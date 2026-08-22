@@ -4,14 +4,14 @@ from logging.config import fileConfig
 from alembic import context
 from sqlalchemy import engine_from_config, pool
 
+from resolvegrid_api.models import Base
+
 config = context.config
 
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
-# No SQLAlchemy ORM models exist yet, so autogenerate has nothing to diff
-# against. Wire this to Base.metadata once models land (Phase 2+).
-target_metadata = None
+target_metadata = Base.metadata
 
 database_url = os.environ.get(
     "DATABASE_URL",
