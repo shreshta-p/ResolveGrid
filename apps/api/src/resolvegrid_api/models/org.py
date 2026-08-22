@@ -49,7 +49,9 @@ class Employee(Base):
     timezone: Mapped[str]
     location_id: Mapped[int | None] = mapped_column(ForeignKey("location.id"))
     department_id: Mapped[int | None] = mapped_column(ForeignKey("department.id"))
-    team_id: Mapped[int | None] = mapped_column(ForeignKey("team.id"))
+    team_id: Mapped[int | None] = mapped_column(
+        ForeignKey("team.id", use_alter=True, name="fk_employee_team_id_team")
+    )
     manager_id: Mapped[int | None] = mapped_column(ForeignKey("employee.id"))
 
     manager: Mapped["Employee | None"] = relationship(remote_side=[id])
