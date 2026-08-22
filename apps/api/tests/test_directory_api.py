@@ -103,3 +103,24 @@ def test_get_single_employee_respects_authorization(seeded_departments):
     # ...but not admin.
     response = client.get(f"/directory/employees/{admin.id}", headers={"X-Debug-Employee-Id": str(plain_b.id)})
     assert response.status_code == 403
+
+
+def test_reports_endpoint_rejects_manager_outside_scope(seeded_departments):
+    admin, analyst_a, plain_b, dept_a, dept_b = seeded_departments
+    # analyst_a is scoped to dept_a; plain_b is in dept_b. analyst_a must not
+    # be able to list plain_b's reports (plain_b is outside analyst_a's scope),
+    # regardless of whether plain_b happens to have any reports.
+    response = client.get(
+        f"/directory/employees/{plain_b.id}/reports",
+        headers={"X-Debug-Employee-Id": str(analyst_a.id)},
+    )
+    assert response.status_code == 403
+
+
+def test_reports_endpoint_404s_nonexistent_manager(seeded_departments):
+    admin, _, _, _, _ = seeded_departments
+    response = client.get(
+        "/directory/employees/999999999/reports",
+        headers={"X-Debug-Employee-Id": str(admin.id)},
+    )
+    assert response.status_code == 404

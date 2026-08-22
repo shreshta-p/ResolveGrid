@@ -59,6 +59,7 @@ class Employee(Base):
 
 class RoleAssignment(Base):
     __tablename__ = "role_assignment"
+    __table_args__ = (Index("ix_role_assignment_employee_id", "employee_id"),)
 
     id: Mapped[int] = mapped_column(primary_key=True)
     employee_id: Mapped[int] = mapped_column(ForeignKey("employee.id"))

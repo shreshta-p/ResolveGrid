@@ -85,6 +85,12 @@ def list_direct_reports(
     if not decision.allowed:
         raise HTTPException(status_code=403, detail=decision.reason)
 
+    manager = session.get(Employee, employee_id)
+    if manager is None:
+        raise HTTPException(status_code=404, detail="employee not found")
+    if not _in_scope(decision, manager):
+        raise HTTPException(status_code=403, detail="not authorized to view this employee's reports")
+
     query = _apply_scope(select(Employee).where(Employee.manager_id == employee_id), decision)
     reports = session.scalars(query).all()
     return [_employee_to_dict(e) for e in reports]
