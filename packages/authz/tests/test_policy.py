@@ -2,38 +2,85 @@ from resolvegrid_authz import Principal, RoleGrant, authorize
 
 
 def test_admin_has_unrestricted_access():
-    principal = Principal(employee_id=1, roles=[RoleGrant(role="admin", scope="global")])
+    principal = Principal(employee_id=1, roles=(RoleGrant(role="admin", scope="global"),))
     decision = authorize(principal, "directory.list_employees")
     assert decision.allowed is True
-    assert decision.filter == {}
+    assert decision.department_ids is None
+    assert decision.employee_id is None
 
 
 def test_analyst_is_restricted_to_own_department():
     principal = Principal(
-        employee_id=2, roles=[RoleGrant(role="analyst", scope="department", scope_id=5)]
+        employee_id=2, roles=(RoleGrant(role="analyst", scope="department", scope_id=5),)
     )
     decision = authorize(principal, "directory.list_employees")
     assert decision.allowed is True
-    assert decision.filter == {"department_id": 5}
+    assert decision.department_ids == (5,)
 
 
 def test_approver_is_restricted_to_own_department():
     principal = Principal(
-        employee_id=3, roles=[RoleGrant(role="approver", scope="department", scope_id=9)]
+        employee_id=3, roles=(RoleGrant(role="approver", scope="department", scope_id=9),)
     )
     decision = authorize(principal, "directory.list_employees")
     assert decision.allowed is True
-    assert decision.filter == {"department_id": 9}
+    assert decision.department_ids == (9,)
 
 
 def test_employee_with_no_role_grant_sees_only_self():
-    principal = Principal(employee_id=7, roles=[])
+    principal = Principal(employee_id=7, roles=())
     decision = authorize(principal, "directory.list_employees")
     assert decision.allowed is True
-    assert decision.filter == {"employee_id": 7}
+    assert decision.employee_id == 7
 
 
 def test_unknown_action_is_denied():
-    principal = Principal(employee_id=1, roles=[RoleGrant(role="admin", scope="global")])
+    principal = Principal(employee_id=1, roles=(RoleGrant(role="admin", scope="global"),))
     decision = authorize(principal, "directory.delete_everything")
     assert decision.allowed is False
+
+
+def test_admin_grant_dominates_regardless_of_order():
+    principal = Principal(
+        employee_id=4,
+        roles=(
+            RoleGrant(role="analyst", scope="department", scope_id=5),
+            RoleGrant(role="admin", scope="global"),
+        ),
+    )
+    decision = authorize(principal, "directory.list_employees")
+    assert decision.allowed is True
+    assert decision.department_ids is None
+    assert decision.employee_id is None
+
+
+def test_multiple_department_grants_are_all_included():
+    principal = Principal(
+        employee_id=6,
+        roles=(
+            RoleGrant(role="analyst", scope="department", scope_id=5),
+            RoleGrant(role="approver", scope="department", scope_id=9),
+        ),
+    )
+    decision = authorize(principal, "directory.list_employees")
+    assert decision.allowed is True
+    assert decision.department_ids == (5, 9)
+
+
+def test_department_grant_with_missing_scope_id_is_ignored_not_unrestricted():
+    principal = Principal(
+        employee_id=8, roles=(RoleGrant(role="analyst", scope="department", scope_id=None),)
+    )
+    decision = authorize(principal, "directory.list_employees")
+    assert decision.allowed is True
+    assert decision.department_ids is None
+    assert decision.employee_id == 8
+
+
+def test_admin_grant_with_wrong_scope_is_ignored():
+    principal = Principal(
+        employee_id=9, roles=(RoleGrant(role="admin", scope="department", scope_id=3),)
+    )
+    decision = authorize(principal, "directory.list_employees")
+    assert decision.allowed is True
+    assert decision.employee_id == 9

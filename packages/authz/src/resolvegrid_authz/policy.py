@@ -1,4 +1,4 @@
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 
 @dataclass(frozen=True)
@@ -11,46 +11,69 @@ class RoleGrant:
 @dataclass(frozen=True)
 class Principal:
     employee_id: int
-    roles: list[RoleGrant] = field(default_factory=list)
+    roles: tuple[RoleGrant, ...] = ()
 
 
 @dataclass(frozen=True)
 class Decision:
     allowed: bool
     reason: str
-    filter: dict[str, int] = field(default_factory=dict)
+    department_ids: tuple[int, ...] | None = None  # None = no department restriction
+    employee_id: int | None = None  # non-None = restrict to this single employee
 
 
 _KNOWN_ACTIONS = {"directory.list_employees", "directory.view_employee"}
 
 
-def authorize(
-    principal: Principal, action: str, department_id: int | None = None
-) -> Decision:
+def authorize(principal: Principal, action: str) -> Decision:
     """Authorize a directory action for a principal.
 
-    Returns a Decision whose `filter` narrows what the caller may see:
-    - {} means no restriction.
-    - {"department_id": N} restricts results to department N.
-    - {"employee_id": N} restricts results to a single employee (self only).
+    Returns the principal's allowed access SET:
+    - department_ids is None and employee_id is None: unrestricted (admin).
+    - department_ids is a non-empty tuple: restricted to those departments.
+    - employee_id is set (department_ids is None): restricted to that single
+      employee (self-view only).
 
-    This is the single, centralized policy entry point -- callers (API routes,
-    future tool/retrieval nodes) must never re-implement authorization logic
-    inline. See docs/adr/0001-modular-monolith-topology.md Decision C.
+    Callers are responsible for checking the SPECIFIC resource they're about
+    to return against this Decision (e.g. "is this employee's department_id
+    in decision.department_ids, or does this employee's id match
+    decision.employee_id") -- authorize() computes the allowed set, it has no
+    knowledge of any specific resource instance. Every caller must perform
+    that membership check, not just the ones that happen to remember to.
+
+    Admin dominates regardless of how many other grants a principal holds or
+    what order they were loaded in -- grant order from a database query is
+    NOT guaranteed. A department-scoped grant with a missing scope_id is
+    ignored (not treated as unrestricted) -- a misconfigured grant must never
+    silently escalate to broader access.
+
+    This is the single, centralized policy entry point -- callers (API
+    routes, future tool/retrieval nodes) must never re-implement
+    authorization logic inline. See
+    docs/adr/0001-modular-monolith-topology.md.
     """
     if action not in _KNOWN_ACTIONS:
         return Decision(allowed=False, reason=f"unknown action: {action}")
 
-    for grant in principal.roles:
-        if grant.role == "admin" and grant.scope == "global":
-            return Decision(allowed=True, reason="admin: global access")
-        if grant.role in ("analyst", "approver") and grant.scope == "department":
-            if department_id is None or department_id == grant.scope_id:
-                filter_ = {"department_id": grant.scope_id} if grant.scope_id is not None else {}
-                return Decision(allowed=True, reason=f"{grant.role}: department-scoped access", filter=filter_)
+    if any(g.role == "admin" and g.scope == "global" for g in principal.roles):
+        return Decision(allowed=True, reason="admin: global access")
+
+    department_ids = tuple(
+        sorted(
+            {
+                g.scope_id
+                for g in principal.roles
+                if g.role in ("analyst", "approver")
+                and g.scope == "department"
+                and g.scope_id is not None
+            }
+        )
+    )
+    if department_ids:
+        return Decision(allowed=True, reason="department-scoped access", department_ids=department_ids)
 
     return Decision(
         allowed=True,
         reason="default: no matching role grant, self-view only",
-        filter={"employee_id": principal.employee_id},
+        employee_id=principal.employee_id,
     )
