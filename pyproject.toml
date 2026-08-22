@@ -5,7 +5,7 @@ requires-python = ">=3.13"
 dependencies = []
 
 [tool.uv.workspace]
-members = ["apps/api", "packages/telemetry", "packages/authz"]
+members = ["apps/api", "packages/telemetry", "packages/authz", "packages/contracts"]
 
 [tool.uv]
 package = false
