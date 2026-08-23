@@ -59,3 +59,28 @@ def test_verify_chain_integrity_false_if_a_row_is_tampered(db_session):
     db_session.flush()
 
     assert verify_chain_integrity(db_session) is False
+
+
+def test_metadata_round_trips(db_session):
+    actor_id = _make_employee(db_session, "audit-test-6@example.test")
+    entry = record_audit_event(
+        db_session, actor_type="employee", actor_id=actor_id, action="ticket.create",
+        entity_type="ticket", entity_id=1, metadata={"ip": "10.0.0.1"},
+    )
+    assert entry.metadata_json == '{"ip": "10.0.0.1"}'
+
+
+def test_verify_chain_integrity_false_if_metadata_is_tampered(db_session):
+    actor_id = _make_employee(db_session, "audit-test-7@example.test")
+    tampered = record_audit_event(
+        db_session, actor_type="employee", actor_id=actor_id, action="ticket.create",
+        entity_type="ticket", entity_id=1, metadata={"ip": "10.0.0.1"},
+    )
+
+    # Simulate tampering with ONLY the metadata field -- before this fix,
+    # this went completely undetected since metadata_json wasn't part of
+    # the hashed payload at all.
+    tampered.metadata_json = '{"ip": "6.6.6.6"}'
+    db_session.flush()
+
+    assert verify_chain_integrity(db_session) is False

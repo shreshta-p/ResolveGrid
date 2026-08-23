@@ -32,6 +32,7 @@ def _compute_record_hash(
     entity_id: int,
     before_json: str | None,
     after_json: str | None,
+    metadata_json: str | None,
 ) -> str:
     payload = json.dumps(
         {
@@ -43,6 +44,7 @@ def _compute_record_hash(
             "entity_id": entity_id,
             "before_json": before_json,
             "after_json": after_json,
+            "metadata_json": metadata_json,
         },
         sort_keys=True,
     )
@@ -69,7 +71,7 @@ def record_audit_event(
     metadata_json = json.dumps(metadata, sort_keys=True) if metadata is not None else None
 
     record_hash = _compute_record_hash(
-        previous_hash, actor_type, actor_id, action, entity_type, entity_id, before_json, after_json
+        previous_hash, actor_type, actor_id, action, entity_type, entity_id, before_json, after_json, metadata_json
     )
 
     entry = AuditLog(
@@ -91,13 +93,20 @@ def record_audit_event(
 
 def verify_chain_integrity(session: Session) -> bool:
     """Recompute every row's hash from its stored fields and confirm the
-    chain is unbroken."""
+    chain is unbroken.
+
+    Loads the entire audit_log table into memory -- fine for Phase 3's
+    walking-skeleton scope, but will need incremental/checkpointed
+    verification (verify only rows after a last-known-good point) once row
+    counts grow large in a real deployment.
+    """
     rows = session.scalars(select(AuditLog).order_by(AuditLog.id.asc())).all()
     previous_hash: str | None = None
     for row in rows:
         expected_hash = _compute_record_hash(
             previous_hash, row.actor_type, row.actor_id, row.action,
             row.entity_type, row.entity_id, row.before_json, row.after_json,
+            row.metadata_json,
         )
         if row.previous_record_hash != previous_hash:
             return False
