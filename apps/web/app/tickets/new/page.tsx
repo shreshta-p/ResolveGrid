@@ -22,13 +22,21 @@ export default function NewTicketPage() {
     e.preventDefault();
     setError(null);
     setResult(null);
-    const response = await apiFetch("/tickets", {
-      method: "POST",
-      body: JSON.stringify({ subject, body, type, queue_id: Number(queueId) }),
-    });
+    let response: Response;
+    try {
+      response = await apiFetch("/tickets", {
+        method: "POST",
+        body: JSON.stringify({ subject, body, type, queue_id: Number(queueId) }),
+      });
+    } catch {
+      setError("Network error: could not reach the API. Is it running?");
+      return;
+    }
     if (!response.ok) {
       const detail = await response.json().catch(() => ({}));
-      setError(`Error ${response.status}: ${detail.detail ?? "request failed"}`);
+      const message =
+        typeof detail.detail === "string" ? detail.detail : JSON.stringify(detail.detail ?? "request failed");
+      setError(`Error ${response.status}: ${message}`);
       return;
     }
     const ticket = await response.json();
