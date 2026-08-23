@@ -14,9 +14,13 @@ interface TicketDetail {
   assignee_id: number | null;
 }
 
+// Keep in sync with ALLOWED_TRANSITIONS in
+// packages/contracts/src/resolvegrid_contracts/tickets.py -- the backend is
+// the single source of truth and is the actual enforcement point; this map
+// only controls which buttons render.
 const NEXT_STATUS_OPTIONS: Record<string, string[]> = {
   open: ["in_progress", "closed"],
-  in_progress: ["resolved", "open"],
+  in_progress: ["resolved", "open", "closed"],
   resolved: ["closed", "reopened"],
   closed: ["reopened"],
   reopened: ["in_progress", "closed"],
