@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from sqlalchemy import ForeignKey, func
+from sqlalchemy import ForeignKey, Index, func
 from sqlalchemy.orm import Mapped, mapped_column
 
 from resolvegrid_api.models.base import Base
@@ -17,6 +17,11 @@ class Queue(Base):
 
 class Ticket(Base):
     __tablename__ = "ticket"
+    __table_args__ = (
+        Index("ix_ticket_queue_id", "queue_id"),
+        Index("ix_ticket_requester_id", "requester_id"),
+        Index("ix_ticket_assignee_id", "assignee_id"),
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True)
     subject: Mapped[str]
@@ -35,6 +40,7 @@ class Ticket(Base):
 
 class TicketMessage(Base):
     __tablename__ = "ticket_message"
+    __table_args__ = (Index("ix_ticket_message_ticket_id", "ticket_id"),)
 
     id: Mapped[int] = mapped_column(primary_key=True)
     ticket_id: Mapped[int] = mapped_column(ForeignKey("ticket.id"))
@@ -46,6 +52,7 @@ class TicketMessage(Base):
 
 class TicketStateTransition(Base):
     __tablename__ = "ticket_state_transition"
+    __table_args__ = (Index("ix_ticket_state_transition_ticket_id", "ticket_id"),)
 
     id: Mapped[int] = mapped_column(primary_key=True)
     ticket_id: Mapped[int] = mapped_column(ForeignKey("ticket.id"))
