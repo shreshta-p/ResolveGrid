@@ -1,3 +1,5 @@
+from sqlalchemy import select
+
 from resolvegrid_api.audit import record_audit_event, verify_chain_integrity
 from resolvegrid_api.models import AuditLog, Employee
 
@@ -14,13 +16,26 @@ def _make_employee(db_session, email: str) -> int:
     return employee.id
 
 
-def test_first_event_has_no_previous_hash(db_session):
+def test_new_event_chains_to_whatever_was_previously_last(db_session):
+    # Deliberately does NOT assume the table starts empty: apps/api's own
+    # committed AuditLog rows are permanent (append-only, no cascade delete --
+    # see resolvegrid_api.audit's module docstring and
+    # resolvegrid_api.seed.generate_org's protection logic), so a local dev
+    # database that has real prior ticket activity will NOT have an empty
+    # audit_log table even though this test's own db_session fixture rolls
+    # back everything IT writes. Capture whatever the actual previous state
+    # is first, then assert the new entry correctly chains from it -- this
+    # is correct whether that baseline is None (a genuinely fresh table, e.g.
+    # in CI) or a real hash (a local dev DB with prior history).
+    baseline = db_session.scalars(select(AuditLog).order_by(AuditLog.id.desc()).limit(1)).first()
+    baseline_hash = baseline.record_hash if baseline is not None else None
+
     actor_id = _make_employee(db_session, "audit-test-1@example.test")
     entry = record_audit_event(
         db_session, actor_type="employee", actor_id=actor_id, action="ticket.create",
         entity_type="ticket", entity_id=1, after={"subject": "VPN down"},
     )
-    assert entry.previous_record_hash is None
+    assert entry.previous_record_hash == baseline_hash
     assert entry.record_hash is not None
 
 
