@@ -6,6 +6,14 @@ ADR), so an in-memory sliding window is sufficient and avoids introducing a
 Redis dependency into apps/api before anything actually needs it. Revisit
 (Redis-backed, shared across workers) once apps/api runs as more than one
 process.
+
+Known gap (documented, not fixed here): _request_log's keys are never
+evicted, only pruned by timestamp within each key's list. Combined with
+X-Debug-Employee-Id being caller-controlled and unauthenticated (see
+deps.py), a caller sending a fresh random employee_id on every request both
+defeats the rate limit and grows this dict unboundedly. Not worth solving
+independently of the auth shim it depends on -- fix alongside replacing
+X-Debug-Employee-Id with real authentication, not before.
 """
 
 import time

@@ -23,6 +23,13 @@ def _ticket_to_dict(ticket: Ticket) -> dict:
         "queue_id": ticket.queue_id,
         "requester_id": ticket.requester_id,
         "assignee_id": ticket.assignee_id,
+        # ISO strings, not raw datetimes: this dict is also passed straight
+        # into record_audit_event()'s before/after payload, which json.dumps
+        # with the plain stdlib encoder (no datetime support) -- a raw
+        # datetime here raises TypeError inside the audit call, not in
+        # FastAPI's own (datetime-aware) response serialization.
+        "created_at": ticket.created_at.isoformat() if ticket.created_at else None,
+        "updated_at": ticket.updated_at.isoformat() if ticket.updated_at else None,
     }
 
 
