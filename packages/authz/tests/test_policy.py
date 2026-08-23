@@ -84,3 +84,36 @@ def test_admin_grant_with_wrong_scope_is_ignored():
     decision = authorize(principal, "directory.list_employees")
     assert decision.allowed is True
     assert decision.employee_id == 9
+
+
+def test_ticket_list_is_self_scoped_for_employee_with_no_grant():
+    principal = Principal(employee_id=10, roles=())
+    decision = authorize(principal, "ticket.list")
+    assert decision.allowed is True
+    assert decision.employee_id == 10
+
+
+def test_ticket_view_is_department_scoped_for_analyst():
+    principal = Principal(employee_id=11, roles=(RoleGrant(role="analyst", scope="department", scope_id=3),))
+    decision = authorize(principal, "ticket.view")
+    assert decision.allowed is True
+    assert decision.department_ids == (3,)
+
+
+def test_ticket_transition_denied_for_plain_employee():
+    principal = Principal(employee_id=12, roles=())
+    decision = authorize(principal, "ticket.transition")
+    assert decision.allowed is False
+
+
+def test_ticket_transition_allowed_for_department_scoped_analyst():
+    principal = Principal(employee_id=13, roles=(RoleGrant(role="analyst", scope="department", scope_id=4),))
+    decision = authorize(principal, "ticket.transition")
+    assert decision.allowed is True
+    assert decision.department_ids == (4,)
+
+
+def test_ticket_transition_allowed_for_admin():
+    principal = Principal(employee_id=14, roles=(RoleGrant(role="admin", scope="global"),))
+    decision = authorize(principal, "ticket.transition")
+    assert decision.allowed is True

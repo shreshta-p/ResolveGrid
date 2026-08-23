@@ -22,30 +22,44 @@ class Decision:
     employee_id: int | None = None  # non-None = restrict to this single employee
 
 
-_KNOWN_ACTIONS = {"directory.list_employees", "directory.view_employee"}
+# Actions where a principal with no matching role grant still gets a
+# self-scoped Decision (they may see/act on their OWN resources).
+_SELF_SCOPED_ACTIONS = {
+    "directory.list_employees",
+    "directory.view_employee",
+    "ticket.list",
+    "ticket.view",
+}
+# Actions that require an actual staff/admin grant -- a principal with no
+# matching grant is DENIED outright, never silently downgraded to self-scope
+# (e.g. a plain employee must never be able to transition ticket status).
+_STAFF_ONLY_ACTIONS = {"ticket.transition"}
+
+_KNOWN_ACTIONS = _SELF_SCOPED_ACTIONS | _STAFF_ONLY_ACTIONS
 
 
 def authorize(principal: Principal, action: str) -> Decision:
-    """Authorize a directory action for a principal.
+    """Authorize an action for a principal.
 
     Returns the principal's allowed access SET:
     - department_ids is None and employee_id is None: unrestricted (admin).
-    - department_ids is a non-empty tuple: restricted to those departments.
+    - department_ids is a non-empty tuple: restricted to resources scoped to
+      those departments (employees in that department, or tickets whose
+      Queue.department_id is in that set -- callers interpret the tuple
+      against whatever resource they're authorizing).
     - employee_id is set (department_ids is None): restricted to that single
-      employee (self-view only).
+      employee's own resources (self-view, or tickets they themselves filed).
 
     Callers are responsible for checking the SPECIFIC resource they're about
-    to return against this Decision (e.g. "is this employee's department_id
-    in decision.department_ids, or does this employee's id match
-    decision.employee_id") -- authorize() computes the allowed set, it has no
-    knowledge of any specific resource instance. Every caller must perform
-    that membership check, not just the ones that happen to remember to.
+    to return against this Decision -- authorize() computes the allowed set,
+    it has no knowledge of any specific resource instance.
 
-    Admin dominates regardless of how many other grants a principal holds or
-    what order they were loaded in -- grant order from a database query is
-    NOT guaranteed. A department-scoped grant with a missing scope_id is
-    ignored (not treated as unrestricted) -- a misconfigured grant must never
-    silently escalate to broader access.
+    Admin dominates regardless of grant order (grant order from a database
+    query is NOT guaranteed). A department-scoped grant with a missing
+    scope_id is ignored (not treated as unrestricted) -- a misconfigured
+    grant must never silently escalate to broader access. Staff-only actions
+    (see _STAFF_ONLY_ACTIONS) are denied outright for principals with no
+    admin/department grant, never downgraded to a self-scoped Decision.
 
     This is the single, centralized policy entry point -- callers (API
     routes, future tool/retrieval nodes) must never re-implement
@@ -71,6 +85,9 @@ def authorize(principal: Principal, action: str) -> Decision:
     )
     if department_ids:
         return Decision(allowed=True, reason="department-scoped access", department_ids=department_ids)
+
+    if action in _STAFF_ONLY_ACTIONS:
+        return Decision(allowed=False, reason="requires an admin or department-scoped analyst/approver grant")
 
     return Decision(
         allowed=True,
