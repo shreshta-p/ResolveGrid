@@ -5,17 +5,29 @@ from resolvegrid_api.seed import generate_org
 
 
 def test_seed_is_deterministic_and_idempotent(raw_db_session):
+    # generate_org() deliberately preserves any employee already referenced by
+    # a real AuditLog row rather than wiping it (see seed.py's docstring on
+    # generate_org) -- so this test must not assume the employee table starts
+    # empty. A local dev DB that has real prior ticket activity (e.g. from
+    # test_tickets_api.py's own committed fixture) will not be empty even
+    # though raw_db_session itself doesn't roll back. Capture whatever's
+    # already there as a baseline and assert determinism over the newly
+    # generated population, not the raw total row count.
+    baseline_emails = set(raw_db_session.scalars(select(Employee.email)).all())
+
     generate_org(raw_db_session, seed=123, num_employees=20)
     first_emails = raw_db_session.scalars(select(Employee.email).order_by(Employee.id)).all()
+    first_generated = [e for e in first_emails if e not in baseline_emails]
     first_role_count = raw_db_session.scalar(select(func.count()).select_from(RoleAssignment))
 
     # Re-running with the same seed must wipe and reproduce identical data.
     generate_org(raw_db_session, seed=123, num_employees=20)
     second_emails = raw_db_session.scalars(select(Employee.email).order_by(Employee.id)).all()
+    second_generated = [e for e in second_emails if e not in baseline_emails]
     second_role_count = raw_db_session.scalar(select(func.count()).select_from(RoleAssignment))
 
-    assert len(first_emails) == 20
-    assert first_emails == second_emails
+    assert len(first_generated) == 20
+    assert first_generated == second_generated
     assert first_role_count == second_role_count
     assert first_role_count == 4  # manager_pool_size (20 // 5) role assignments: 1 admin + 3 dept-scoped
 

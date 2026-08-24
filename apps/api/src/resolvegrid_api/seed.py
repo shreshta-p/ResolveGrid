@@ -12,10 +12,10 @@ import argparse
 import os
 
 from faker import Faker
-from sqlalchemy import create_engine, delete, update
+from sqlalchemy import create_engine, delete, select, update
 from sqlalchemy.orm import Session
 
-from resolvegrid_api.models import Department, Employee, Location, RoleAssignment, Team
+from resolvegrid_api.models import AuditLog, Department, Employee, Location, RoleAssignment, Team
 
 DATABASE_URL = os.environ.get(
     "DATABASE_URL",
@@ -38,19 +38,49 @@ def generate_org(session: Session, seed: int, num_employees: int = 75) -> None:
     if num_employees < 1:
         raise ValueError("num_employees must be at least 1")
 
-    # Wipe existing rows for idempotency. Team and Employee mutually
-    # reference each other (Employee.team_id -> team.id, Team.lead_employee_id
-    # -> employee.id), so Team.lead_employee_id must be nulled out before
-    # Employee can be safely deleted -- this generator never actually sets
-    # lead_employee_id today, so the update is a no-op in practice, but
-    # without it this delete order breaks the moment any future code
-    # populates a team lead (the same circular FK Task 3 hit on insert).
+    # Wipe existing rows for idempotency -- except any Employee already
+    # referenced by a real AuditLog row (audit_log.actor_id has no cascade;
+    # the log is append-only/tamper-evident by design, so such a row can
+    # never be deleted -- see apps/api/src/resolvegrid_api/audit.py). This
+    # only happens today via apps/api/tests/test_tickets_api.py's fixture,
+    # which commits real ticket/audit activity for two dedicated employees
+    # under their own dedicated department/location, so also protect the
+    # small closure of rows that would otherwise dangle: those employees'
+    # department_id/location_id/team_id. This is a narrow, targeted fix, not
+    # a general transitive-closure solver -- e.g. it does not need to protect
+    # manager_id chains, since no protected employee here ever has one set.
+    protected_employee_ids = set(
+        session.execute(select(AuditLog.actor_id).where(AuditLog.actor_id.isnot(None)).distinct()).scalars()
+    )
+    protected_department_ids: set[int] = set()
+    protected_location_ids: set[int] = set()
+    protected_team_ids: set[int] = set()
+    if protected_employee_ids:
+        for dept_id, loc_id, team_id in session.execute(
+            select(Employee.department_id, Employee.location_id, Employee.team_id).where(
+                Employee.id.in_(protected_employee_ids)
+            )
+        ):
+            if dept_id is not None:
+                protected_department_ids.add(dept_id)
+            if loc_id is not None:
+                protected_location_ids.add(loc_id)
+            if team_id is not None:
+                protected_team_ids.add(team_id)
+
+    # Team and Employee mutually reference each other (Employee.team_id ->
+    # team.id, Team.lead_employee_id -> employee.id), so Team.lead_employee_id
+    # must be nulled out before Employee can be safely deleted -- this
+    # generator never actually sets lead_employee_id today, so the update is
+    # a no-op in practice, but without it this delete order breaks the moment
+    # any future code populates a team lead (the same circular FK Task 3 hit
+    # on insert).
     session.execute(update(Team).values(lead_employee_id=None))
     session.execute(delete(RoleAssignment))
-    session.execute(delete(Employee))
-    session.execute(delete(Team))
-    session.execute(delete(Department))
-    session.execute(delete(Location))
+    session.execute(delete(Employee).where(Employee.id.notin_(protected_employee_ids)))
+    session.execute(delete(Team).where(Team.id.notin_(protected_team_ids)))
+    session.execute(delete(Department).where(Department.id.notin_(protected_department_ids)))
+    session.execute(delete(Location).where(Location.id.notin_(protected_location_ids)))
     session.flush()
 
     locations = [Location(name=n, region=r, timezone=tz) for n, r, tz in _LOCATIONS]
