@@ -63,3 +63,14 @@ jobs:
       - run: pnpm --filter @resolvegrid/web lint
       - run: pnpm --filter @resolvegrid/web typecheck
       - run: pnpm --filter @resolvegrid/web build
+
+  contracts:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v3
+        with:
+          version: "0.8.13"
+      - run: uv sync --all-packages
+      - run: uv run --package resolvegrid-contracts pytest packages/contracts/tests -v
