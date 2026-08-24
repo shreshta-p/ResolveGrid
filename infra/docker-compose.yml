@@ -13,6 +13,7 @@ services:
       - "5433:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
+      - ./postgres/init-litellm-db.sh:/docker-entrypoint-initdb.d/init-litellm-db.sh:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-resolvegrid} -d ${POSTGRES_DB:-resolvegrid}"]
       interval: 5s
@@ -74,7 +75,13 @@ services:
     ports:
       - "4000:4000"
     environment:
-      DATABASE_URL: postgresql://${POSTGRES_USER:-resolvegrid}:${POSTGRES_PASSWORD:-resolvegrid_dev}@postgres:5432/${POSTGRES_DB:-resolvegrid}
+      # A DEDICATED database, not resolvegrid -- LiteLLM's Prisma startup
+      # baselines against whatever database it's pointed at and will DROP any
+      # table it doesn't recognize if that database already has a schema with
+      # no _prisma_migrations table (exactly what apps/api's Alembic-managed
+      # database looks like). This actually happened once during development
+      # -- see infra/postgres/init-litellm-db.sh for the full incident note.
+      DATABASE_URL: postgresql://${POSTGRES_USER:-resolvegrid}:${POSTGRES_PASSWORD:-resolvegrid_dev}@postgres:5432/litellm
       LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY:-sk-resolvegrid-local-dev}
     volumes:
       - ./litellm/config.yaml:/app/config.yaml:ro
