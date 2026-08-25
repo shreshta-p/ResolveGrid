@@ -215,6 +215,17 @@ def summarize_ticket(
 
         span.set_attribute("gen_ai.usage.input_tokens", result.input_tokens)
         span.set_attribute("gen_ai.usage.output_tokens", result.output_tokens)
+        # "gen_ai.response.model" is the currently-installed OTel GenAI
+        # semconv name for the model that actually served the response (see
+        # opentelemetry.semconv._incubating.attributes.gen_ai_attributes.
+        # GEN_AI_RESPONSE_MODEL) -- flagged deprecated-in-favor-of-the-
+        # standalone genai-semconv-repo in that module's docstring, but it's
+        # still the only "response model" constant this installed package
+        # ships, so it's the correct name to emit today. Only set when a
+        # fallback (or any distinct serving model group) actually occurred;
+        # a non-fallback call already has the request model on this span.
+        if result.serving_model_group:
+            span.set_attribute("gen_ai.response.model", result.serving_model_group)
 
     pricing = _current_pricing_version(session, result.provider, result.model)
     if pricing is not None:
@@ -230,6 +241,7 @@ def summarize_ticket(
         pricing_version_id=pricing.id if pricing is not None else None,
         input_tokens=result.input_tokens, output_tokens=result.output_tokens,
         latency_ms=result.latency_ms, estimated_cost_usd=estimated_cost_usd, status="success",
+        fallback_occurred=result.fallback_occurred, serving_model_group=result.serving_model_group,
     )
     session.add(call)
     session.commit()

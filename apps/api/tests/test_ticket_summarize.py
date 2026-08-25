@@ -200,6 +200,42 @@ def test_summarize_ticket_rejects_employee_outside_scope(summarize_fixtures):
     assert response.status_code == 403
 
 
+def test_summarize_ticket_records_fallback_when_gateway_reports_one(summarize_fixtures, raw_db_session):
+    # Simulates what llm_gateway.complete() returns after a real forced
+    # primary-failure-then-successful-fallback (empirically verified header
+    # contract in docs/superpowers/plans/2026-08-25-phase5-cloud-fallback.md's
+    # "Task 1 status": x-litellm-attempted-fallbacks > 0 and
+    # x-litellm-model-group=cloud-fallback). This is a unit-level mock of the
+    # gateway's OUTPUT, matching this file's established pattern for every
+    # other test here -- no real LiteLLM/Anthropic/OpenAI call is made.
+    requester, analyst, outsider, queue, dept = summarize_fixtures
+    ticket_id = _create_ticket(requester.id, queue.id)
+
+    fake_result = CompletionResult(
+        text="Summary produced after a fallback to the secondary provider.",
+        input_tokens=96, output_tokens=40, latency_ms=610,
+        provider="openai", model="cloud-fallback",
+        fallback_occurred=True, serving_model_group="cloud-fallback",
+    )
+    with patch("resolvegrid_api.routers.tickets.llm_gateway.complete", return_value=fake_result):
+        response = client.post(
+            f"/tickets/{ticket_id}/summarize",
+            headers={"X-Debug-Employee-Id": str(requester.id)},
+        )
+
+    assert response.status_code == 200
+
+    call = raw_db_session.scalar(
+        select(ModelCall)
+        .where(ModelCall.purpose == "ticket.summarize", ModelCall.provider == "openai")
+        .order_by(ModelCall.id.desc())
+    )
+    assert call is not None
+    assert call.status == "success"
+    assert call.fallback_occurred is True
+    assert call.serving_model_group == "cloud-fallback"
+
+
 def test_summarize_ticket_gateway_error_returns_502_and_records_model_call(summarize_fixtures, raw_db_session):
     requester, analyst, outsider, queue, dept = summarize_fixtures
     ticket_id = _create_ticket(requester.id, queue.id)
