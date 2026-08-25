@@ -170,3 +170,49 @@ def test_complete_defaults_fallback_occurred_false_on_malformed_header():
         result = complete("Summarize this ticket.")
 
     assert result.fallback_occurred is False
+
+
+def test_complete_omits_think_for_cloud_models():
+    """Only local-qwen3 (Ollama) understands "think" -- Anthropic/OpenAI's
+    real APIs reject unrecognized request params outright. Discovered via a
+    real forced-fallback call during Phase 5 fresh-state verification: this
+    field being sent unconditionally broke EVERY cloud-primary/cloud-fallback
+    call with a 400, regardless of whether the target model was valid. If
+    this test starts failing, someone regressed the conditional -- do not
+    "fix" it to always send think=False again.
+    """
+    mock_response = _mock_response(
+        200,
+        {
+            "choices": [{"message": {"content": "ok"}}],
+            "usage": {"prompt_tokens": 3, "completion_tokens": 1},
+        },
+        headers={"x-litellm-model-group": "cloud-primary"},
+    )
+
+    with patch("resolvegrid_api.llm_gateway.httpx.post", return_value=mock_response) as mock_post:
+        result = complete("Summarize this ticket.", model="cloud-primary")
+
+    assert mock_post.called
+    _, kwargs = mock_post.call_args
+    assert "think" not in kwargs["json"]
+    assert result.provider == "anthropic"
+
+
+def test_complete_derives_provider_from_serving_model_group_after_fallback():
+    # model="cloud-primary" was requested, but cloud-fallback actually served
+    # it -- provider must reflect the real (fallback) provider, not the
+    # originally-requested one.
+    mock_response = _mock_response(
+        200,
+        {
+            "choices": [{"message": {"content": "ok"}}],
+            "usage": {"prompt_tokens": 3, "completion_tokens": 1},
+        },
+        headers={"x-litellm-attempted-fallbacks": "1", "x-litellm-model-group": "cloud-fallback"},
+    )
+
+    with patch("resolvegrid_api.llm_gateway.httpx.post", return_value=mock_response):
+        result = complete("Summarize this ticket.", model="cloud-primary")
+
+    assert result.provider == "openai"

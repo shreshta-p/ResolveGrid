@@ -9,6 +9,28 @@ LITELLM_BASE_URL = os.environ.get("LITELLM_BASE_URL", "http://localhost:4000")
 LITELLM_MASTER_KEY = os.environ.get("LITELLM_MASTER_KEY", "sk-resolvegrid-local-dev")
 DEFAULT_MODEL = "local-qwen3"
 
+# Maps a LiteLLM model_name (from infra/litellm/config.yaml) to the real
+# provider that serves it. Used to derive CompletionResult.provider correctly
+# even after a fallback (see complete()'s docstring) -- a small, explicit
+# mapping rather than trying to parse it out of the model string, since
+# there are only 3 model_names defined today and this stays trivially
+# correct as more are added.
+_MODEL_GROUP_TO_PROVIDER = {
+    "local-qwen3": "ollama",
+    "cloud-primary": "anthropic",
+    "cloud-fallback": "openai",
+}
+
+# Only local-qwen3 (Ollama) understands/tolerates the "think" field -- both
+# Anthropic and OpenAI's real APIs reject unrecognized request parameters
+# outright ("Extra inputs are not permitted" / "Unrecognized request
+# argument"), and LiteLLM's drop_params setting does not strip it for them.
+# Discovered via a real forced-fallback call during Phase 5 fresh-state
+# verification: sending "think": false unconditionally broke EVERY
+# cloud-primary/cloud-fallback call with a 400, regardless of whether the
+# target model itself was valid.
+_THINK_FALSE_MODELS = {DEFAULT_MODEL}
+
 
 @dataclass(frozen=True)
 class CompletionResult:
@@ -52,12 +74,11 @@ def complete(prompt: str, *, model: str = DEFAULT_MODEL, timeout_seconds: float 
     e.g. by raising timeout_seconds or surfacing a "warming up" message
     rather than treating a timeout here as a hard failure.
 
-    `CompletionResult.provider` is hardcoded to "ollama" -- correct today
-    (this proxy only routes to the local Ollama model), but will misreport
-    once a later phase adds Anthropic/OpenAI behind the same LiteLLM proxy
-    (see docs/DECISION_LOG.md's "Anthropic primary / OpenAI fallback"
-    entry). Must be derived from the response/model instead before that
-    phase lands.
+    `CompletionResult.provider` is derived from `_MODEL_GROUP_TO_PROVIDER`,
+    keyed by `serving_model_group` when present (the model that actually
+    served the call, which may differ from `model` after a fallback) or
+    `model` otherwise (Ollama's local-qwen3 has no fallback config, so it
+    never gets a serving_model_group header at all).
 
     Raises LLMGatewayError uniformly for network failures, non-2xx
     responses, AND a malformed/unparseable response body -- callers should
@@ -73,11 +94,14 @@ def complete(prompt: str, *, model: str = DEFAULT_MODEL, timeout_seconds: float 
     an otherwise-successful completion over a header-parsing quirk.
     """
     start = time.monotonic()
+    request_body = {"model": model, "messages": [{"role": "user", "content": prompt}]}
+    if model in _THINK_FALSE_MODELS:
+        request_body["think"] = False
     try:
         response = httpx.post(
             f"{LITELLM_BASE_URL}/v1/chat/completions",
             headers={"Authorization": f"Bearer {LITELLM_MASTER_KEY}"},
-            json={"model": model, "messages": [{"role": "user", "content": prompt}], "think": False},
+            json=request_body,
             timeout=timeout_seconds,
         )
         response.raise_for_status()
@@ -103,13 +127,14 @@ def complete(prompt: str, *, model: str = DEFAULT_MODEL, timeout_seconds: float 
     except (ValueError, TypeError):
         fallback_occurred = False
     serving_model_group = response.headers.get("x-litellm-model-group")
+    provider = _MODEL_GROUP_TO_PROVIDER.get(serving_model_group or model, "unknown")
 
     return CompletionResult(
         text=choice,
         input_tokens=usage.get("prompt_tokens", 0),
         output_tokens=usage.get("completion_tokens", 0),
         latency_ms=latency_ms,
-        provider="ollama",
+        provider=provider,
         model=model,
         fallback_occurred=fallback_occurred,
         serving_model_group=serving_model_group,
