@@ -7,7 +7,15 @@ uv sync --all-packages
 pnpm install
 
 echo "== 1/6: infra containers healthy =="
-docker compose -f infra/docker-compose.yml up -d
+# --env-file is required, not optional, on this Git-Bash/Windows setup: Compose
+# does not reliably auto-discover .env from this shell's cwd (confirmed during
+# Phase 5) -- without it, unset-with-no-inline-default vars like
+# ANTHROPIC_API_KEY/OPENAI_API_KEY silently resolve to "" instead of erroring,
+# breaking cloud-provider routing with no visible failure anywhere in this
+# script. Also strip any pre-existing shell-level ANTHROPIC_API_KEY/
+# OPENAI_API_KEY (Compose prioritizes real shell env over --env-file, so a
+# stale exported value would silently shadow the real one in .env).
+env -u ANTHROPIC_API_KEY -u OPENAI_API_KEY docker compose -f infra/docker-compose.yml --env-file .env up -d
 # otel-collector's image is fully distroless (no shell, no wget/curl/nc) so it has no
 # Docker healthcheck by design (confirmed during Task 4) — it always reports blank health,
 # which this grep already tolerates since blank never matches "unhealthy|starting". Its
