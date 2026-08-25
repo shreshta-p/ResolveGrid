@@ -13,6 +13,7 @@ dependencies = [
     "psycopg[binary]>=3.2",
     "sqlalchemy>=2.0",
     "faker>=30.0",
+    "httpx>=0.27",
 ]
 
 [tool.uv.sources]
@@ -23,7 +24,6 @@ resolvegrid-contracts = { workspace = true }
 [dependency-groups]
 dev = [
     "pytest>=8.3",
-    "httpx>=0.27",
 ]
 
 [build-system]

@@ -674,6 +674,7 @@ dependencies = [
     { name = "alembic" },
     { name = "faker" },
     { name = "fastapi" },
+    { name = "httpx" },
     { name = "psycopg", extra = ["binary"] },
     { name = "resolvegrid-authz" },
     { name = "resolvegrid-contracts" },
@@ -684,7 +685,6 @@ dependencies = [
 
 [package.dev-dependencies]
 dev = [
-    { name = "httpx" },
     { name = "pytest" },
 ]
 
@@ -693,6 +693,7 @@ requires-dist = [
     { name = "alembic", specifier = ">=1.13" },
     { name = "faker", specifier = ">=30.0" },
     { name = "fastapi", specifier = ">=0.115" },
+    { name = "httpx", specifier = ">=0.27" },
     { name = "psycopg", extras = ["binary"], specifier = ">=3.2" },
     { name = "resolvegrid-authz", editable = "packages/authz" },
     { name = "resolvegrid-contracts", editable = "packages/contracts" },
@@ -702,10 +703,7 @@ requires-dist = [
 ]
 
 [package.metadata.requires-dev]
-dev = [
-    { name = "httpx", specifier = ">=0.27" },
-    { name = "pytest", specifier = ">=8.3" },
-]
+dev = [{ name = "pytest", specifier = ">=8.3" }]
 
 [[package]]
 name = "resolvegrid-authz"
