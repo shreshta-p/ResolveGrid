@@ -1,3 +1,4 @@
+import json
 import os
 import time
 from dataclasses import dataclass
@@ -35,6 +36,26 @@ def complete(prompt: str, *, model: str = DEFAULT_MODEL, timeout_seconds: float 
     true` in the proxy config -- that setting only drops unsupported
     *standard* OpenAI params, not custom passthrough fields like `think`. Do
     not remove this without re-verifying the cost/latency impact.
+
+    `timeout_seconds` defaults to 60s; steady-state calls (think=False) run
+    well under a second, but a cold Ollama model load (nothing resident in
+    GPU memory) can plausibly still exceed 60s independent of thinking mode
+    -- a cold start is a real, not-yet-eliminated way for this to time out.
+    Callers doing a first-call-after-idle need to be prepared for that,
+    e.g. by raising timeout_seconds or surfacing a "warming up" message
+    rather than treating a timeout here as a hard failure.
+
+    `CompletionResult.provider` is hardcoded to "ollama" -- correct today
+    (this proxy only routes to the local Ollama model), but will misreport
+    once a later phase adds Anthropic/OpenAI behind the same LiteLLM proxy
+    (see docs/DECISION_LOG.md's "Anthropic primary / OpenAI fallback"
+    entry). Must be derived from the response/model instead before that
+    phase lands.
+
+    Raises LLMGatewayError uniformly for network failures, non-2xx
+    responses, AND a malformed/unparseable response body -- callers should
+    only ever need to catch this one exception type, never a raw
+    KeyError/IndexError/JSONDecodeError from this function.
     """
     start = time.monotonic()
     try:
@@ -45,12 +66,14 @@ def complete(prompt: str, *, model: str = DEFAULT_MODEL, timeout_seconds: float 
             timeout=timeout_seconds,
         )
         response.raise_for_status()
+        data = response.json()
+        choice = data["choices"][0]["message"]["content"]
     except httpx.HTTPError as exc:
         raise LLMGatewayError(str(exc)) from exc
+    except (json.JSONDecodeError, KeyError, IndexError, TypeError) as exc:
+        raise LLMGatewayError(f"malformed response from LLM gateway: {exc}") from exc
 
     latency_ms = int((time.monotonic() - start) * 1000)
-    data = response.json()
-    choice = data["choices"][0]["message"]["content"]
     usage = data.get("usage", {})
     return CompletionResult(
         text=choice,

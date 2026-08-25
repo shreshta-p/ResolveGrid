@@ -59,6 +59,18 @@ def test_complete_raises_gateway_error_on_timeout():
             complete("Summarize this ticket.")
 
 
+def test_complete_raises_gateway_error_on_malformed_response_body():
+    # A 200 response whose body doesn't have the expected shape (e.g. an
+    # empty choices list, or a proxy/error page) must still surface as
+    # LLMGatewayError -- callers should never need to catch a raw
+    # KeyError/IndexError/JSONDecodeError from this function.
+    mock_response = _mock_response(200, {"choices": []})
+
+    with patch("resolvegrid_api.llm_gateway.httpx.post", return_value=mock_response):
+        with pytest.raises(LLMGatewayError):
+            complete("Summarize this ticket.")
+
+
 def test_complete_sends_think_false_in_request_body():
     """The single most important behavior in this module.
 
