@@ -155,6 +155,11 @@ def transition_ticket(
 
 
 def _current_pricing_version(session: Session, provider: str, model: str) -> PricingVersion | None:
+    # No `effective_at <= now()` filter -- harmless today (one seeded $0 row
+    # for ollama/local-qwen3), but once a real paid provider adds a
+    # future-dated PricingVersion row (a scheduled rate change), this would
+    # pick it up early and misprice calls made before that date. Fix before
+    # Phase 5 adds real provider pricing.
     return session.scalar(
         select(PricingVersion)
         .where(PricingVersion.provider == provider, PricingVersion.model == model)

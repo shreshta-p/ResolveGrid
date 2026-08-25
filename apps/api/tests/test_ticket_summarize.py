@@ -114,10 +114,17 @@ def test_summarize_ticket_returns_summary_and_writes_model_call(summarize_fixtur
     requester, analyst, outsider, queue, dept = summarize_fixtures
     ticket_id = _create_ticket(requester.id, queue.id)
 
+    # model="local-qwen3" -- llm_gateway.complete()'s CompletionResult.model
+    # always carries the caller-requested/LiteLLM-alias name (its default,
+    # "local-qwen3"), never the raw underlying Ollama tag "qwen3:14b" -- a
+    # real call's response JSON echoes the same alias back too. Using the
+    # raw tag here would silently mask exactly the pricing-lookup mismatch
+    # this test's own pricing_version_id assertion is supposed to catch
+    # (see migration 0007's docstring for the real bug this caused).
     fake_result = CompletionResult(
         text="User cannot connect to VPN from home.",
         input_tokens=128, output_tokens=52, latency_ms=340,
-        provider="ollama", model="qwen3:14b",
+        provider="ollama", model="local-qwen3",
     )
     with patch("resolvegrid_api.routers.tickets.llm_gateway.complete", return_value=fake_result) as mock_complete:
         response = client.post(
@@ -141,13 +148,45 @@ def test_summarize_ticket_returns_summary_and_writes_model_call(summarize_fixtur
     assert call is not None
     assert call.status == "success"
     assert call.provider == "ollama"
-    assert call.model == "qwen3:14b"
+    assert call.model == "local-qwen3"
     assert call.input_tokens == 128
     assert call.output_tokens == 52
     assert call.latency_ms == 340
     assert call.estimated_cost_usd == 0.0
-    # The seeded PricingVersion row for ollama/qwen3:14b must have been found.
+    # The seeded PricingVersion row for ollama/local-qwen3 must have been found.
     assert call.pricing_version_id is not None
+
+
+def test_summarize_ticket_falls_back_to_zero_cost_when_no_pricing_version_matches(summarize_fixtures, raw_db_session):
+    # A model/provider combination with no seeded PricingVersion row (unlike
+    # the real ollama/local-qwen3 row) must not crash -- pricing_version_id
+    # stays None and cost is treated as 0.0 rather than raising.
+    requester, analyst, outsider, queue, dept = summarize_fixtures
+    ticket_id = _create_ticket(requester.id, queue.id)
+
+    fake_result = CompletionResult(
+        text="Summary from an unpriced model.",
+        input_tokens=64, output_tokens=16, latency_ms=120,
+        provider="anthropic", model="claude-not-yet-priced",
+    )
+    with patch("resolvegrid_api.routers.tickets.llm_gateway.complete", return_value=fake_result):
+        response = client.post(
+            f"/tickets/{ticket_id}/summarize",
+            headers={"X-Debug-Employee-Id": str(requester.id)},
+        )
+
+    assert response.status_code == 200
+    assert response.json()["estimated_cost_usd"] == 0.0
+
+    call = raw_db_session.scalar(
+        select(ModelCall)
+        .where(ModelCall.purpose == "ticket.summarize", ModelCall.provider == "anthropic")
+        .order_by(ModelCall.id.desc())
+    )
+    assert call is not None
+    assert call.status == "success"
+    assert call.pricing_version_id is None
+    assert call.estimated_cost_usd == 0.0
 
 
 def test_summarize_ticket_rejects_employee_outside_scope(summarize_fixtures):
