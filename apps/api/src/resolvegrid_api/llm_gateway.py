@@ -18,6 +18,13 @@ class CompletionResult:
     latency_ms: int
     provider: str
     model: str
+    # Defaulted (not required positional) so existing callers that construct
+    # CompletionResult directly -- e.g. apps/api/tests/test_ticket_summarize.py's
+    # mocks, which predate this phase and are out of scope to edit here --
+    # keep working unchanged. False/None matches the non-fallback case, which
+    # is what those pre-existing callers are simulating anyway.
+    fallback_occurred: bool = False
+    serving_model_group: str | None = None
 
 
 class LLMGatewayError(Exception):
@@ -56,6 +63,14 @@ def complete(prompt: str, *, model: str = DEFAULT_MODEL, timeout_seconds: float 
     responses, AND a malformed/unparseable response body -- callers should
     only ever need to catch this one exception type, never a raw
     KeyError/IndexError/JSONDecodeError from this function.
+
+    `CompletionResult.fallback_occurred`/`serving_model_group` are read from
+    the `x-litellm-attempted-fallbacks`/`x-litellm-model-group` response
+    headers, not the JSON body -- LiteLLM only signals a fallback via
+    headers (empirically verified against live Anthropic/OpenAI calls). A
+    missing/malformed header degrades to fallback_occurred=False rather than
+    raising, since losing that signal for one call is preferable to failing
+    an otherwise-successful completion over a header-parsing quirk.
     """
     start = time.monotonic()
     try:
@@ -75,6 +90,20 @@ def complete(prompt: str, *, model: str = DEFAULT_MODEL, timeout_seconds: float 
 
     latency_ms = int((time.monotonic() - start) * 1000)
     usage = data.get("usage", {})
+
+    # LiteLLM signals fallback via response HEADERS, never the JSON body
+    # (empirically verified against live Anthropic/OpenAI calls -- see
+    # docs/superpowers/plans/2026-08-25-phase5-cloud-fallback.md's "Task 1
+    # status"). A missing/malformed x-litellm-attempted-fallbacks header
+    # must degrade to "no fallback" rather than raising LLMGatewayError --
+    # losing the fallback signal for one call is a much smaller regression
+    # than turning an otherwise-successful completion into a hard failure.
+    try:
+        fallback_occurred = int(response.headers.get("x-litellm-attempted-fallbacks", "0")) > 0
+    except (ValueError, TypeError):
+        fallback_occurred = False
+    serving_model_group = response.headers.get("x-litellm-model-group")
+
     return CompletionResult(
         text=choice,
         input_tokens=usage.get("prompt_tokens", 0),
@@ -82,4 +111,6 @@ def complete(prompt: str, *, model: str = DEFAULT_MODEL, timeout_seconds: float 
         latency_ms=latency_ms,
         provider="ollama",
         model=model,
+        fallback_occurred=fallback_occurred,
+        serving_model_group=serving_model_group,
     )
