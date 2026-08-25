@@ -13,6 +13,7 @@ def test_model_call_round_trips_with_pricing_version(db_session):
         purpose="ticket.summarize", provider="ollama", model="qwen3:14b",
         pricing_version_id=pricing.id, input_tokens=128, output_tokens=52,
         latency_ms=340, estimated_cost_usd=0.0, status="success",
+        fallback_occurred=True, serving_model_group="cloud-fallback",
     )
     db_session.add(call)
     db_session.flush()
@@ -31,6 +32,8 @@ def test_model_call_round_trips_with_pricing_version(db_session):
     assert fetched_call.estimated_cost_usd == 0.0
     assert fetched_call.status == "success"
     assert fetched_call.error_message is None
+    assert fetched_call.fallback_occurred is True
+    assert fetched_call.serving_model_group == "cloud-fallback"
 
     assert fetched_pricing is not None
     assert fetched_pricing.provider == "ollama"
@@ -75,3 +78,6 @@ def test_model_call_keeps_pointing_at_original_pricing_version_after_repricing(d
     fetched_call = db_session.get(ModelCall, call.id)
     assert fetched_call.pricing_version_id == original_pricing.id
     assert fetched_call.pricing_version_id != newer_pricing.id
+    # fallback_occurred defaults to False when not explicitly set.
+    assert fetched_call.fallback_occurred is False
+    assert fetched_call.serving_model_group is None

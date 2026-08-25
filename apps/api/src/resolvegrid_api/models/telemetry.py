@@ -32,6 +32,18 @@ class ModelCall(Base):
     purpose: Mapped[str]  # e.g. "ticket.summarize" -- what the call was for
     provider: Mapped[str]
     model: Mapped[str]
+    # No fallback_reason/routing_reason free-text column: LiteLLM's response
+    # never carries the upstream error text that caused a fallback (only a
+    # successful fallback response's HEADERS do, and only whether/which --
+    # x-litellm-attempted-fallbacks / x-litellm-model-group; the actual
+    # "why" is swallowed internally after a successful retry, empirically
+    # verified against real live providers). Storing a reason string here
+    # would mean fabricating data this system can never actually observe.
+    fallback_occurred: Mapped[bool] = mapped_column(default=False)
+    # Nullable: a call with no fallback config at all (e.g. local-qwen3) has
+    # no x-litellm-model-group concept worth recording, and a call that
+    # errored before a response came back has no group to record either.
+    serving_model_group: Mapped[str | None] = mapped_column(default=None)
     # Real FK (not left unconstrained): every provider/model this phase can
     # call always has a matching PricingVersion row seeded ahead of time
     # (migration 0006 seeds the $0 ollama/qwen3:14b row before any ModelCall
