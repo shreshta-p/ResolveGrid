@@ -83,6 +83,11 @@ services:
       # -- see infra/postgres/init-litellm-db.sh for the full incident note.
       DATABASE_URL: postgresql://${POSTGRES_USER:-resolvegrid}:${POSTGRES_PASSWORD:-resolvegrid_dev}@postgres:5432/litellm
       LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY:-sk-resolvegrid-local-dev}
+      # Real values live only in this repo's gitignored .env -- never in this
+      # file, never in any committed file. Empty string default if unset, not
+      # an error, so local dev without cloud keys still works (Ollama-only).
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
     volumes:
       - ./litellm/config.yaml:/app/config.yaml:ro
     command: ["--config", "/app/config.yaml", "--port", "4000"]

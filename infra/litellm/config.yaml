@@ -4,8 +4,26 @@ model_list:
       model: ollama/qwen3:14b
       api_base: http://ollama:11434
 
+  # Anthropic primary / OpenAI fallback (approved architecture plan §4).
+  # Keys are never in this file -- os.environ/... reads them from the
+  # container's environment at request time (see infra/docker-compose.yml's
+  # litellm service and this repo's gitignored .env).
+  - model_name: cloud-primary
+    litellm_params:
+      model: anthropic/claude-haiku-4-5-20251001
+      api_key: os.environ/ANTHROPIC_API_KEY
+
+  - model_name: cloud-fallback
+    litellm_params:
+      model: openai/gpt-4o-mini
+      api_key: os.environ/OPENAI_API_KEY
+
 litellm_settings:
   drop_params: true
+
+router_settings:
+  fallbacks:
+    - cloud-primary: ["cloud-fallback"]
 
 general_settings:
   master_key: os.environ/LITELLM_MASTER_KEY
