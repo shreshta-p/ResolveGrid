@@ -144,7 +144,7 @@ export default function TicketDetailPage({ params }: { params: Promise<{ id: str
               {summarizing ? "Summarizing..." : "Summarize"}
             </button>
             {summarizeResult && (
-              <div>
+              <div role="status">
                 <p>{summarizeResult.summary}</p>
                 <p>
                   <small>
