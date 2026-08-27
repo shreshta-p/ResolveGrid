@@ -35,7 +35,15 @@ uv run --package resolvegrid-api alembic -c apps/api/alembic.ini upgrade head
 docker exec resolvegrid-postgres psql -U resolvegrid -d resolvegrid -c "\dt" | grep -q employee
 
 echo "== 3/6: FastAPI /health =="
-uv run --package resolvegrid-api uvicorn resolvegrid_api.main:app --app-dir apps/api/src --port 8000 &
+# Uses scripts/run_api_dev.py, not a plain `uvicorn ...` invocation, on
+# Windows -- since Phase 6 wired AsyncPostgresSaver into the app's lifespan,
+# a real uvicorn process on Windows fails startup entirely with
+# `psycopg.InterfaceError: Psycopg cannot use the 'ProactorEventLoop'`.
+# uvicorn's own loop factory hard-codes ProactorEventLoop on win32
+# regardless of any --loop flag value (confirmed by reading its source,
+# see run_api_dev.py's module docstring for the full explanation) -- there
+# is no CLI-flag fix, only this wrapper. No-op on non-Windows platforms.
+uv run --package resolvegrid-api python scripts/run_api_dev.py --port 8000 &
 API_PID=$!
 trap 'kill "$API_PID" 2>/dev/null || true' EXIT
 sleep 3
