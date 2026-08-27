@@ -15,7 +15,7 @@ from faker import Faker
 from sqlalchemy import create_engine, delete, select, update
 from sqlalchemy.orm import Session
 
-from resolvegrid_api.models import AuditLog, Department, Employee, Location, RoleAssignment, Team
+from resolvegrid_api.models import AgentRun, AuditLog, Department, Employee, Location, RoleAssignment, Team
 
 DATABASE_URL = os.environ.get(
     "DATABASE_URL",
@@ -41,16 +41,23 @@ def generate_org(session: Session, seed: int, num_employees: int = 75) -> None:
     # Wipe existing rows for idempotency -- except any Employee already
     # referenced by a real AuditLog row (audit_log.actor_id has no cascade;
     # the log is append-only/tamper-evident by design, so such a row can
-    # never be deleted -- see apps/api/src/resolvegrid_api/audit.py). This
-    # only happens today via apps/api/tests/test_tickets_api.py's fixture,
-    # which commits real ticket/audit activity for two dedicated employees
-    # under their own dedicated department/location, so also protect the
-    # small closure of rows that would otherwise dangle: those employees'
-    # department_id/location_id/team_id. This is a narrow, targeted fix, not
-    # a general transitive-closure solver -- e.g. it does not need to protect
-    # manager_id chains, since no protected employee here ever has one set.
+    # never be deleted -- see apps/api/src/resolvegrid_api/audit.py) OR a
+    # real AgentRun row (agent_run.principal_employee_id is a real FK too,
+    # added in Phase 6 -- apps/api/tests/test_chat_api.py's fixture commits
+    # real /chat activity for a dedicated employee the same way
+    # test_tickets_api.py's fixture does for AuditLog). This only happens
+    # today via those two test fixtures, which commit real activity under
+    # dedicated employees, so also protect the small closure of rows that
+    # would otherwise dangle: those employees' department_id/location_id/
+    # team_id. This is a narrow, targeted fix, not a general transitive-
+    # closure solver -- e.g. it does not need to protect manager_id chains,
+    # since no protected employee here ever has one set.
     protected_employee_ids = set(
         session.execute(select(AuditLog.actor_id).where(AuditLog.actor_id.isnot(None)).distinct()).scalars()
+    ) | set(
+        session.execute(
+            select(AgentRun.principal_employee_id).where(AgentRun.principal_employee_id.isnot(None)).distinct()
+        ).scalars()
     )
     protected_department_ids: set[int] = set()
     protected_location_ids: set[int] = set()
