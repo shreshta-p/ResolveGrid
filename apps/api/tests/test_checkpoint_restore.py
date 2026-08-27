@@ -87,29 +87,30 @@ Windows.
 
 import asyncio
 import json
+from uuid import uuid4
 
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 
 from resolvegrid_agent_orchestration import build_graph
 from resolvegrid_api.main import _CHECKPOINTER_DATABASE_URL
 
-_THREAD_ID = "test-checkpoint-restore-1"
-
 _CLASSIFICATION_RESPONSE = json.dumps({"intent": "general_question", "risk_level": "medium"})
 _ANSWER_RESPONSE = "A VPN is a Virtual Private Network that encrypts your connection."
 
-_INITIAL_STATE = {
-    "thread_id": _THREAD_ID,
-    # Deliberately None: this test builds graphs directly (not through
-    # /chat), so no AgentRun/Employee FK exists or is needed -- see module
-    # docstring's "Scope note".
-    "principal_employee_id": None,
-    "input_text": "What is a VPN?",
-    "intent": None,
-    "risk_level": None,
-    "output_text": None,
-    "error": None,
-}
+
+def _initial_state(thread_id: str) -> dict:
+    return {
+        "thread_id": thread_id,
+        # Deliberately None: this test builds graphs directly (not through
+        # /chat), so no AgentRun/Employee FK exists or is needed -- see
+        # module docstring's "Scope note".
+        "principal_employee_id": None,
+        "input_text": "What is a VPN?",
+        "intent": None,
+        "risk_level": None,
+        "output_text": None,
+        "error": None,
+    }
 
 
 def _instance_a_complete_fn():
@@ -139,20 +140,20 @@ def _instance_b_complete_fn(prompt: str) -> str:
     )
 
 
-async def _run_instance_a_to_completion() -> dict:
+async def _run_instance_a_to_completion(thread_id: str) -> dict:
     async with AsyncPostgresSaver.from_conn_string(_CHECKPOINTER_DATABASE_URL) as checkpointer_a:
         await checkpointer_a.setup()
         graph_a = build_graph(checkpointer_a, _instance_a_complete_fn())
         result = await graph_a.ainvoke(
-            _INITIAL_STATE,
-            config={"configurable": {"thread_id": _THREAD_ID}},
+            _initial_state(thread_id),
+            config={"configurable": {"thread_id": thread_id}},
         )
         return result
     # `async with` exits here -- checkpointer_a's connection is fully closed.
     # Nothing below this point can share any state with checkpointer_a.
 
 
-async def _read_state_via_instance_b() -> dict:
+async def _read_state_via_instance_b(thread_id: str) -> dict:
     async with AsyncPostgresSaver.from_conn_string(_CHECKPOINTER_DATABASE_URL) as checkpointer_b:
         # Deliberately NOT calling checkpointer_b.setup() again: Task 3
         # already established setup() is idempotent (safe to call more than
@@ -162,25 +163,45 @@ async def _read_state_via_instance_b() -> dict:
         # exactly what a real fresh-process restart would also do (connect
         # and read, not re-run migrations).
         graph_b = build_graph(checkpointer_b, _instance_b_complete_fn)
-        snapshot = await graph_b.aget_state({"configurable": {"thread_id": _THREAD_ID}})
+        snapshot = await graph_b.aget_state({"configurable": {"thread_id": thread_id}})
         return snapshot.values
+
+
+async def _delete_thread(thread_id: str) -> None:
+    async with AsyncPostgresSaver.from_conn_string(_CHECKPOINTER_DATABASE_URL) as checkpointer:
+        await checkpointer.adelete_thread(thread_id)
 
 
 def test_checkpoint_restore_cross_instance_persistence():
     """The actual Phase 6 exit criterion: state written by graph instance A
     is correctly recovered by a completely separate graph instance B, proven
     via B's own independent read (`CompiledStateGraph.aget_state`), not by
-    re-checking anything through instance A."""
-    result_from_a = asyncio.run(_run_instance_a_to_completion())
-    assert result_from_a["output_text"] == _ANSWER_RESPONSE
-    assert result_from_a["intent"] == "general_question"
-    assert result_from_a["risk_level"] == "medium"
-    assert result_from_a["error"] is None
+    re-checking anything through instance A.
 
-    state_from_b = asyncio.run(_read_state_via_instance_b())
+    A fresh, random `thread_id` is used per run (not a fixed constant) and
+    the thread's checkpoint rows are deleted afterward. Code review of an
+    earlier version of this test found a real gap with a fixed thread_id
+    and no cleanup: `aget_state()` only reads the LATEST checkpoint for a
+    thread, so a stale row left over from an earlier, genuinely-passing run
+    could mask a future regression in the write path (`aput`) -- the
+    "instance B must never call complete_fn" trick only proves the graph
+    didn't re-execute, not that THIS run's write actually succeeded, if an
+    old row from a prior run were silently satisfying the read instead.
+    """
+    thread_id = uuid4().hex
+    try:
+        result_from_a = asyncio.run(_run_instance_a_to_completion(thread_id))
+        assert result_from_a["output_text"] == _ANSWER_RESPONSE
+        assert result_from_a["intent"] == "general_question"
+        assert result_from_a["risk_level"] == "medium"
+        assert result_from_a["error"] is None
 
-    assert state_from_b["output_text"] == _ANSWER_RESPONSE
-    assert state_from_b["intent"] == "general_question"
-    assert state_from_b["risk_level"] == "medium"
-    assert state_from_b["input_text"] == _INITIAL_STATE["input_text"]
-    assert state_from_b["error"] is None
+        state_from_b = asyncio.run(_read_state_via_instance_b(thread_id))
+
+        assert state_from_b["output_text"] == _ANSWER_RESPONSE
+        assert state_from_b["intent"] == "general_question"
+        assert state_from_b["risk_level"] == "medium"
+        assert state_from_b["input_text"] == "What is a VPN?"
+        assert state_from_b["error"] is None
+    finally:
+        asyncio.run(_delete_thread(thread_id))
