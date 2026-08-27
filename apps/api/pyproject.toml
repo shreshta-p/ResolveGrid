@@ -10,6 +10,7 @@ dependencies = [
     "resolvegrid-authz",
     "resolvegrid-contracts",
     "resolvegrid-agent-orchestration",
+    "resolvegrid-retrieval",
     "alembic>=1.13",
     "psycopg[binary,pool]>=3.2",
     "sqlalchemy>=2.0",
@@ -17,6 +18,7 @@ dependencies = [
     "httpx>=0.27",
     "langgraph>=1.2",
     "langgraph-checkpoint-postgres>=3.1",
+    "pgvector>=0.3",
 ]
 
 [tool.uv.sources]
@@ -24,6 +26,7 @@ resolvegrid-telemetry = { workspace = true }
 resolvegrid-authz = { workspace = true }
 resolvegrid-contracts = { workspace = true }
 resolvegrid-agent-orchestration = { workspace = true }
+resolvegrid-retrieval = { workspace = true }
 
 [dependency-groups]
 dev = [

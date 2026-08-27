@@ -12,6 +12,7 @@ members = [
     "resolvegrid-api",
     "resolvegrid-authz",
     "resolvegrid-contracts",
+    "resolvegrid-retrieval",
     "resolvegrid-telemetry",
     "resolvegrid-workspace",
 ]
@@ -805,6 +806,15 @@ wheels = [
 ]
 
 [[package]]
+name = "pgvector"
+version = "0.5.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/a7/ec/6eb80aebc728200f95229219882994c1b0585b956ca47da5edb9d062627a/pgvector-0.5.0.tar.gz", hash = "sha256:07a9dcf735696879406983afc6eba9a787cef7c0cf6c367ca1a5779f036dee74", size = 35170, upload-time = "2026-07-06T18:27:27.767Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/5c/e4/a5573f2c579ca9ad133293bfb624148ba0893674ca4a6eeec85ced9a6a09/pgvector-0.5.0-py3-none-any.whl", hash = "sha256:fedc9800894e6da2be51358d7b7c574bf34f247ca741a5a09513622135f5964f", size = 30958, upload-time = "2026-07-06T18:27:26.797Z" },
+]
+
+[[package]]
 name = "pluggy"
 version = "1.6.0"
 source = { registry = "https://pypi.org/simple" }
@@ -1091,10 +1101,12 @@ dependencies = [
     { name = "httpx" },
     { name = "langgraph" },
     { name = "langgraph-checkpoint-postgres" },
+    { name = "pgvector" },
     { name = "psycopg", extra = ["binary", "pool"] },
     { name = "resolvegrid-agent-orchestration" },
     { name = "resolvegrid-authz" },
     { name = "resolvegrid-contracts" },
+    { name = "resolvegrid-retrieval" },
     { name = "resolvegrid-telemetry" },
     { name = "sqlalchemy" },
     { name = "uvicorn", extra = ["standard"] },
@@ -1113,10 +1125,12 @@ requires-dist = [
     { name = "httpx", specifier = ">=0.27" },
     { name = "langgraph", specifier = ">=1.2" },
     { name = "langgraph-checkpoint-postgres", specifier = ">=3.1" },
+    { name = "pgvector", specifier = ">=0.3" },
     { name = "psycopg", extras = ["binary", "pool"], specifier = ">=3.2" },
     { name = "resolvegrid-agent-orchestration", editable = "services/agent-orchestration" },
     { name = "resolvegrid-authz", editable = "packages/authz" },
     { name = "resolvegrid-contracts", editable = "packages/contracts" },
+    { name = "resolvegrid-retrieval", editable = "services/retrieval" },
     { name = "resolvegrid-telemetry", editable = "packages/telemetry" },
     { name = "sqlalchemy", specifier = ">=2.0" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.32" },
@@ -1155,6 +1169,25 @@ dev = [
 
 [package.metadata]
 requires-dist = [{ name = "pydantic", specifier = ">=2.9" }]
+
+[package.metadata.requires-dev]
+dev = [{ name = "pytest", specifier = ">=8.3" }]
+
+[[package]]
+name = "resolvegrid-retrieval"
+version = "0.1.0"
+source = { editable = "services/retrieval" }
+dependencies = [
+    { name = "httpx" },
+]
+
+[package.dev-dependencies]
+dev = [
+    { name = "pytest" },
+]
+
+[package.metadata]
+requires-dist = [{ name = "httpx", specifier = ">=0.27" }]
 
 [package.metadata.requires-dev]
 dev = [{ name = "pytest", specifier = ">=8.3" }]

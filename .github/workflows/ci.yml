@@ -11,7 +11,7 @@ permissions:
 jobs:
   api:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     services:
       postgres:
         image: pgvector/pgvector:pg16
@@ -26,13 +26,32 @@ jobs:
           --health-interval 5s
           --health-timeout 5s
           --health-retries 10
+      # apps/api/tests/test_knowledge_store.py's cosine-similarity test (Phase
+      # 7 Task 3) calls the real nomic-embed-text embeddings endpoint -- no
+      # mocking, by design, since the whole point is verifying real semantic
+      # behavior round-trips through pgvector. ollama/ollama's image starts
+      # `ollama serve` on its default entrypoint; the model itself still has
+      # to be pulled explicitly (see the step below) since a service
+      # container's `options` can't run post-start commands.
+      ollama:
+        image: ollama/ollama:latest
+        ports:
+          - 11434:11434
     env:
       DATABASE_URL: postgresql+psycopg://resolvegrid:resolvegrid_dev@localhost:5433/resolvegrid
+      OLLAMA_BASE_URL: http://localhost:11434
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v3
         with:
           version: "0.8.13"
+      - name: Pull nomic-embed-text into the Ollama service container
+        run: |
+          for i in $(seq 1 30); do
+            curl -sf http://localhost:11434/api/tags >/dev/null && break
+            sleep 2
+          done
+          curl -sf http://localhost:11434/api/pull -d '{"model": "nomic-embed-text", "stream": false}'
       - run: uv sync --all-packages
       - run: uv run --package resolvegrid-api alembic -c apps/api/alembic.ini upgrade head
       - run: uv run --package resolvegrid-api pytest apps/api/tests -v
@@ -85,3 +104,14 @@ jobs:
           version: "0.8.13"
       - run: uv sync --all-packages
       - run: uv run --package resolvegrid-agent-orchestration pytest services/agent-orchestration/tests -v
+
+  retrieval:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v3
+        with:
+          version: "0.8.13"
+      - run: uv sync --all-packages
+      - run: uv run --package resolvegrid-retrieval pytest services/retrieval/tests -v
