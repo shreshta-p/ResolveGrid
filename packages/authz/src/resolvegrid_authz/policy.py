@@ -29,6 +29,14 @@ _SELF_SCOPED_ACTIONS = {
     "directory.view_employee",
     "ticket.list",
     "ticket.view",
+    # Phase 7 Task 5 (knowledge retrieval authz filtering): reuses this same
+    # admin/department-scoped/self-scoped Decision shape rather than a
+    # bespoke retrieval policy -- see
+    # apps/api/src/resolvegrid_api/retrieval_authz.py for how the caller
+    # interprets a self-scoped Decision (no department grant) for knowledge
+    # retrieval specifically, since a Document isn't "owned" by an employee
+    # the way a Ticket is.
+    "knowledge.retrieve",
 }
 # Actions that require an actual staff/admin grant -- a principal with no
 # matching grant is DENIED outright, never silently downgraded to self-scope

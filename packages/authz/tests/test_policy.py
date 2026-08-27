@@ -117,3 +117,32 @@ def test_ticket_transition_allowed_for_admin():
     principal = Principal(employee_id=14, roles=(RoleGrant(role="admin", scope="global"),))
     decision = authorize(principal, "ticket.transition")
     assert decision.allowed is True
+
+
+def test_knowledge_retrieve_is_self_scoped_for_employee_with_no_grant():
+    # Phase 7 Task 5: knowledge.retrieve reuses the same self-scoped
+    # Decision shape as ticket.list/directory.list_employees -- the
+    # retrieval-specific interpretation of a self-scoped Decision lives in
+    # apps/api/src/resolvegrid_api/retrieval_authz.py, not here.
+    principal = Principal(employee_id=15, roles=())
+    decision = authorize(principal, "knowledge.retrieve")
+    assert decision.allowed is True
+    assert decision.employee_id == 15
+    assert decision.department_ids is None
+
+
+def test_knowledge_retrieve_is_department_scoped_for_analyst():
+    principal = Principal(
+        employee_id=16, roles=(RoleGrant(role="analyst", scope="department", scope_id=7),)
+    )
+    decision = authorize(principal, "knowledge.retrieve")
+    assert decision.allowed is True
+    assert decision.department_ids == (7,)
+
+
+def test_knowledge_retrieve_is_unrestricted_for_admin():
+    principal = Principal(employee_id=17, roles=(RoleGrant(role="admin", scope="global"),))
+    decision = authorize(principal, "knowledge.retrieve")
+    assert decision.allowed is True
+    assert decision.department_ids is None
+    assert decision.employee_id is None
