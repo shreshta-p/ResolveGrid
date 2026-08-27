@@ -37,9 +37,25 @@ jobs:
         image: ollama/ollama:latest
         ports:
           - 11434:11434
+      # apps/api/tests/test_ingestion_worker.py's Arq test (Phase 7 Task 6)
+      # enqueues a real job against Redis and runs a real worker to consume
+      # it -- no mocking, matching this repo's "no mocking the actual
+      # infra" precedent for the Ollama/pgvector integration tests above.
+      # Port 6380 matches infra/docker-compose.yml's host mapping for
+      # resolvegrid-redis, which REDIS_URL's default also assumes.
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6380:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
     env:
       DATABASE_URL: postgresql+psycopg://resolvegrid:resolvegrid_dev@localhost:5433/resolvegrid
       OLLAMA_BASE_URL: http://localhost:11434
+      REDIS_URL: redis://localhost:6380/0
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v3
