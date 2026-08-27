@@ -1,8 +1,8 @@
 from datetime import datetime
 
 from pgvector.sqlalchemy import Vector
-from sqlalchemy import ForeignKey, Index, String, func
-from sqlalchemy.dialects.postgresql import ARRAY
+from sqlalchemy import Computed, ForeignKey, Index, String, func
+from sqlalchemy.dialects.postgresql import ARRAY, TSVECTOR
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from resolvegrid_api.models.base import Base
@@ -104,6 +104,18 @@ class Chunk(Base):
     # fact -- out of scope for this schema-only task.
     metadata_json: Mapped[str | None] = mapped_column(default=None)
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+    # Postgres full-text-search column (Phase 7 Task 4, migration 0011):
+    # a stored generated tsvector, kept in sync with `text` by Postgres
+    # itself (not application code), backed by a GIN index
+    # (`ix_chunk_search_vector`) so `resolvegrid_api.retrieval.lexical_search`'s
+    # `ts_rank_cd` queries are index-backed rather than a per-query
+    # sequential `to_tsvector` recompute. See migration 0011's docstring
+    # for the stored-vs-inline reasoning. Never written to directly by
+    # the ORM -- Postgres computes it -- so it's not passed in any
+    # `Chunk(...)` constructor call in this codebase.
+    search_vector: Mapped[str] = mapped_column(
+        TSVECTOR, Computed("to_tsvector('english', text)", persisted=True)
+    )
 
     parent_chunk: Mapped["Chunk | None"] = relationship(remote_side=[id])
 
