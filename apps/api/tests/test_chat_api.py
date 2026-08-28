@@ -2,11 +2,14 @@ from unittest.mock import patch
 
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import delete, select
+from sqlalchemy import delete, func, select
 
+from resolvegrid_api.ingestion_worker import run_seed_corpus_ingestion
 from resolvegrid_api.llm_gateway import CompletionResult
 from resolvegrid_api.main import app
 from resolvegrid_api.models import AgentRun, Department, Employee, Location, Span
+from resolvegrid_api.models.knowledge import Chunk, Document, DocumentVersion, Embedding, IngestionRun
+from resolvegrid_api.seed_corpus import load_seed_corpus
 
 _SEED_EMAIL = "chat.requester@example.test"
 _SEED_DEPARTMENT_NAME = "Chat Test Dept"
@@ -107,6 +110,44 @@ def chat_fixtures(raw_db_session):
     return requester
 
 
+@pytest.fixture
+def seed_corpus_ingested(raw_db_session):
+    """Ingest `resolvegrid_api.seed_corpus.SEED_CORPUS` for a retrieval
+    -focused chat test, then delete every row this fixture itself created,
+    afterward -- mirrors `test_ingestion_worker.py`'s
+    `test_arq_worker_processes_ingest_seed_corpus_task_via_real_redis`
+    cleanup pattern for the same reason documented there:
+    `apps/api/tests/test_retrieval.py`'s fixed-content lexical/vector
+    -search tests assert *exact* result lists (e.g. `results ==
+    [(chunk_dense_id, 1), (chunk_sparse_id, 2)]`) against this same live,
+    shared dev database -- leaving seed-corpus rows behind permanently
+    would risk an unrelated corpus chunk sneaking into one of those top-N
+    result lists and breaking that equality assertion in a different test
+    file entirely. Function-scoped (not module-scoped) so it cleans up
+    after every test that uses it, not just once for the whole file.
+    """
+    before_max_run_id = raw_db_session.scalar(select(func.max(IngestionRun.id))) or 0
+    run_seed_corpus_ingestion(raw_db_session)
+    raw_db_session.commit()
+    try:
+        yield
+    finally:
+        titles = [doc.title for doc in load_seed_corpus()]
+        document_ids = raw_db_session.scalars(select(Document.id).where(Document.title.in_(titles))).all()
+        version_ids = raw_db_session.scalars(
+            select(DocumentVersion.id).where(DocumentVersion.document_id.in_(document_ids))
+        ).all()
+        chunk_ids = raw_db_session.scalars(
+            select(Chunk.id).where(Chunk.document_version_id.in_(version_ids))
+        ).all()
+        raw_db_session.execute(delete(Embedding).where(Embedding.chunk_id.in_(chunk_ids)))
+        raw_db_session.execute(delete(Chunk).where(Chunk.id.in_(chunk_ids)))
+        raw_db_session.execute(delete(DocumentVersion).where(DocumentVersion.id.in_(version_ids)))
+        raw_db_session.execute(delete(Document).where(Document.id.in_(document_ids)))
+        raw_db_session.execute(delete(IngestionRun).where(IngestionRun.id > before_max_run_id))
+        raw_db_session.commit()
+
+
 def _classification_result(intent: str = "general_question", risk_level: str = "low") -> CompletionResult:
     # graph.py's classify_intent node does `json.loads(complete_fn(prompt))`
     # then validates the shape with IntentClassification -- this must be
@@ -125,7 +166,7 @@ def _answer_result(text: str) -> CompletionResult:
     )
 
 
-def test_chat_success_writes_agent_run_and_three_success_spans(chat_fixtures, raw_db_session, client):
+def test_chat_success_writes_agent_run_and_four_success_spans(chat_fixtures, raw_db_session, client):
     requester = chat_fixtures
     message = "What is a VPN?"
 
@@ -152,6 +193,14 @@ def test_chat_success_writes_agent_run_and_three_success_spans(chat_fixtures, ra
     assert isinstance(body["thread_id"], str) and body["thread_id"]
     assert mock_complete.call_count == 2
 
+    # chat_fixtures's requester belongs to "Chat Test Dept" -- not part of
+    # the real seed corpus, and this test doesn't ingest it (see
+    # `seed_corpus_ingested` fixture) -- so retrieval finds nothing to
+    # cite here, and the response degrades to the general-knowledge
+    # caption/empty citations, per chat.py's documented branch condition.
+    assert body["citations"] == []
+    assert "General-knowledge answer" in body["caption"]
+
     run = raw_db_session.scalar(select(AgentRun).where(AgentRun.thread_id == body["thread_id"]))
     assert run is not None
     assert run.status == "completed"
@@ -164,8 +213,8 @@ def test_chat_success_writes_agent_run_and_three_success_spans(chat_fixtures, ra
     spans = raw_db_session.scalars(
         select(Span).where(Span.agent_run_id == run.id).order_by(Span.id)
     ).all()
-    assert [s.stage_name for s in spans] == ["classify_intent", "compose_response", "finalize"]
-    assert len(spans) == 3
+    assert [s.stage_name for s in spans] == ["classify_intent", "retrieve", "compose_response", "finalize"]
+    assert len(spans) == 4
     assert all(s.status == "success" for s in spans)
 
 
@@ -202,7 +251,7 @@ def test_chat_gateway_error_returns_502_and_records_error(chat_fixtures, raw_db_
     assert run.output_text is None
     assert run.completed_at is None
 
-    # No Span rows on the error path -- chat.py only writes the 3 stage
+    # No Span rows on the error path -- chat.py only writes the 4 stage
     # Spans after a successful ainvoke() call.
     spans = raw_db_session.scalars(select(Span).where(Span.agent_run_id == run.id)).all()
     assert spans == []
@@ -226,5 +275,90 @@ def test_chat_two_calls_get_different_thread_ids(chat_fixtures, client):
 
     thread_id_1 = _call("first message")
     thread_id_2 = _call("second message")
-
     assert thread_id_1 != thread_id_2
+
+
+# ---------------------------------------------------------------------------
+# Retrieval-focused chat tests (Phase 7 Task 7)
+# ---------------------------------------------------------------------------
+
+
+def test_chat_retrieves_and_cites_public_seed_corpus_chunk(chat_fixtures, seed_corpus_ingested, client):
+    """End-to-end: with the real seed corpus ingested, a question that
+    matches the corpus's public "What Is a VPN" reference doc should come
+    back with a real citation to it -- proving retrieve_for_agent's real
+    vector+lexical+RRF pipeline, not just the graph's plumbing, actually
+    finds and threads through real ingested chunks.
+
+    Uses `chat_fixtures`'s requester, whose home department ("Chat Test
+    Dept") is NOT one of the seed corpus's real department tags -- this
+    deliberately proves the PUBLIC document is retrievable regardless of
+    department (per `retrieval_authz.py`'s "empty access_scope_tags =
+    visible to everyone" convention), without needing a department-scoped
+    fixture employee.
+    """
+    requester = chat_fixtures
+    message = "What is a VPN?"
+
+    with patch(
+        _COMPLETE_PATCH_TARGET,
+        side_effect=[
+            _classification_result(),
+            _answer_result("A VPN creates an encrypted tunnel for remote access [chunk:1]."),
+        ],
+    ) as mock_complete:
+        response = client.post(
+            "/chat",
+            json={"message": message},
+            headers={"X-Debug-Employee-Id": str(requester.id)},
+        )
+
+    assert response.status_code == 200
+    assert mock_complete.call_count == 2
+    body = response.json()
+
+    assert body["citations"], "expected at least one citation from the ingested seed corpus"
+    titles = {c["document_title"] for c in body["citations"]}
+    assert "What Is a VPN (Public Reference)" in titles
+    assert all("chunk_id" in c and "document_title" in c for c in body["citations"])
+    assert "knowledge base" in body["caption"].lower()
+    assert "citation" in body["caption"].lower() or "citations" in body["caption"].lower()
+
+    # The 2nd complete_fn call (compose_response's prompt) must have
+    # actually carried the citation context, proving the graph's
+    # `retrieve` -> `compose_response` wiring, not just chat.py's response
+    # shaping, is what's under test here.
+    compose_prompt = mock_complete.call_args_list[1].args[0]
+    assert "[chunk:" in compose_prompt
+    assert "What Is a VPN (Public Reference)" in compose_prompt
+
+
+def test_chat_authz_filters_out_department_scoped_seed_corpus_chunk(
+    chat_fixtures, seed_corpus_ingested, client
+):
+    """Adversarial-style leakage check: `chat_fixtures`'s requester belongs
+    to "Chat Test Dept", which is NOT the seed corpus's
+    "platform_engineering" tag -- the platform-engineering-scoped on-call
+    escalation policy must never appear in this requester's citations,
+    even though it exists in the now-ingested corpus and the query below
+    is worded specifically to match its content. The response must still
+    degrade sensibly (200, some answer, no crash), not fail outright.
+    """
+    requester = chat_fixtures
+    message = "What is the Kestrel Platform Engineering on-call escalation policy?"
+
+    with patch(
+        _COMPLETE_PATCH_TARGET,
+        side_effect=[_classification_result(), _answer_result("I don't have that information.")],
+    ):
+        response = client.post(
+            "/chat",
+            json={"message": message},
+            headers={"X-Debug-Employee-Id": str(requester.id)},
+        )
+
+    assert response.status_code == 200
+    body = response.json()
+    titles = {c["document_title"] for c in body["citations"]}
+    assert "Kestrel Platform Engineering On-Call Escalation Policy" not in titles
+    assert body["answer"] == "I don't have that information."

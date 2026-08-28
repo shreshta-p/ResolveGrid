@@ -20,6 +20,7 @@ from resolvegrid_agent_orchestration.graph import (
     finalize,
     make_classify_intent_node,
     make_compose_response_node,
+    make_retrieve_node,
 )
 
 _BASE_STATE = {
@@ -28,6 +29,9 @@ _BASE_STATE = {
     "input_text": "placeholder",
     "intent": None,
     "risk_level": None,
+    "retrieval_scope": None,
+    "retrieved_chunks": None,
+    "retrieval_sufficient": None,
     "output_text": None,
     "error": None,
 }
@@ -104,6 +108,114 @@ def test_compose_response_records_error_on_completion_failure_instead_of_raising
     assert result == {"error": "gateway unreachable"}
 
 
+def test_compose_response_uses_general_knowledge_prompt_when_retrieval_insufficient():
+    # retrieval_sufficient=False (even with chunks present) must NOT use
+    # the citation-context branch -- see graph.py's documented scope
+    # limit: sufficiency gates citation-grounded answering, not whether an
+    # answer is attempted at all.
+    captured_prompts = []
+
+    def fake_complete(prompt: str) -> str:
+        captured_prompts.append(prompt)
+        return "answer"
+
+    node = make_compose_response_node(fake_complete)
+    node(
+        _state(
+            input_text="what is a VPN?",
+            retrieved_chunks=[
+                {"chunk_id": 1, "document_title": "Some Doc", "text": "irrelevant", "score": 0.001}
+            ],
+            retrieval_sufficient=False,
+        )
+    )
+    assert "No relevant company-specific knowledge-base article was found" in captured_prompts[0]
+    assert "[chunk:1]" not in captured_prompts[0]
+
+
+def test_compose_response_uses_citation_context_prompt_when_retrieval_sufficient():
+    captured_prompts = []
+
+    def fake_complete(prompt: str) -> str:
+        captured_prompts.append(prompt)
+        return "answer"
+
+    node = make_compose_response_node(fake_complete)
+    node(
+        _state(
+            input_text="what is a VPN?",
+            retrieved_chunks=[
+                {
+                    "chunk_id": 42,
+                    "document_title": "Kestrel VPN Access Policy (v2)",
+                    "text": "A VPN is required for remote access.",
+                    "score": 0.05,
+                }
+            ],
+            retrieval_sufficient=True,
+        )
+    )
+    prompt = captured_prompts[0]
+    assert "[chunk:42]" in prompt
+    assert "Kestrel VPN Access Policy (v2)" in prompt
+    assert "A VPN is required for remote access." in prompt
+    assert "cite it inline" in prompt
+
+
+def test_compose_response_falls_back_to_general_knowledge_when_no_chunks():
+    captured_prompts = []
+
+    def fake_complete(prompt: str) -> str:
+        captured_prompts.append(prompt)
+        return "answer"
+
+    node = make_compose_response_node(fake_complete)
+    node(_state(input_text="hello", retrieved_chunks=[], retrieval_sufficient=True))
+    assert "No relevant company-specific knowledge-base article was found" in captured_prompts[0]
+
+
+# --- retrieve ---------------------------------------------------------------
+
+
+def test_retrieve_attaches_chunks_and_sufficiency_from_fake_retrieve_fn():
+    def fake_retrieve(query_text: str, scope):
+        assert query_text == "what is a VPN?"
+        assert scope == {"unrestricted": False, "allowed_tags": ["security"]}
+        return {
+            "chunks": [
+                {"chunk_id": 1, "document_title": "Doc", "text": "text", "score": 0.5}
+            ],
+            "sufficient": True,
+        }
+
+    node = make_retrieve_node(fake_retrieve)
+    result = node(
+        _state(
+            input_text="what is a VPN?",
+            retrieval_scope={"unrestricted": False, "allowed_tags": ["security"]},
+        )
+    )
+    assert result == {
+        "retrieved_chunks": [{"chunk_id": 1, "document_title": "Doc", "text": "text", "score": 0.5}],
+        "retrieval_sufficient": True,
+    }
+
+
+def test_retrieve_degrades_softly_when_retrieve_fn_raises():
+    def failing_retrieve(query_text: str, scope):
+        raise RuntimeError("db unreachable")
+
+    node = make_retrieve_node(failing_retrieve)
+    result = node(_state(input_text="hello"))
+    assert result == {"retrieved_chunks": [], "retrieval_sufficient": False}
+
+
+def test_retrieve_defaults_missing_outcome_keys_safely():
+    node = make_retrieve_node(lambda query_text, scope: {})
+    result = node(_state(input_text="hello"))
+    assert result == {"retrieved_chunks": [], "retrieval_sufficient": False}
+
+
 # --- finalize --------------------------------------------------------------
 
 
@@ -136,8 +248,11 @@ def test_build_graph_runs_end_to_end_with_mocked_completion_and_memory_checkpoin
         # Second call is compose_response's prompt.
         return "This is a mocked answer about service tickets."
 
+    def fake_retrieve(query_text: str, scope):
+        return {"chunks": [], "sufficient": False}
+
     checkpointer = InMemorySaver()
-    graph = build_graph(checkpointer, fake_complete)
+    graph = build_graph(checkpointer, fake_complete, fake_retrieve)
 
     initial_state = _state(
         thread_id="test-thread-1",
@@ -152,4 +267,45 @@ def test_build_graph_runs_end_to_end_with_mocked_completion_and_memory_checkpoin
     assert result["risk_level"] == "low"
     assert result["output_text"] == "This is a mocked answer about service tickets."
     assert result["error"] is None
+    assert result["retrieved_chunks"] == []
+    assert result["retrieval_sufficient"] is False
     assert len(calls) == 2
+
+
+def test_build_graph_runs_end_to_end_with_sufficient_retrieval_produces_citation_prompt():
+    calls = []
+
+    def fake_complete(prompt: str) -> str:
+        calls.append(prompt)
+        if len(calls) == 1:
+            return json.dumps({"intent": "general_question", "risk_level": "low"})
+        return "A VPN is required for remote access [chunk:7]."
+
+    def fake_retrieve(query_text: str, scope):
+        return {
+            "chunks": [
+                {
+                    "chunk_id": 7,
+                    "document_title": "Kestrel VPN Access Policy (v2)",
+                    "text": "Remote access requires the corporate VPN client.",
+                    "score": 0.05,
+                }
+            ],
+            "sufficient": True,
+        }
+
+    checkpointer = InMemorySaver()
+    graph = build_graph(checkpointer, fake_complete, fake_retrieve)
+
+    result = graph.invoke(
+        _state(thread_id="test-thread-2", input_text="What is the VPN policy?"),
+        config={"configurable": {"thread_id": "test-thread-2"}},
+    )
+
+    assert result["retrieval_sufficient"] is True
+    assert result["retrieved_chunks"][0]["chunk_id"] == 7
+    assert result["output_text"] == "A VPN is required for remote access [chunk:7]."
+    # compose_response's prompt (the 2nd captured call) must have carried
+    # the chunk's citation context through.
+    assert "[chunk:7]" in calls[1]
+    assert "Kestrel VPN Access Policy (v2)" in calls[1]

@@ -10,6 +10,7 @@ from sqlalchemy.orm import Session
 from resolvegrid_api.db import get_db
 from resolvegrid_api.deps import get_principal
 from resolvegrid_api.models import AgentRun, Span
+from resolvegrid_api.retrieval_authz import build_authz_filter
 from resolvegrid_authz import Principal
 
 router = APIRouter(prefix="/chat", tags=["chat"])
@@ -21,10 +22,21 @@ router = APIRouter(prefix="/chat", tags=["chat"])
 # as tickets.py).
 tracer = trace.get_tracer(__name__)
 
-# The graph's 3 conceptual stages, in execution order -- used to write one
-# DB `Span` row per stage. See chat()'s docstring for why their latency_ms
-# values are a documented simplification, not real per-node timing.
-_STAGE_NAMES = ("classify_intent", "compose_response", "finalize")
+# The graph's 4 conceptual stages, in execution order -- used to write one
+# DB `Span` row per stage. `retrieve` (Phase 7 Task 7) was inserted between
+# `classify_intent` and `compose_response`, matching the real graph wiring
+# in `services/agent-orchestration/.../graph.py`'s `build_graph`. See
+# chat()'s docstring for why their latency_ms values are a documented
+# simplification, not real per-node timing.
+_STAGE_NAMES = ("classify_intent", "retrieve", "compose_response", "finalize")
+
+# Shown when retrieval ran but found nothing sufficient to cite -- a real
+# knowledge base exists (Phase 7), so this is no longer "no KB yet" (that
+# caption was accurate through Phase 6; it would now be a false statement).
+_NO_KB_MATCH_CAPTION = (
+    "General-knowledge answer — no matching company knowledge-base article "
+    "was found for this question."
+)
 
 
 class ChatRequest(BaseModel):
@@ -38,8 +50,8 @@ async def chat(
     session: Session = Depends(get_db),
     principal: Principal = Depends(get_principal),
 ) -> dict:
-    """Single-turn chat: run the classify_intent -> compose_response ->
-    finalize graph (via `request.app.state.agent_graph`, wired up in
+    """Single-turn chat: run the classify_intent -> retrieve -> compose_response
+    -> finalize graph (via `request.app.state.agent_graph`, wired up in
     main.py's lifespan with AsyncPostgresSaver checkpointing) for one fresh
     thread_id.
 
@@ -55,14 +67,24 @@ async def chat(
     synchronous equivalent being used here, so this is architecturally
     correct, not an inconsistency with the rest of this router's modules.
 
+    Authz note (Phase 7 Task 7): `build_authz_filter(principal, session)` is
+    resolved here, per-request, using this handler's own `Depends(get_db)`
+    session -- then translated into the plain-dict `retrieval_scope` that
+    crosses into the graph's `AgentState` (see agent-orchestration's
+    `state.py` module docstring for why it's a dict, not the typed
+    `AuthzFilter`). This is genuinely per-request (unlike `complete_fn`,
+    which has no per-request auth concept at all), because a different
+    caller can have a different authorized scope for the same graph.
+
     Span/timing note: this task doesn't have genuine per-node timing
     instrumentation wired through LangGraph's own internals yet -- only the
-    single `ainvoke()` call's wall-clock time is actually measured. The 3
-    `Span` rows below (one per conceptual stage) split that single measured
-    duration evenly across the 3 stages as a documented, honest
-    simplification -- this is NOT real per-node timing and must not be read
-    as such; a future phase that wants genuine per-node latency would need
-    to instrument inside the graph nodes themselves (see
+    single `ainvoke()` call's wall-clock time is actually measured. The 4
+    `Span` rows below (one per conceptual stage, `retrieve` added in Phase 7
+    Task 7) split that single measured duration evenly across the 4 stages
+    as a documented, honest simplification -- this is NOT real per-node
+    timing and must not be read as such; a future phase that wants genuine
+    per-node latency would need to instrument inside the graph nodes
+    themselves (see
     services/agent-orchestration/src/resolvegrid_agent_orchestration/graph.py)
     or hook LangGraph's own streaming/callback API.
     """
@@ -77,12 +99,21 @@ async def chat(
     session.add(agent_run)
     session.commit()
 
+    authz_filter = build_authz_filter(principal, session)
+    retrieval_scope = {
+        "unrestricted": authz_filter.unrestricted,
+        "allowed_tags": sorted(authz_filter.allowed_tags),
+    }
+
     initial_state = {
         "thread_id": thread_id,
         "principal_employee_id": principal.employee_id,
         "input_text": payload.message,
         "intent": None,
         "risk_level": None,
+        "retrieval_scope": retrieval_scope,
+        "retrieved_chunks": None,
+        "retrieval_sufficient": None,
         "output_text": None,
         "error": None,
     }
@@ -114,13 +145,15 @@ async def chat(
         span.set_attribute("resolvegrid.latency_ms", latency_ms)
 
     output_text = final_state.get("output_text") or ""
+    retrieved_chunks = final_state.get("retrieved_chunks") or []
+    retrieval_sufficient = bool(final_state.get("retrieval_sufficient"))
 
     agent_run.status = "completed"
     agent_run.output_text = output_text
     agent_run.completed_at = datetime.now(timezone.utc)
 
     # See docstring above: latency is only measured for the whole ainvoke()
-    # call, not per node -- split evenly across the 3 stages as an honest
+    # call, not per node -- split evenly across the 4 stages as an honest
     # placeholder, not a claim of real per-node instrumentation.
     per_stage_latency_ms = latency_ms // len(_STAGE_NAMES)
     for stage_name in _STAGE_NAMES:
@@ -134,4 +167,34 @@ async def chat(
         )
     session.commit()
 
-    return {"answer": output_text, "thread_id": thread_id}
+    # Citation/caption logic (Phase 7 Task 7): only surface citations when
+    # `compose_response` actually used the citation-grounded prompt branch
+    # (retrieval_sufficient AND non-empty chunks -- mirrors graph.py's own
+    # branch condition exactly, so the UI never claims a grounded answer
+    # the model wasn't actually given KB context for). Otherwise this is
+    # the same general-knowledge-answer case Phase 6 always produced --
+    # with an updated caption, since "no ticket or company-specific
+    # knowledge base yet" is no longer true now that a real KB exists; see
+    # graph.py's module docstring for why an insufficient/empty retrieval
+    # result still gets a best-effort general-knowledge answer rather than
+    # a hard abstention.
+    if retrieval_sufficient and retrieved_chunks:
+        citations = [
+            {"chunk_id": chunk["chunk_id"], "document_title": chunk["document_title"]}
+            for chunk in retrieved_chunks
+        ]
+        noun = "citation" if len(citations) == 1 else "citations"
+        caption = (
+            f"Answer grounded in {len(citations)} knowledge-base {noun} from the "
+            "Kestrel knowledge base — see citations below."
+        )
+    else:
+        citations = []
+        caption = _NO_KB_MATCH_CAPTION
+
+    return {
+        "answer": output_text,
+        "thread_id": thread_id,
+        "citations": citations,
+        "caption": caption,
+    }

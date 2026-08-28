@@ -11,6 +11,7 @@ from resolvegrid_agent_orchestration import build_graph
 from resolvegrid_telemetry import init_tracing
 
 from resolvegrid_api import llm_gateway
+from resolvegrid_api.agent_retrieval import retrieve_for_agent
 from resolvegrid_api.db import DATABASE_URL
 from resolvegrid_api.routers import chat, directory, tickets
 
@@ -79,7 +80,15 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         # module level.
         await checkpointer.setup()
         complete_fn = lambda prompt: llm_gateway.complete(prompt).text  # noqa: E731
-        app.state.agent_graph = build_graph(checkpointer, complete_fn)
+        # `retrieve_for_agent` (Phase 7 Task 7) is passed directly, not
+        # wrapped in a lambda like `complete_fn` -- its signature already
+        # matches `RetrieveFn` exactly (`(query_text, retrieval_scope) ->
+        # RetrievalOutcome`), so no adapter is needed. See
+        # `agent_retrieval.py`'s module docstring for why it's built here
+        # (once, at startup) rather than per-request, and how it still
+        # gets per-request DB/authz behavior without a live Session ever
+        # crossing into checkpointed graph state.
+        app.state.agent_graph = build_graph(checkpointer, complete_fn, retrieve_for_agent)
         yield
     trace.get_tracer_provider().shutdown()
 

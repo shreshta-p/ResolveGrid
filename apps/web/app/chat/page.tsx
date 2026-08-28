@@ -4,9 +4,16 @@ import { useState } from "react";
 import { getDebugEmployeeId, setDebugEmployeeId } from "@/lib/debug-principal";
 import { apiFetch } from "@/lib/api";
 
+interface Citation {
+  chunk_id: number;
+  document_title: string;
+}
+
 interface ChatResult {
   answer: string;
   thread_id: string;
+  citations: Citation[];
+  caption: string;
 }
 
 export default function ChatPage() {
@@ -73,8 +80,17 @@ export default function ChatPage() {
       {result && (
         <div role="status">
           <p>{result.answer}</p>
+          {result.citations.length > 0 && (
+            <ul aria-label="citations">
+              {result.citations.map((citation) => (
+                <li key={citation.chunk_id}>
+                  [chunk:{citation.chunk_id}] {citation.document_title}
+                </li>
+              ))}
+            </ul>
+          )}
           <p>
-            <small>General-knowledge answer — no ticket or company-specific knowledge base yet.</small>
+            <small>{result.caption}</small>
           </p>
         </div>
       )}
