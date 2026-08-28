@@ -13,10 +13,66 @@ dependencies = [
     "httpx>=0.27",
 ]
 
+# `reranker.py` (Phase 8 Task 1) needs a real local cross-encoder model,
+# which needs `sentence-transformers` -- and `sentence-transformers` pulls
+# in `torch` + `transformers` + `scipy`/`numpy`/etc as *required* transitive
+# dependencies (there is no way to get real cross-encoder inference without
+# a tensor framework). Measured via a real `uv add` in this environment:
+# torch alone is a 116MB download (CPU-only wheel; PyPI's default index
+# resolves the CPU build here, not a multi-GB CUDA build -- verified via
+# `torch.cuda.is_available()` returning False after install), and the full
+# dependency set is ~200MB of downloads / 28 packages.
+#
+# This repo's workspace (`pyproject.toml` at the repo root) shares one
+# resolution across all `tool.uv.workspace` members, and `apps/api` already
+# depends on `resolvegrid-retrieval` (see `apps/api/pyproject.toml`) purely
+# for `chunker.py`/`embedder.py` today. If `sentence-transformers` were
+# added to `dependencies` above (an unconditional, always-installed
+# dependency), every environment that installs this package -- including
+# `apps/api`'s, which does not call the reranker yet per this task's scope
+# ("do not wire this into retrieval.py... yet") -- would be forced to pull
+# down torch and friends for no benefit. That is a real, avoidable cost
+# (multi-hundred-MB installs, slower CI, a bigger attack surface) for
+# functionality nothing uses yet.
+#
+# So `sentence-transformers` is declared as an *optional* extra
+# (`resolvegrid-retrieval[reranker]`) instead of a core dependency -- the
+# standard packaging mechanism for "this feature needs a heavy dependency
+# that most consumers of this package don't need." A later task that wires
+# `reranker.py` into a real caller (`apps/api` or a dedicated reranking
+# process) should explicitly opt in to the `reranker` extra (or split
+# `reranker.py` into its own service/package entirely, if the footprint
+# argues for physical separation by then) rather than this becoming a core
+# dependency by default.
+[project.optional-dependencies]
+reranker = [
+    "sentence-transformers>=6.0.0",
+]
+
 [dependency-groups]
 dev = [
     "pytest>=8.3",
 ]
+
+# sentence-transformers was previously duplicated into the plain `dev`
+# group above so `uv run --package resolvegrid-retrieval pytest ...`
+# could exercise reranker.py's real-model tests without making it a core
+# runtime dependency. That was wrong: this repo's `dev` dependency-group
+# is included, for EVERY workspace member, by `uv sync --all-packages` --
+# the sync command every CI job and local dev workflow in this repo
+# actually uses (confirmed: `.github/workflows/ci.yml`'s `web`/`authz`/
+# `contracts`/`agent-orchestration`/`api` jobs, none of which touch
+# reranking, all run `uv sync --all-packages`). Verified empirically: with
+# sentence-transformers in `dev`, a plain `uv sync --all-packages` in this
+# repo pulled in torch/transformers regardless of which package a job
+# actually cares about -- exactly the "real, avoidable cost... for
+# functionality nothing uses yet" the `[reranker]` extra above exists to
+# prevent, silently reintroduced through the dev-group side door. The
+# `[reranker]` extra (defined above) is the only place
+# sentence-transformers is now declared; `services/retrieval`'s own CI job
+# opts in explicitly (`uv sync --all-packages --extra reranker`, see
+# `.github/workflows/ci.yml`) rather than every job paying for it by
+# default.
 
 [build-system]
 requires = ["hatchling"]

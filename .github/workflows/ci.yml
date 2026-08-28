@@ -123,11 +123,21 @@ jobs:
 
   retrieval:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    # Higher than the other uv-based jobs: test_reranker.py (Phase 8 Task 1)
+    # downloads a real ~1.1GB bge-reranker-base model on first use, on top
+    # of the reranker extra's own torch/transformers download -- budget
+    # real time for both rather than the other jobs' 10-minute default.
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v3
         with:
           version: "0.8.13"
-      - run: uv sync --all-packages
+      # --extra reranker: sentence-transformers/torch/transformers are an
+      # optional extra on resolvegrid-retrieval (see its pyproject.toml),
+      # not a core dependency or a plain dev-group entry, specifically so
+      # every OTHER job's plain `uv sync --all-packages` doesn't pay for a
+      # ~200MB torch install it never uses -- only this job, which actually
+      # runs reranker.py's real-model tests, opts in explicitly.
+      - run: uv sync --all-packages --extra reranker
       - run: uv run --package resolvegrid-retrieval pytest services/retrieval/tests -v
