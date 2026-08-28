@@ -110,9 +110,21 @@ def test_arq_worker_processes_ingest_seed_corpus_task_via_real_redis(raw_db_sess
     (which would make Task 4/5's fixed-content search-ranking tests in
     test_retrieval.py increasingly fragile -- their queries and result
     -set assertions assume no unrelated matching content exists), this
-    test deletes exactly the rows it caused to exist afterwards: the
-    corpus Documents (by title) and everything that cascades from them,
-    plus the IngestionRun row(s) created during this test.
+    test deletes exactly the `Document`/`Chunk`/`Embedding` rows it caused
+    to exist, tracked by an id-watermark (like `IngestionRun` below), NOT
+    by matching the seed corpus's titles. Title-matching was the original
+    approach here and is WRONG once the dev DB may already have the seed
+    corpus permanently ingested (Phase 7 Task 10's deliberate final-state
+    choice, see docs/PROGRESS.md's Phase 7 row): `ingest_document`'s
+    idempotency means re-running ingestion against an already-ingested
+    corpus creates zero new Document rows (a title match resolves to the
+    existing one), so a title-based cleanup would delete rows this test
+    never created -- destroying the deliberately-persisted corpus as a
+    side effect of merely running the test suite (this was caught for
+    real: it silently wiped an already-ingested corpus during Task 10's
+    own fresh-state verification). The id-watermark approach correctly
+    deletes nothing when the corpus was already present before this test
+    ran, since no new ids are created in that case.
     """
     from sqlalchemy import delete
 
@@ -127,6 +139,10 @@ def test_arq_worker_processes_ingest_seed_corpus_task_via_real_redis(raw_db_sess
             await pool.aclose()
 
     before_max_id = raw_db_session.scalar(select(func.max(IngestionRun.id))) or 0
+    before_max_document_id = raw_db_session.scalar(select(func.max(Document.id))) or 0
+    before_max_version_id = raw_db_session.scalar(select(func.max(DocumentVersion.id))) or 0
+    before_max_chunk_id = raw_db_session.scalar(select(func.max(Chunk.id))) or 0
+    before_max_embedding_id = raw_db_session.scalar(select(func.max(Embedding.id))) or 0
 
     asyncio.run(_enqueue())
 
@@ -145,16 +161,24 @@ def test_arq_worker_processes_ingest_seed_corpus_task_via_real_redis(raw_db_sess
         assert latest_run.documents_processed == len(load_seed_corpus())
         assert latest_run.chunks_created > 0
     finally:
-        titles = [doc.title for doc in load_seed_corpus()]
-        document_ids = raw_db_session.scalars(select(Document.id).where(Document.title.in_(titles))).all()
-        version_ids = raw_db_session.scalars(
-            select(DocumentVersion.id).where(DocumentVersion.document_id.in_(document_ids))
+        # Delete only rows this run actually created (id > watermark), not
+        # rows matching the seed corpus's titles -- if the corpus was
+        # already ingested before this test ran, ingest_document's
+        # idempotency means this run created zero new rows in any of
+        # these tables, so nothing is deleted (the pre-existing,
+        # deliberately-persisted corpus survives untouched).
+        embedding_ids = raw_db_session.scalars(
+            select(Embedding.id).where(Embedding.id > before_max_embedding_id)
         ).all()
-        chunk_ids = raw_db_session.scalars(
-            select(Chunk.id).where(Chunk.document_version_id.in_(version_ids))
+        chunk_ids = raw_db_session.scalars(select(Chunk.id).where(Chunk.id > before_max_chunk_id)).all()
+        version_ids = raw_db_session.scalars(
+            select(DocumentVersion.id).where(DocumentVersion.id > before_max_version_id)
+        ).all()
+        document_ids = raw_db_session.scalars(
+            select(Document.id).where(Document.id > before_max_document_id)
         ).all()
 
-        raw_db_session.execute(delete(Embedding).where(Embedding.chunk_id.in_(chunk_ids)))
+        raw_db_session.execute(delete(Embedding).where(Embedding.id.in_(embedding_ids)))
         raw_db_session.execute(delete(Chunk).where(Chunk.id.in_(chunk_ids)))
         raw_db_session.execute(delete(DocumentVersion).where(DocumentVersion.id.in_(version_ids)))
         raw_db_session.execute(delete(Document).where(Document.id.in_(document_ids)))

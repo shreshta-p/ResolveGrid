@@ -125,22 +125,40 @@ def seed_corpus_ingested(raw_db_session):
     result lists and breaking that equality assertion in a different test
     file entirely. Function-scoped (not module-scoped) so it cleans up
     after every test that uses it, not just once for the whole file.
+
+    Cleanup is tracked by id-watermark (rows with id greater than what
+    existed before this fixture ran), NOT by matching the seed corpus's
+    titles -- title-matching deletes rows this fixture didn't create
+    whenever the dev DB already has the corpus permanently ingested
+    (Phase 7 Task 10's deliberate final-state choice, see
+    docs/PROGRESS.md's Phase 7 row): `ingest_document`'s idempotency means
+    re-ingesting an already-present corpus creates zero new rows (a title
+    match resolves to the existing Document/DocumentVersion), so a
+    title-based cleanup would silently destroy that deliberately
+    -persisted corpus as a side effect of merely running this test (caught
+    for real during Task 10's own fresh-state verification).
     """
     before_max_run_id = raw_db_session.scalar(select(func.max(IngestionRun.id))) or 0
+    before_max_document_id = raw_db_session.scalar(select(func.max(Document.id))) or 0
+    before_max_version_id = raw_db_session.scalar(select(func.max(DocumentVersion.id))) or 0
+    before_max_chunk_id = raw_db_session.scalar(select(func.max(Chunk.id))) or 0
+    before_max_embedding_id = raw_db_session.scalar(select(func.max(Embedding.id))) or 0
     run_seed_corpus_ingestion(raw_db_session)
     raw_db_session.commit()
     try:
         yield
     finally:
-        titles = [doc.title for doc in load_seed_corpus()]
-        document_ids = raw_db_session.scalars(select(Document.id).where(Document.title.in_(titles))).all()
+        embedding_ids = raw_db_session.scalars(
+            select(Embedding.id).where(Embedding.id > before_max_embedding_id)
+        ).all()
+        chunk_ids = raw_db_session.scalars(select(Chunk.id).where(Chunk.id > before_max_chunk_id)).all()
         version_ids = raw_db_session.scalars(
-            select(DocumentVersion.id).where(DocumentVersion.document_id.in_(document_ids))
+            select(DocumentVersion.id).where(DocumentVersion.id > before_max_version_id)
         ).all()
-        chunk_ids = raw_db_session.scalars(
-            select(Chunk.id).where(Chunk.document_version_id.in_(version_ids))
+        document_ids = raw_db_session.scalars(
+            select(Document.id).where(Document.id > before_max_document_id)
         ).all()
-        raw_db_session.execute(delete(Embedding).where(Embedding.chunk_id.in_(chunk_ids)))
+        raw_db_session.execute(delete(Embedding).where(Embedding.id.in_(embedding_ids)))
         raw_db_session.execute(delete(Chunk).where(Chunk.id.in_(chunk_ids)))
         raw_db_session.execute(delete(DocumentVersion).where(DocumentVersion.id.in_(version_ids)))
         raw_db_session.execute(delete(Document).where(Document.id.in_(document_ids)))

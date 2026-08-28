@@ -8,10 +8,11 @@ Internal IT service-management + AI-ops platform for the fictional company **Kes
 |---|---|
 | Frontend | Next.js 16 (App Router) / TypeScript |
 | Backend | FastAPI (Python 3.13) |
-| Agent orchestration | LangGraph (added in a later phase) |
-| Data | PostgreSQL + pgvector, Redis |
-| Local inference | Ollama (GPU-accelerated) |
-| Model gateway | LiteLLM proxy (added in a later phase) |
+| Agent orchestration | LangGraph (`classify_intent → retrieve → compose_response → finalize`) |
+| Knowledge retrieval | Hybrid RAG: pgvector cosine search + Postgres lexical search + RRF fusion, authz-aware filtering, Arq-based ingestion pipeline (see `docs/RAG_INGESTION.md`) |
+| Data | PostgreSQL + pgvector, Redis (also backs the Arq ingestion queue) |
+| Local inference | Ollama (GPU-accelerated) — `qwen3:14b` chat, `nomic-embed-text` embeddings |
+| Model gateway | LiteLLM proxy (chat completions only — embeddings call Ollama directly, see `docs/RAG_INGESTION.md`) |
 | Observability | OpenTelemetry Collector, Langfuse, Prometheus/Grafana (added in a later phase) |
 
 ## Quick start
@@ -40,9 +41,11 @@ Then check `http://localhost:8000/health` and `http://localhost:3000`.
 - `apps/api` — FastAPI backend
 - `apps/web` — Next.js frontend
 - `packages/telemetry` — shared OpenTelemetry instrumentation
+- `services/agent-orchestration` — LangGraph agent graph (chat/classify/retrieve/compose)
+- `services/retrieval` — structure-aware Markdown chunker + embedder (pure library, no DB/app dependency)
 - `infra/` — Docker Compose + service configs
-- `docs/` — canonical documentation set; `docs/PROGRESS.md` is the single authoritative status ledger
-- `eval/` — golden dataset, adversarial cases, load-test workloads (added in a later phase)
+- `docs/` — canonical documentation set; `docs/PROGRESS.md` is the single authoritative status ledger; `docs/RAG_INGESTION.md` documents the knowledge ingestion/retrieval pipeline
+- `eval/` — golden retrieval dataset (`eval/golden/`), seed corpus source Markdown (`eval/corpus/`)
 
 ## Commands
 
