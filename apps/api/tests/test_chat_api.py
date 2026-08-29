@@ -1,3 +1,4 @@
+import re
 from unittest.mock import patch
 
 import pytest
@@ -318,13 +319,46 @@ def test_chat_retrieves_and_cites_public_seed_corpus_chunk(chat_fixtures, seed_c
     requester = chat_fixtures
     message = "What is a VPN?"
 
-    with patch(
-        _COMPLETE_PATCH_TARGET,
-        side_effect=[
-            _classification_result(),
-            _answer_result("A VPN creates an encrypted tunnel for remote access [chunk:1]."),
-        ],
-    ) as mock_complete:
+    # The mocked answer must cite a REAL chunk id -- Phase 8 Task 7's
+    # citation-verification step (`verify_citations`, running inside the
+    # real graph after compose_response) strips any [chunk:<id>] marker
+    # that doesn't resolve to a chunk actually present in the real
+    # context_block, and chat.py now filters the returned `citations` list
+    # down to exactly the verified survivors. A hardcoded fake id like
+    # `[chunk:1]` would always get stripped as fabricated, since real
+    # `Chunk.id` values are DB-assigned autoincrement ints, never
+    # literally 1 in this shared dev DB. `side_effect` here is a callable
+    # (not a fixed list) so the second call can inspect the REAL prompt
+    # `compose_response` built (which already contains real `[chunk:<id>]`
+    # labels for whatever `retrieve_for_agent` actually found) and cite
+    # the first real id it sees, rather than guessing one.
+    _call_count = {"n": 0}
+
+    def _complete_side_effect(prompt: str) -> CompletionResult:
+        _call_count["n"] += 1
+        if _call_count["n"] == 1:
+            # 1st call: classify_intent's prompt.
+            return _classification_result()
+        # 2nd call: compose_response's prompt, which already contains real
+        # [chunk:<id>] labels for whatever retrieve_for_agent actually
+        # found -- extract one to cite rather than guessing a fake id.
+        # Must search only inside the <retrieved_context>...</retrieved_context>
+        # delimiter (Phase 8 Task 7's prompt-injection framing fix), not
+        # the whole prompt: the instruction text above it contains its own
+        # literal formatting EXAMPLE, "[chunk:123]", which is not a real
+        # chunk id and must not be picked up here.
+        context_match = re.search(
+            r"<retrieved_context>(.*)</retrieved_context>", prompt, re.DOTALL
+        )
+        assert context_match, f"expected a <retrieved_context> block in the prompt: {prompt!r}"
+        match = re.search(r"\[chunk:(\d+)\]", context_match.group(1))
+        assert match, f"expected a real [chunk:<id>] citation label inside <retrieved_context>: {prompt!r}"
+        real_chunk_id = match.group(1)
+        return _answer_result(
+            f"A VPN creates an encrypted tunnel for remote access [chunk:{real_chunk_id}]."
+        )
+
+    with patch(_COMPLETE_PATCH_TARGET, side_effect=_complete_side_effect) as mock_complete:
         response = client.post(
             "/chat",
             json={"message": message},
@@ -335,7 +369,7 @@ def test_chat_retrieves_and_cites_public_seed_corpus_chunk(chat_fixtures, seed_c
     assert mock_complete.call_count == 2
     body = response.json()
 
-    assert body["citations"], "expected at least one citation from the ingested seed corpus"
+    assert body["citations"], "expected at least one verified citation from the ingested seed corpus"
     titles = {c["document_title"] for c in body["citations"]}
     assert "What Is a VPN (Public Reference)" in titles
     assert all("chunk_id" in c and "document_title" in c for c in body["citations"])

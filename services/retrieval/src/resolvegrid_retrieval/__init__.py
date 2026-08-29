@@ -10,6 +10,12 @@ is wired in by a later ingestion task.
 """
 
 from resolvegrid_retrieval.chunker import ChunkRecord, chunk_markdown
+from resolvegrid_retrieval.status_adjustment import apply_status_adjustment
 from resolvegrid_retrieval.tokenizer import estimate_token_count
 
-__all__ = ["ChunkRecord", "chunk_markdown", "estimate_token_count"]
+__all__ = [
+    "ChunkRecord",
+    "apply_status_adjustment",
+    "chunk_markdown",
+    "estimate_token_count",
+]

@@ -114,8 +114,12 @@ async def chat(
         "retrieval_scope": retrieval_scope,
         "retrieved_chunks": None,
         "retrieval_sufficient": None,
+        "context_block": None,
         "output_text": None,
         "error": None,
+        "citations_verified": None,
+        "verified_chunk_ids": None,
+        "fabricated_chunk_ids": None,
     }
 
     with tracer.start_as_current_span("chat.graph_run") as span:
@@ -147,6 +151,7 @@ async def chat(
     output_text = final_state.get("output_text") or ""
     retrieved_chunks = final_state.get("retrieved_chunks") or []
     retrieval_sufficient = bool(final_state.get("retrieval_sufficient"))
+    verified_chunk_ids = set(final_state.get("verified_chunk_ids") or [])
 
     agent_run.status = "completed"
     agent_run.output_text = output_text
@@ -167,27 +172,48 @@ async def chat(
         )
     session.commit()
 
-    # Citation/caption logic (Phase 7 Task 7): only surface citations when
-    # `compose_response` actually used the citation-grounded prompt branch
-    # (retrieval_sufficient AND non-empty chunks -- mirrors graph.py's own
-    # branch condition exactly, so the UI never claims a grounded answer
-    # the model wasn't actually given KB context for). Otherwise this is
-    # the same general-knowledge-answer case Phase 6 always produced --
-    # with an updated caption, since "no ticket or company-specific
-    # knowledge base yet" is no longer true now that a real KB exists; see
-    # graph.py's module docstring for why an insufficient/empty retrieval
-    # result still gets a best-effort general-knowledge answer rather than
-    # a hard abstention.
+    # Citation/caption logic (Phase 7 Task 7, refined Phase 8 Task 7): only
+    # surface citations when `compose_response` actually used the
+    # citation-grounded prompt branch (retrieval_sufficient AND non-empty
+    # chunks -- mirrors graph.py's own branch condition exactly, so the UI
+    # never claims a grounded answer the model wasn't actually given KB
+    # context for). Otherwise this is the same general-knowledge-answer
+    # case Phase 6 always produced -- with an updated caption, since "no
+    # ticket or company-specific knowledge base yet" is no longer true now
+    # that a real KB exists; see graph.py's module docstring for why an
+    # insufficient/empty retrieval result still gets a best-effort
+    # general-knowledge answer rather than a hard abstention.
+    #
+    # Phase 8 Task 7: citations are further filtered down to
+    # `verified_chunk_ids` -- the graph's `verify_citations` node (running
+    # after `compose_response`, before `finalize`) already rewrote
+    # `output_text` to strip any fabricated `[chunk:<id>]` marker before
+    # this handler ever sees it (see state.py's `citations_verified`
+    # docstring); this filter keeps the separately-returned `citations`
+    # list in lockstep with that same guarantee -- only citations the
+    # model actually made AND that verified against `context_block` are
+    # ever surfaced to the UI, never the full pre-verification
+    # `retrieved_chunks` set (which may include chunks retrieved but never
+    # actually cited in the answer).
     if retrieval_sufficient and retrieved_chunks:
         citations = [
             {"chunk_id": chunk["chunk_id"], "document_title": chunk["document_title"]}
             for chunk in retrieved_chunks
+            if chunk["chunk_id"] in verified_chunk_ids
         ]
-        noun = "citation" if len(citations) == 1 else "citations"
-        caption = (
-            f"Answer grounded in {len(citations)} knowledge-base {noun} from the "
-            "Kestrel knowledge base — see citations below."
-        )
+        if citations:
+            noun = "citation" if len(citations) == 1 else "citations"
+            caption = (
+                f"Answer grounded in {len(citations)} knowledge-base {noun} from the "
+                "Kestrel knowledge base — see citations below."
+            )
+        else:
+            # Retrieval was sufficient and chunks were shown to the model,
+            # but the answer either cited nothing or cited only fabricated
+            # ids that got stripped -- there is nothing verified to point
+            # to, so this degrades to the same caption as "no KB match"
+            # rather than falsely implying grounded citations exist.
+            caption = _NO_KB_MATCH_CAPTION
     else:
         citations = []
         caption = _NO_KB_MATCH_CAPTION

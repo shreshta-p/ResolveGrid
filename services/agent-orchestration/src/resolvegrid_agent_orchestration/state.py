@@ -72,5 +72,40 @@ class AgentState(TypedDict):
     # graph.py's module docstring for the documented scope limit on how
     # far this drives abstention routing.
     retrieval_sufficient: bool | None
+    # Phase 8 Task 7: the pre-assembled, token-budgeted context block text
+    # (`resolvegrid_retrieval.context_budget.assemble_context(...).text`),
+    # already reranked/status-adjusted/deduped/budgeted by `retrieve_fn`
+    # (see `apps/api`'s `agent_retrieval.py` -- that's where all of this
+    # runs, since it needs DB access `services/retrieval` doesn't have;
+    # see graph.py's module docstring). `compose_response` substitutes
+    # this directly into its prompt template's untrusted-data-delimited
+    # slot instead of building its own unbounded join from
+    # `retrieved_chunks` -- see graph.py's `_COMPOSE_PROMPT_WITH_CONTEXT_
+    # TEMPLATE`. `retrieved_chunks` above is exactly the set of chunks
+    # whose formatted entry appears in this text (`ContextBlock.chunk_ids`,
+    # not the larger pre-budget candidate pool) -- the two must stay in
+    # lockstep so citation verification's `valid_chunk_ids` (derived from
+    # `retrieved_chunks`) matches what the model actually saw in `text`.
+    context_block: str | None
     output_text: str | None
     error: str | None
+    # Phase 8 Task 7: the deterministic citation-verification outcome for
+    # `output_text`, populated by the `verify_citations` node (runs after
+    # `compose_response`, before `finalize`). `citations_verified` is
+    # `True` iff every `[chunk:<id>]` citation `output_text` contained (at
+    # the time verification ran) resolved to a chunk id actually present
+    # in `context_block`/`retrieved_chunks` -- vacuously `True` when the
+    # answer cited nothing at all. `output_text` is REWRITTEN by that node
+    # to strip any fabricated citation markers before `finalize` ever sees
+    # it (see graph.py's `verify_citations_node` docstring for the exact
+    # graph-level consequence chosen) -- so by the time a caller reads
+    # `state["output_text"]` after a full graph run, it is already
+    # citation-safe. `verified_chunk_ids`/`fabricated_chunk_ids` are the
+    # unique ids in first-appearance order (mirrors `VerificationResult`'s
+    # own shape) -- `apps/api`'s `/chat` uses `verified_chunk_ids` to build
+    # the citation list it actually surfaces to the UI (only citations the
+    # model actually made AND that verified survive), not the full
+    # pre-citation `retrieved_chunks` list.
+    citations_verified: bool | None
+    verified_chunk_ids: list[int] | None
+    fabricated_chunk_ids: list[int] | None

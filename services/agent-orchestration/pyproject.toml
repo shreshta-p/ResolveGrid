@@ -6,7 +6,17 @@ requires-python = ">=3.13"
 dependencies = [
     "langgraph>=1.2",
     "pydantic>=2.0",
+    # Phase 8 Task 7: `verify_citations_node` (graph.py) uses
+    # `resolvegrid_retrieval.citation_verification.verify_citations` -- a
+    # pure, dependency-free module (confirmed: no external imports at all)
+    # from a sibling workspace library, not `resolvegrid_api` -- see
+    # graph.py's module docstring for why this doesn't violate this
+    # package's "never import resolvegrid_api" dependency-direction rule.
+    "resolvegrid-retrieval",
 ]
+
+[tool.uv.sources]
+resolvegrid-retrieval = { workspace = true }
 
 [dependency-groups]
 dev = [

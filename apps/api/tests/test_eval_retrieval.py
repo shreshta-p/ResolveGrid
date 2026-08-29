@@ -184,17 +184,26 @@ def test_reranked_eval_path_runs_end_to_end_against_real_corpus_and_reranker(db_
     assert reranked.mean_reciprocal_rank >= _MIN_MEAN_RECIPROCAL_RANK, reranked.mean_reciprocal_rank
     assert reranked.mean_ndcg_at_k >= _MIN_MEAN_NDCG_AT_K, reranked.mean_ndcg_at_k
 
-    # Known, measured finding (see this section's docstring and
-    # docs/EXPERIMENT_REGISTRY.md): reranking flips exactly one of the 3
-    # VPN v1/v2 distractor cases so the deprecated chunk outranks the
-    # current one. This pins that as the current known ceiling -- more
-    # than one flip would be a new, undocumented regression worth
-    # investigating before a later task wires this reranker model/
-    # threshold into the live graph as-is.
+    # Phase 8 Task 6 found, and independent review confirmed, that
+    # reranking ALONE flips one of the 3 VPN v1/v2 distractor cases so the
+    # deprecated chunk outranks the current one. Phase 8 Task 7 Part B
+    # fixed this with `apply_status_adjustment` (a Document.status
+    # -- aware deprioritization applied between rerank() and dedup(), see
+    # `resolvegrid_retrieval.status_adjustment`'s module docstring and
+    # this module's own reranking-path docstring above) -- this path now
+    # exercises the SAME rerank -> status-adjust -> dedup order the real
+    # production pipeline uses (`agent_retrieval.py`), so a flip here
+    # would mean the live graph has the same bug. With the fix in place
+    # this is a hard zero-tolerance assertion, not a "known ceiling of 1"
+    # -- confirmed by direct real measurement (see
+    # docs/EXPERIMENT_REGISTRY.md's Phase 8 Task 7 entry): all 3
+    # distractor cases now show `distractor_beats_best_relevant=False`
+    # with a wide positive margin (6-8 ranks), not just a narrow correct
+    # order.
     distractor_beats_count = sum(
         1 for c in reranked.case_results if c.distractor_beats_best_relevant
     )
-    assert distractor_beats_count <= 1, [
+    assert distractor_beats_count == 0, [
         c.query for c in reranked.case_results if c.distractor_beats_best_relevant
     ]
 

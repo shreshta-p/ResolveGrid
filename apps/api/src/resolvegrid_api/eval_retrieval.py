@@ -156,6 +156,7 @@ from resolvegrid_api.retrieval_authz import AuthzFilter
 from resolvegrid_retrieval.dedup import DEFAULT_DEDUP_THRESHOLD, dedup
 from resolvegrid_retrieval.embedder import DEFAULT_EMBEDDING_MODEL, embed_texts
 from resolvegrid_retrieval.reranker import DEFAULT_RERANKER_MODEL, rerank
+from resolvegrid_retrieval.status_adjustment import apply_status_adjustment
 
 _DEFAULT_GOLDEN_PATH = (
     Path(__file__).resolve().parents[4] / "eval" / "golden" / "phase7_retrieval_v1.jsonl"
@@ -346,6 +347,26 @@ def _fetch_chunk_texts(session: Session, chunk_ids: list[int]) -> dict[int, str]
     return {chunk_id: text for chunk_id, text in rows}
 
 
+def _fetch_superseded_chunk_ids(session: Session, chunk_ids: list[int]) -> frozenset[int]:
+    """Resolve which of `chunk_ids` belong to a `Document.status ==
+    "superseded"` document (Phase 8 Task 7 Part B: the status-aware
+    deprioritization mitigation for the VPN v1/v2 distractor-flip
+    regression, see `docs/EXPERIMENT_REGISTRY.md`'s Phase 8 Task 6/7
+    entries and `resolvegrid_retrieval.status_adjustment`'s module
+    docstring). Empty input returns `frozenset()` without a query, same
+    short-circuit convention as `_fetch_chunk_texts`.
+    """
+    if not chunk_ids:
+        return frozenset()
+    rows = session.execute(
+        select(Chunk.id)
+        .join(DocumentVersion, DocumentVersion.id == Chunk.document_version_id)
+        .join(Document, Document.id == DocumentVersion.document_id)
+        .where(Chunk.id.in_(chunk_ids), Document.status == "superseded")
+    ).all()
+    return frozenset(row[0] for row in rows)
+
+
 def evaluate_case(
     session: Session,
     case: GoldenCase,
@@ -360,8 +381,12 @@ def evaluate_case(
     this is byte-for-byte Phase 7's baseline behavior: score
     `fuse_rrf`'s fused order directly. Passing `reranker_model` (e.g.
     `resolvegrid_retrieval.reranker.DEFAULT_RERANKER_MODEL`) additionally
-    reranks the *entire* fused candidate list via `rerank()`, then
-    deduplicates it via `dedup()` (see module docstring), and scores that
+    reranks the *entire* fused candidate list via `rerank()`, applies
+    `apply_status_adjustment` (Phase 8 Task 7 Part B -- deprioritizes any
+    candidate whose `Document.status == "superseded"`, matching
+    `apps/api/src/resolvegrid_api/agent_retrieval.py`'s real production
+    pipeline order exactly, rerank -> status-adjust -> dedup), then
+    deduplicates via `dedup()` (see module docstring), and scores that
     order instead -- against the exact same hand-labeled relevant sets,
     so a reranked run is directly comparable to a baseline run.
     """
@@ -381,13 +406,18 @@ def evaluate_case(
     if reranker_model is None:
         ranked_chunk_ids = [chunk_id for chunk_id, _ in fused]
     else:
-        chunk_texts = _fetch_chunk_texts(session, [chunk_id for chunk_id, _ in fused])
+        fused_ids = [chunk_id for chunk_id, _ in fused]
+        chunk_texts = _fetch_chunk_texts(session, fused_ids)
+        superseded_ids = _fetch_superseded_chunk_ids(session, fused_ids)
         candidates = [(chunk_id, chunk_texts[chunk_id]) for chunk_id, _ in fused]
         reranked = rerank(case.query, candidates, model=reranker_model)
         reranked_with_text = [
             (chunk_id, chunk_texts[chunk_id], score) for chunk_id, score in reranked
         ]
-        deduped = dedup(reranked_with_text, threshold=dedup_threshold)
+        adjusted = apply_status_adjustment(
+            reranked_with_text, superseded_chunk_ids=superseded_ids
+        )
+        deduped = dedup(adjusted, threshold=dedup_threshold)
         ranked_chunk_ids = [chunk_id for chunk_id, _text, _score in deduped]
 
     sufficiency = assess_sufficiency(fused)

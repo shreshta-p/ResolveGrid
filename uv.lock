@@ -1653,6 +1653,7 @@ source = { editable = "services/agent-orchestration" }
 dependencies = [
     { name = "langgraph" },
     { name = "pydantic" },
+    { name = "resolvegrid-retrieval" },
 ]
 
 [package.dev-dependencies]
@@ -1664,6 +1665,7 @@ dev = [
 requires-dist = [
     { name = "langgraph", specifier = ">=1.2" },
     { name = "pydantic", specifier = ">=2.0" },
+    { name = "resolvegrid-retrieval", editable = "services/retrieval" },
 ]
 
 [package.metadata.requires-dev]

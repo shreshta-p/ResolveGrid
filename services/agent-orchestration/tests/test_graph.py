@@ -32,8 +32,12 @@ _BASE_STATE = {
     "retrieval_scope": None,
     "retrieved_chunks": None,
     "retrieval_sufficient": None,
+    "context_block": None,
     "output_text": None,
     "error": None,
+    "citations_verified": None,
+    "verified_chunk_ids": None,
+    "fabricated_chunk_ids": None,
 }
 
 
@@ -153,6 +157,8 @@ def test_compose_response_uses_citation_context_prompt_when_retrieval_sufficient
                 }
             ],
             retrieval_sufficient=True,
+            context_block='[chunk:42] (from "Kestrel VPN Access Policy (v2)"):\n'
+            "A VPN is required for remote access.",
         )
     )
     prompt = captured_prompts[0]
@@ -160,6 +166,37 @@ def test_compose_response_uses_citation_context_prompt_when_retrieval_sufficient
     assert "Kestrel VPN Access Policy (v2)" in prompt
     assert "A VPN is required for remote access." in prompt
     assert "cite it inline" in prompt
+    # Phase 8 Task 7: the context block is delimited and framed as
+    # untrusted data, not instructions -- see graph.py's
+    # `_COMPOSE_PROMPT_WITH_CONTEXT_TEMPLATE`.
+    assert "<retrieved_context>" in prompt
+    assert "</retrieved_context>" in prompt
+    assert "never" in prompt.lower() and "instructions" in prompt.lower()
+
+
+def test_compose_response_falls_back_to_general_knowledge_when_chunks_present_but_no_context_block():
+    # retrieved_chunks non-empty + retrieval_sufficient=True, but
+    # context_block empty/missing (e.g. every candidate was dropped by the
+    # token budget) must NOT use the citation-context branch -- there is
+    # nothing to substitute into it.
+    captured_prompts = []
+
+    def fake_complete(prompt: str) -> str:
+        captured_prompts.append(prompt)
+        return "answer"
+
+    node = make_compose_response_node(fake_complete)
+    node(
+        _state(
+            input_text="what is a VPN?",
+            retrieved_chunks=[
+                {"chunk_id": 1, "document_title": "Doc", "text": "irrelevant", "score": 0.5}
+            ],
+            retrieval_sufficient=True,
+            context_block="",
+        )
+    )
+    assert "No relevant company-specific knowledge-base article was found" in captured_prompts[0]
 
 
 def test_compose_response_falls_back_to_general_knowledge_when_no_chunks():
@@ -177,7 +214,7 @@ def test_compose_response_falls_back_to_general_knowledge_when_no_chunks():
 # --- retrieve ---------------------------------------------------------------
 
 
-def test_retrieve_attaches_chunks_and_sufficiency_from_fake_retrieve_fn():
+def test_retrieve_attaches_chunks_sufficiency_and_context_block_from_fake_retrieve_fn():
     def fake_retrieve(query_text: str, scope):
         assert query_text == "what is a VPN?"
         assert scope == {"unrestricted": False, "allowed_tags": ["security"]}
@@ -186,6 +223,7 @@ def test_retrieve_attaches_chunks_and_sufficiency_from_fake_retrieve_fn():
                 {"chunk_id": 1, "document_title": "Doc", "text": "text", "score": 0.5}
             ],
             "sufficient": True,
+            "context_block": '[chunk:1] (from "Doc"):\ntext',
         }
 
     node = make_retrieve_node(fake_retrieve)
@@ -198,6 +236,7 @@ def test_retrieve_attaches_chunks_and_sufficiency_from_fake_retrieve_fn():
     assert result == {
         "retrieved_chunks": [{"chunk_id": 1, "document_title": "Doc", "text": "text", "score": 0.5}],
         "retrieval_sufficient": True,
+        "context_block": '[chunk:1] (from "Doc"):\ntext',
     }
 
 
@@ -207,13 +246,13 @@ def test_retrieve_degrades_softly_when_retrieve_fn_raises():
 
     node = make_retrieve_node(failing_retrieve)
     result = node(_state(input_text="hello"))
-    assert result == {"retrieved_chunks": [], "retrieval_sufficient": False}
+    assert result == {"retrieved_chunks": [], "retrieval_sufficient": False, "context_block": ""}
 
 
 def test_retrieve_defaults_missing_outcome_keys_safely():
     node = make_retrieve_node(lambda query_text, scope: {})
     result = node(_state(input_text="hello"))
-    assert result == {"retrieved_chunks": [], "retrieval_sufficient": False}
+    assert result == {"retrieved_chunks": [], "retrieval_sufficient": False, "context_block": ""}
 
 
 # --- finalize --------------------------------------------------------------
@@ -292,6 +331,8 @@ def test_build_graph_runs_end_to_end_with_sufficient_retrieval_produces_citation
                 }
             ],
             "sufficient": True,
+            "context_block": '[chunk:7] (from "Kestrel VPN Access Policy (v2)"):\n'
+            "Remote access requires the corporate VPN client.",
         }
 
     checkpointer = InMemorySaver()
@@ -309,3 +350,52 @@ def test_build_graph_runs_end_to_end_with_sufficient_retrieval_produces_citation
     # the chunk's citation context through.
     assert "[chunk:7]" in calls[1]
     assert "Kestrel VPN Access Policy (v2)" in calls[1]
+    # Phase 8 Task 7: citation verification ran and found the model's
+    # citation to be genuine (chunk 7 was really in context).
+    assert result["citations_verified"] is True
+    assert result["verified_chunk_ids"] == [7]
+    assert result["fabricated_chunk_ids"] == []
+
+
+def test_build_graph_strips_a_fabricated_citation_before_finalize():
+    calls = []
+
+    def fake_complete(prompt: str) -> str:
+        calls.append(prompt)
+        if len(calls) == 1:
+            return json.dumps({"intent": "general_question", "risk_level": "low"})
+        # The model cites a real chunk (7) AND a fabricated one (999) that
+        # was never part of its context.
+        return "Remote access needs a VPN client [chunk:7], per policy [chunk:999]."
+
+    def fake_retrieve(query_text: str, scope):
+        return {
+            "chunks": [
+                {
+                    "chunk_id": 7,
+                    "document_title": "Kestrel VPN Access Policy (v2)",
+                    "text": "Remote access requires the corporate VPN client.",
+                    "score": 0.05,
+                }
+            ],
+            "sufficient": True,
+            "context_block": '[chunk:7] (from "Kestrel VPN Access Policy (v2)"):\n'
+            "Remote access requires the corporate VPN client.",
+        }
+
+    checkpointer = InMemorySaver()
+    graph = build_graph(checkpointer, fake_complete, fake_retrieve)
+
+    result = graph.invoke(
+        _state(thread_id="test-thread-3", input_text="What is the VPN policy?"),
+        config={"configurable": {"thread_id": "test-thread-3"}},
+    )
+
+    assert result["citations_verified"] is False
+    assert result["verified_chunk_ids"] == [7]
+    assert result["fabricated_chunk_ids"] == [999]
+    # The fabricated marker is stripped; the genuine citation and
+    # surrounding prose survive untouched.
+    assert "[chunk:999]" not in result["output_text"]
+    assert "[chunk:7]" in result["output_text"]
+    assert result["output_text"] == "Remote access needs a VPN client [chunk:7], per policy ."
