@@ -11,7 +11,13 @@ permissions:
 jobs:
   api:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    # 25, not the other jobs' 15: apps/api/tests/test_eval_retrieval.py's
+    # reranking-enabled eval test (Phase 8 Task 6) needs the same
+    # `--extra reranker` install (sentence-transformers/torch/
+    # transformers + a real ~1.1GB bge-reranker-base download on first
+    # use) the `retrieval` job below already budgets 15 minutes for on
+    # its own, on top of this job's existing DB/Ollama/Redis setup work.
+    timeout-minutes: 25
     services:
       postgres:
         image: pgvector/pgvector:pg16
@@ -68,7 +74,13 @@ jobs:
             sleep 2
           done
           curl -sf http://localhost:11434/api/pull -d '{"model": "nomic-embed-text", "stream": false}'
-      - run: uv sync --all-packages
+      # --extra reranker: apps/api/tests/test_eval_retrieval.py's
+      # reranking-enabled eval test (Phase 8 Task 6) imports
+      # resolvegrid_retrieval.reranker, which needs sentence-transformers
+      # installed in this shared workspace venv -- see reranker.py's and
+      # resolvegrid-retrieval's pyproject.toml's module docstrings for
+      # why it's an optional extra, not a core dependency.
+      - run: uv sync --all-packages --extra reranker
       - run: uv run --package resolvegrid-api alembic -c apps/api/alembic.ini upgrade head
       - run: uv run --package resolvegrid-api pytest apps/api/tests -v
       - run: uv run --package resolvegrid-telemetry pytest packages/telemetry/tests -v

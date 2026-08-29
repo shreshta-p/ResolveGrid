@@ -95,12 +95,50 @@ Distractor handling (the deliberately-superseded VPN v1/v2 pair)
 A case may list `distractor` pairs: plausible-but-wrong chunks (almost
 always the superseded VPN v1 policy) that a naive lexical/vector match
 could easily rank above the correct answer. `evaluate_case` records
-`distractor_beats_best_relevant`: True if any distractor chunk's fused
-rank is better (numerically lower) than the best-ranked relevant chunk's
-fused rank. This is reported per-case and aggregated, not silently
-folded into recall/precision (a distractor ranking #2 behind a correct
-#1 still means recall@k=1.0 -- the distractor check is a distinct,
-additional signal this task's plan explicitly calls out).
+`distractor_beats_best_relevant`: True if any distractor chunk's final
+(post-rerank/dedup, when reranking is enabled; fused, otherwise) rank is
+better (numerically lower) than the best-ranked relevant chunk's rank.
+This is reported per-case and aggregated, not silently folded into
+recall/precision (a distractor ranking #2 behind a correct #1 still
+means recall@k=1.0 -- the distractor check is a distinct, additional
+signal this task's plan explicitly calls out). `distractor_margin`
+(Phase 8 Task 6) additionally records the *signed* rank gap between the
+best distractor and the best relevant chunk when both appear in the
+ranked list (`best_distractor_rank - best_relevant_rank`, 0-indexed
+positions -- positive means the distractor trails the relevant chunk by
+that many positions, i.e. a safer margin) so a reranking run and a
+baseline run can be compared on more than the pass/fail outcome: the
+margin can widen or narrow even when neither run's boolean outcome
+changes (see `main()`'s baseline-vs-reranked comparison).
+
+Reranking-enabled evaluation path (Phase 8 Task 6)
+------------------------------------------------------------------------
+`evaluate_case`/`run_eval` both take an optional `reranker_model`
+keyword (default `None`, preserving Phase 7's exact baseline behavior
+byte-for-byte when omitted -- this module is extended, not forked, so
+the existing regression-guard test above keeps exercising the same
+untouched code path). When `reranker_model` is given, each case's fused
+candidate list (the *entire* `fuse_rrf` output -- not pre-truncated to
+`k`, so reranking has the same full candidate pool a real pipeline would
+give it) has its chunk text fetched from the DB
+(`_fetch_chunk_texts`), is reranked via
+`resolvegrid_retrieval.reranker.rerank`, then deduplicated via
+`resolvegrid_retrieval.dedup.dedup` (`dedup_threshold`, default
+`resolvegrid_retrieval.dedup.DEFAULT_DEDUP_THRESHOLD`) before the same
+recall@k/precision@k/MRR/nDCG@k formulas run against it -- so a
+reranked run and Phase 7's baseline run are scored by the identical
+metric code against the identical hand-labeled `GoldenCase.relevant`
+sets, the only difference being which ranked chunk-id list is fed in.
+
+`context_budget.assemble_context` (Task 3) is deliberately NOT part of
+this eval path: it decides which chunks fit a token budget for the
+*final prompt*, not their relative rank -- recall/precision/MRR/nDCG are
+computed purely from ranking order among the candidate set, so a token
+budget cap has no defined effect on any of these metrics (it could only
+ever truncate the ranked list further, which the existing `k` cutoff
+already does in a metrics-meaningful way). Running budgeting here would
+add a dependency this task's measurement doesn't need without changing
+what's measured.
 """
 
 import json
@@ -115,7 +153,9 @@ from resolvegrid_api.db import DATABASE_URL
 from resolvegrid_api.models.knowledge import Chunk, Document, DocumentVersion
 from resolvegrid_api.retrieval import assess_sufficiency, fuse_rrf, lexical_search, vector_search
 from resolvegrid_api.retrieval_authz import AuthzFilter
+from resolvegrid_retrieval.dedup import DEFAULT_DEDUP_THRESHOLD, dedup
 from resolvegrid_retrieval.embedder import DEFAULT_EMBEDDING_MODEL, embed_texts
+from resolvegrid_retrieval.reranker import DEFAULT_RERANKER_MODEL, rerank
 
 _DEFAULT_GOLDEN_PATH = (
     Path(__file__).resolve().parents[4] / "eval" / "golden" / "phase7_retrieval_v1.jsonl"
@@ -284,6 +324,26 @@ class CaseResult:
     top_score: float | None
     distractor_beats_best_relevant: bool | None
     leaked_chunk_ids: frozenset[int]  # must_not_appear chunks that leaked through
+    # Signed rank gap between the best distractor and best relevant chunk
+    # (0-indexed positions in ranked_chunk_ids) -- see module docstring's
+    # "Reranking-enabled evaluation path" section. `None` unless both a
+    # distractor and a relevant chunk appear somewhere in ranked_chunk_ids.
+    distractor_margin: int | None = None
+
+
+def _fetch_chunk_texts(session: Session, chunk_ids: list[int]) -> dict[int, str]:
+    """Fetch real `Chunk.text` for `chunk_ids` from the DB, keyed by id.
+
+    Used only by the reranking-enabled path below: `rerank()` needs real
+    chunk text, not just the `(chunk_id, fused_score)` pairs `fuse_rrf`
+    produces. Returns `{}` immediately for an empty input (mirrors
+    `rerank()`'s own "empty candidates -> empty result, no model load"
+    short-circuit -- no reason to round-trip the DB for zero ids).
+    """
+    if not chunk_ids:
+        return {}
+    rows = session.execute(select(Chunk.id, Chunk.text).where(Chunk.id.in_(chunk_ids))).all()
+    return {chunk_id: text for chunk_id, text in rows}
 
 
 def evaluate_case(
@@ -293,7 +353,18 @@ def evaluate_case(
     k: int = DEFAULT_K,
     search_limit: int = DEFAULT_SEARCH_LIMIT,
     embedding_model: str = DEFAULT_EMBEDDING_MODEL,
+    reranker_model: str | None = None,
+    dedup_threshold: float = DEFAULT_DEDUP_THRESHOLD,
 ) -> CaseResult:
+    """Evaluate one golden case. With `reranker_model=None` (the default)
+    this is byte-for-byte Phase 7's baseline behavior: score
+    `fuse_rrf`'s fused order directly. Passing `reranker_model` (e.g.
+    `resolvegrid_retrieval.reranker.DEFAULT_RERANKER_MODEL`) additionally
+    reranks the *entire* fused candidate list via `rerank()`, then
+    deduplicates it via `dedup()` (see module docstring), and scores that
+    order instead -- against the exact same hand-labeled relevant sets,
+    so a reranked run is directly comparable to a baseline run.
+    """
     relevant_ids = resolve_relevant_chunk_ids(session, case.relevant)
     distractor_ids = resolve_relevant_chunk_ids(session, case.distractor)
     must_not_appear_ids = resolve_relevant_chunk_ids(session, case.must_not_appear)
@@ -306,11 +377,23 @@ def evaluate_case(
         session, case.query, limit=search_limit, authz_filter=case.authz
     )
     fused = fuse_rrf(vector_results, lexical_results)
-    ranked_chunk_ids = [chunk_id for chunk_id, _ in fused]
+
+    if reranker_model is None:
+        ranked_chunk_ids = [chunk_id for chunk_id, _ in fused]
+    else:
+        chunk_texts = _fetch_chunk_texts(session, [chunk_id for chunk_id, _ in fused])
+        candidates = [(chunk_id, chunk_texts[chunk_id]) for chunk_id, _ in fused]
+        reranked = rerank(case.query, candidates, model=reranker_model)
+        reranked_with_text = [
+            (chunk_id, chunk_texts[chunk_id], score) for chunk_id, score in reranked
+        ]
+        deduped = dedup(reranked_with_text, threshold=dedup_threshold)
+        ranked_chunk_ids = [chunk_id for chunk_id, _text, _score in deduped]
 
     sufficiency = assess_sufficiency(fused)
 
     distractor_beats_best_relevant: bool | None = None
+    distractor_margin: int | None = None
     if distractor_ids and relevant_ids:
         rank_of = {chunk_id: position for position, chunk_id in enumerate(ranked_chunk_ids)}
         best_relevant_rank = min(
@@ -327,13 +410,17 @@ def evaluate_case(
             distractor_beats_best_relevant = (
                 best_distractor_rank is not None and best_distractor_rank < best_relevant_rank
             )
+        if best_relevant_rank is not None and best_distractor_rank is not None:
+            distractor_margin = best_distractor_rank - best_relevant_rank
 
     # Leakage check for must_not_appear: these chunks must be absent from
     # the RAW vector_search/lexical_search result sets entirely (not just
     # the fused top-k) -- authz filtering happens in the SQL query itself
     # (retrieval.py), so this is checking the same property
     # test_adversarial_authz_filter_blocks_cross_scope_leakage checks, on
-    # this task's own golden queries.
+    # this task's own golden queries. Unaffected by reranking/dedup (both
+    # operate only on chunks that already passed the authz-filtered SQL
+    # query), so this check is identical in both evaluation paths.
     raw_ids = {c for c, _ in vector_results} | {c for c, _ in lexical_results}
     leaked_chunk_ids = frozenset(must_not_appear_ids & raw_ids)
 
@@ -350,6 +437,7 @@ def evaluate_case(
         top_score=sufficiency.top_score,
         distractor_beats_best_relevant=distractor_beats_best_relevant,
         leaked_chunk_ids=leaked_chunk_ids,
+        distractor_margin=distractor_margin,
     )
 
 
@@ -363,6 +451,10 @@ class EvalSummary:
     k: int
     search_limit: int
     case_results: list[CaseResult]
+    # None for a Phase 7 baseline run; the model name for a Task 6
+    # reranking-enabled run. Carried through purely for reporting (see
+    # format_report) -- not used by any metric computation.
+    reranker_model: str | None = None
 
     @property
     def answerable_case_results(self) -> list[CaseResult]:
@@ -406,6 +498,8 @@ def run_eval(
     k: int = DEFAULT_K,
     search_limit: int = DEFAULT_SEARCH_LIMIT,
     embedding_model: str = DEFAULT_EMBEDDING_MODEL,
+    reranker_model: str | None = None,
+    dedup_threshold: float = DEFAULT_DEDUP_THRESHOLD,
 ) -> EvalSummary:
     """Run every golden case (loaded from the default path if `cases` is
     not given) against `session` and return the aggregated `EvalSummary`.
@@ -413,13 +507,26 @@ def run_eval(
     Assumes the seed corpus is already ingested into `session` -- see
     module docstring's "Ingestion is NOT this module's responsibility"
     section.
+
+    `reranker_model=None` (default) reproduces Phase 7's exact baseline
+    path. Passing a model name (e.g. `resolvegrid_retrieval.reranker.
+    DEFAULT_RERANKER_MODEL`) runs Task 6's reranking-enabled path for
+    every case instead -- see `evaluate_case`/module docstring.
     """
     resolved_cases = cases if cases is not None else load_golden_cases()
     results = [
-        evaluate_case(session, case, k=k, search_limit=search_limit, embedding_model=embedding_model)
+        evaluate_case(
+            session,
+            case,
+            k=k,
+            search_limit=search_limit,
+            embedding_model=embedding_model,
+            reranker_model=reranker_model,
+            dedup_threshold=dedup_threshold,
+        )
         for case in resolved_cases
     ]
-    return EvalSummary(k=k, search_limit=search_limit, case_results=results)
+    return EvalSummary(k=k, search_limit=search_limit, case_results=results, reranker_model=reranker_model)
 
 
 def format_report(summary: EvalSummary) -> str:
@@ -430,7 +537,8 @@ def format_report(summary: EvalSummary) -> str:
         f"Golden set: {len(summary.case_results)} cases "
         f"({len(summary.answerable_case_results)} answerable, "
         f"{len(summary.case_results) - len(summary.answerable_case_results)} no-good-match), "
-        f"k={summary.k}, search_limit={summary.search_limit}",
+        f"k={summary.k}, search_limit={summary.search_limit}, "
+        f"reranker_model={summary.reranker_model!r}",
         f"recall@{summary.k}:    {summary.mean_recall_at_k:.4f}",
         f"precision@{summary.k}: {summary.mean_precision_at_k:.4f}",
         f"MRR:          {summary.mean_reciprocal_rank:.4f}",
@@ -445,7 +553,48 @@ def format_report(summary: EvalSummary) -> str:
             f"  - {c.query!r}: recall={c.recall_at_k} precision={c.precision_at_k} "
             f"rr={c.reciprocal_rank} ndcg={c.ndcg_at_k} sufficient={c.sufficient} "
             f"top_score={c.top_score} distractor_beats_relevant={c.distractor_beats_best_relevant} "
+            f"distractor_margin={c.distractor_margin} "
             f"leaked={sorted(c.leaked_chunk_ids)}"
+        )
+    return "\n".join(lines)
+
+
+def format_comparison(baseline: EvalSummary, reranked: EvalSummary) -> str:
+    """Human-readable before/after comparison of a baseline (`fuse_rrf`
+    only) run against a reranking-enabled run over the *same* cases, in
+    the *same* order -- see module docstring's "Reranking-enabled
+    evaluation path" section and Phase 8 Task 6's brief: given Phase 7's
+    baseline is already at or near ceiling on recall/precision/MRR on
+    this small corpus, the headline metric deltas are expected to be
+    small or zero; `distractor_margin` deltas are the more informative
+    signal on the VPN v1/v2 cases specifically, and are broken out
+    per-case here rather than only averaged.
+    """
+    lines = [
+        "=== Baseline (fuse_rrf only) ===",
+        format_report(baseline),
+        "",
+        "=== Reranked (rerank + dedup) ===",
+        format_report(reranked),
+        "",
+        "=== Headline metric deltas (reranked - baseline) ===",
+        f"recall@k:    {reranked.mean_recall_at_k - baseline.mean_recall_at_k:+.4f}",
+        f"precision@k: {reranked.mean_precision_at_k - baseline.mean_precision_at_k:+.4f}",
+        f"MRR:         {reranked.mean_reciprocal_rank - baseline.mean_reciprocal_rank:+.4f}",
+        f"nDCG@k:      {reranked.mean_ndcg_at_k - baseline.mean_ndcg_at_k:+.4f}",
+        "",
+        "=== Distractor cases: baseline vs. reranked margin "
+        "(rank gap, best_distractor_rank - best_relevant_rank; "
+        "positive = distractor trails the correct answer) ===",
+    ]
+    for base_case, rerank_case in zip(baseline.case_results, reranked.case_results):
+        if base_case.distractor_beats_best_relevant is None and rerank_case.distractor_beats_best_relevant is None:
+            continue
+        lines.append(
+            f"  - {base_case.query!r}: baseline_margin={base_case.distractor_margin} "
+            f"(beats={base_case.distractor_beats_best_relevant}) -> "
+            f"reranked_margin={rerank_case.distractor_margin} "
+            f"(beats={rerank_case.distractor_beats_best_relevant})"
         )
     return "\n".join(lines)
 
@@ -455,15 +604,21 @@ def main() -> None:
     live dev DB: `uv run --package resolvegrid-api python -m
     resolvegrid_api.eval_retrieval`.
 
-    Ingests the seed corpus and runs the full golden set inside one
-    session, `flush()`-ing (not committing) so `run_eval`'s queries see
-    the ingested rows within the same transaction, then unconditionally
-    `rollback()`s at the end -- simpler than `test_ingestion_worker.py`'s
-    delete-what-we-created cleanup (which is only needed there because
-    that test goes through a genuinely separate, real-Arq-committing
-    session it cannot roll back). A manual run here leaves zero residue
-    in the shared dev DB, matching `db_session`'s fixture-level
-    convention applied at the script level.
+    Ingests the seed corpus and runs the full golden set twice inside one
+    session -- once as Phase 7's untouched baseline (`reranker_model=
+    None`), once with Task 6's reranking-enabled path
+    (`reranker_model=DEFAULT_RERANKER_MODEL`) -- `flush()`-ing (not
+    committing) so `run_eval`'s queries see the ingested rows within the
+    same transaction, then unconditionally `rollback()`s at the end --
+    simpler than `test_ingestion_worker.py`'s delete-what-we-created
+    cleanup (which is only needed there because that test goes through a
+    genuinely separate, real-Arq-committing session it cannot roll
+    back). A manual run here leaves zero residue in the shared dev DB,
+    matching `db_session`'s fixture-level convention applied at the
+    script level. Requires the optional `reranker` extra installed in
+    the shared workspace venv (`uv sync --all-packages --extra
+    reranker`) -- see `resolvegrid_retrieval.reranker`'s module
+    docstring.
     """
     from resolvegrid_api.ingestion_worker import run_seed_corpus_ingestion
 
@@ -473,8 +628,10 @@ def main() -> None:
             run_seed_corpus_ingestion(session)
             session.flush()
 
-            summary = run_eval(session)
-            print(format_report(summary))
+            cases = load_golden_cases()
+            baseline_summary = run_eval(session, cases)
+            reranked_summary = run_eval(session, cases, reranker_model=DEFAULT_RERANKER_MODEL)
+            print(format_comparison(baseline_summary, reranked_summary))
         finally:
             session.rollback()
     engine.dispose()

@@ -49,6 +49,7 @@ import pytest
 
 from resolvegrid_api.eval_retrieval import (
     DEFAULT_K,
+    DEFAULT_RERANKER_MODEL,
     _ndcg_at_k,
     _precision_at_k,
     _recall_at_k,
@@ -117,6 +118,85 @@ def test_golden_set_metrics_clear_baseline_regression_guard(db_session):
     assert summary.mean_precision_at_k >= _MIN_MEAN_PRECISION_AT_K, summary.mean_precision_at_k
     assert summary.mean_reciprocal_rank >= _MIN_MEAN_RECIPROCAL_RANK, summary.mean_reciprocal_rank
     assert summary.mean_ndcg_at_k >= _MIN_MEAN_NDCG_AT_K, summary.mean_ndcg_at_k
+
+
+# ---------------------------------------------------------------------------
+# Reranking-enabled eval path (Phase 8 Task 6) -- real end-to-end run
+# against the real DB, real rerank()/dedup() (no mocking, matching this
+# phase's established precedent), scored against the SAME golden set and
+# hand-labeled relevant sets as the baseline test above, so the two are
+# directly comparable.
+#
+# Threshold/behavior provenance (read before changing the numbers below):
+# measured for real by running `python -m resolvegrid_api.eval_retrieval`
+# (which now runs baseline THEN reranked back-to-back and prints a diff)
+# against a freshly-ingested real corpus, commit `1e3d38d`+this task, with
+# `reranker_model=BAAI/bge-reranker-base`, `dedup_threshold=0.30`:
+#
+#     baseline:  recall@5=1.0000 precision@5=0.2000 MRR=0.9524 nDCG@5=0.9643
+#     reranked:  recall@5=1.0000 precision@5=0.2000 MRR=0.9643 nDCG@5=0.9736
+#
+# Headline metrics did NOT regress -- MRR/nDCG actually improved slightly,
+# because reranking fixed the one baseline case that didn't rank its
+# correct chunk #1 ("Does Kestrel VPN access grant a flat connection to
+# the entire corporate network?", RR 0.333->1.0, nDCG 0.5->1.0). recall/
+# precision stayed flat at their mechanical ceiling (every answerable case
+# has exactly 1 relevant chunk -- see module docstring), as expected on
+# this small, already-near-ceiling corpus.
+#
+# But reranking ALSO introduced a real, measured regression the baseline
+# did not have: of the 3 VPN v1/v2 distractor cases, one -- "What VPN
+# client software should I currently install for Kestrel remote access?"
+# -- flips from correctly ranking v2 (current) ahead of v1 (deprecated,
+# margin +1) to incorrectly ranking the deprecated v1 chunk ahead of v2
+# (margin -1, distractor_beats_best_relevant=True). The other two
+# distractor cases (password rotation/MFA, password reset) stayed
+# correctly ordered. This is reported honestly, not smoothed over -- see
+# `docs/EXPERIMENT_REGISTRY.md`'s reranking comparison entry for the full
+# writeup and interpretation.
+# ---------------------------------------------------------------------------
+
+
+def test_reranked_eval_path_runs_end_to_end_against_real_corpus_and_reranker(db_session):
+    run_seed_corpus_ingestion(db_session)
+    db_session.flush()
+
+    cases = load_golden_cases()
+    baseline = run_eval(db_session, cases)
+    reranked = run_eval(db_session, cases, reranker_model=DEFAULT_RERANKER_MODEL)
+
+    assert reranked.reranker_model == DEFAULT_RERANKER_MODEL
+    assert len(reranked.case_results) == len(cases) == len(baseline.case_results)
+
+    # Reranking/dedup must never introduce authz leakage: both operate
+    # only on chunks the authz-filtered SQL query already returned, so
+    # this should hold trivially -- asserted for real, not assumed.
+    assert reranked.any_leakage is False, [
+        (c.query, sorted(c.leaked_chunk_ids)) for c in reranked.case_results if c.leaked_chunk_ids
+    ]
+
+    # Headline metrics: same regression-guard floors as the baseline test
+    # above (see its docstring for provenance) -- reranking measurably
+    # matched or exceeded the baseline on this corpus (see this section's
+    # docstring), so it must clear the same floor.
+    assert reranked.mean_recall_at_k >= _MIN_MEAN_RECALL_AT_K, reranked.mean_recall_at_k
+    assert reranked.mean_precision_at_k >= _MIN_MEAN_PRECISION_AT_K, reranked.mean_precision_at_k
+    assert reranked.mean_reciprocal_rank >= _MIN_MEAN_RECIPROCAL_RANK, reranked.mean_reciprocal_rank
+    assert reranked.mean_ndcg_at_k >= _MIN_MEAN_NDCG_AT_K, reranked.mean_ndcg_at_k
+
+    # Known, measured finding (see this section's docstring and
+    # docs/EXPERIMENT_REGISTRY.md): reranking flips exactly one of the 3
+    # VPN v1/v2 distractor cases so the deprecated chunk outranks the
+    # current one. This pins that as the current known ceiling -- more
+    # than one flip would be a new, undocumented regression worth
+    # investigating before a later task wires this reranker model/
+    # threshold into the live graph as-is.
+    distractor_beats_count = sum(
+        1 for c in reranked.case_results if c.distractor_beats_best_relevant
+    )
+    assert distractor_beats_count <= 1, [
+        c.query for c in reranked.case_results if c.distractor_beats_best_relevant
+    ]
 
 
 # ---------------------------------------------------------------------------
