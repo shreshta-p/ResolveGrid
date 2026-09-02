@@ -102,3 +102,29 @@ def authorize(principal: Principal, action: str) -> Decision:
         reason="default: no matching role grant, self-view only",
         employee_id=principal.employee_id,
     )
+
+
+def principal_has_role(principal: Principal, role: str) -> bool:
+    """Does `principal` hold `role` (in any scope)?
+
+    A general RBAC-style role check, distinct from `authorize()` -- the
+    latter is action-per-resource-type (e.g. "can this principal list
+    employees") and doesn't map onto "does this principal hold role X" for
+    an arbitrary role string (e.g. a tool's `required_role`). This helper
+    exists so callers that need that simpler check (see
+    `apps/api/src/resolvegrid_api/tool_execution.py`'s
+    `available_tools_for_principal`) still go through `packages/authz`
+    instead of re-implementing role-string comparisons inline -- this
+    package remains the single source of truth for "what can this
+    principal do."
+
+    Mirrors `authorize()`'s admin-dominates precedent: a global admin grant
+    satisfies any requested role, regardless of scope. Otherwise, true iff
+    `principal.roles` contains a grant with `role == role` in ANY scope
+    (global/department/team) -- unlike `authorize()`, this check doesn't
+    interpret `scope`/`scope_id` into a Decision, since callers of this
+    helper only need a yes/no role check, not a resource-filtering scope.
+    """
+    if any(g.role == "admin" and g.scope == "global" for g in principal.roles):
+        return True
+    return any(g.role == role for g in principal.roles)

@@ -1,4 +1,4 @@
-from resolvegrid_authz import Principal, RoleGrant, authorize
+from resolvegrid_authz import Principal, RoleGrant, authorize, principal_has_role
 
 
 def test_admin_has_unrestricted_access():
@@ -146,3 +146,41 @@ def test_knowledge_retrieve_is_unrestricted_for_admin():
     assert decision.allowed is True
     assert decision.department_ids is None
     assert decision.employee_id is None
+
+
+def test_principal_has_role_matches_direct_grant():
+    principal = Principal(
+        employee_id=18, roles=(RoleGrant(role="analyst", scope="department", scope_id=5),)
+    )
+    assert principal_has_role(principal, "analyst") is True
+
+
+def test_principal_has_role_false_for_missing_grant():
+    principal = Principal(
+        employee_id=19, roles=(RoleGrant(role="approver", scope="department", scope_id=9),)
+    )
+    assert principal_has_role(principal, "analyst") is False
+
+
+def test_principal_has_role_false_for_no_grants():
+    principal = Principal(employee_id=20, roles=())
+    assert principal_has_role(principal, "analyst") is False
+
+
+def test_principal_has_role_true_for_global_admin_regardless_of_requested_role():
+    principal = Principal(employee_id=21, roles=(RoleGrant(role="admin", scope="global"),))
+    assert principal_has_role(principal, "analyst") is True
+    assert principal_has_role(principal, "approver") is True
+    assert principal_has_role(principal, "admin") is True
+
+
+def test_principal_has_role_ignores_department_scoped_admin_grant():
+    # Mirrors authorize()'s test_admin_grant_with_wrong_scope_is_ignored --
+    # a non-global admin grant does not dominate, but it IS still a direct
+    # "admin" role grant, so principal_has_role(principal, "admin") is True
+    # while a *different* requested role is not satisfied by it.
+    principal = Principal(
+        employee_id=22, roles=(RoleGrant(role="admin", scope="department", scope_id=3),)
+    )
+    assert principal_has_role(principal, "admin") is True
+    assert principal_has_role(principal, "analyst") is False
