@@ -9,7 +9,7 @@ from resolvegrid_contracts.tickets import (
     TicketType,
     is_valid_transition,
 )
-from resolvegrid_contracts.tools import TOOL_REGISTRY, ToolContract
+from resolvegrid_contracts.tools import TOOL_REGISTRY, ToolContract, ToolRole
 
 __all__ = [
     "ALLOWED_TRANSITIONS",
@@ -22,5 +22,6 @@ __all__ = [
     "TicketTransitionRequest",
     "TicketType",
     "ToolContract",
+    "ToolRole",
     "is_valid_transition",
 ]
