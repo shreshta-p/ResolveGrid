@@ -20,7 +20,10 @@ class ApprovalRequest(Base):
     """
 
     __tablename__ = "approval_request"
-    __table_args__ = (Index("ix_approval_request_status", "status"),)
+    __table_args__ = (
+        Index("ix_approval_request_status", "status"),
+        Index("ix_approval_request_ticket_id", "ticket_id"),
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True)
     ticket_id: Mapped[int | None] = mapped_column(ForeignKey("ticket.id"), default=None)
@@ -45,6 +48,7 @@ class ApprovalDecision(Base):
     """One approver's decision (approve/reject) against an ApprovalRequest."""
 
     __tablename__ = "approval_decision"
+    __table_args__ = (Index("ix_approval_decision_approval_request_id", "approval_request_id"),)
 
     id: Mapped[int] = mapped_column(primary_key=True)
     approval_request_id: Mapped[int] = mapped_column(ForeignKey("approval_request.id"))

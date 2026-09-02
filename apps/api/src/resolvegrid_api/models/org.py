@@ -72,8 +72,6 @@ class RoleAssignment(Base):
 
 
 class AccessGroup(Base):
-    """A named grouping of related Entitlements (e.g. "Networking", "Finance Systems")."""
-
     __tablename__ = "access_group"
 
     id: Mapped[int] = mapped_column(primary_key=True)
@@ -82,8 +80,6 @@ class AccessGroup(Base):
 
 
 class Entitlement(Base):
-    """A single grantable access right (e.g. "VPN Access"), belonging to an AccessGroup."""
-
     __tablename__ = "entitlement"
 
     id: Mapped[int] = mapped_column(primary_key=True)
@@ -93,8 +89,6 @@ class Entitlement(Base):
 
 
 class EmployeeEntitlement(Base):
-    """One grant of an Entitlement to an Employee, revocable via `revoked_at`."""
-
     __tablename__ = "employee_entitlement"
     __table_args__ = (Index("ix_employee_entitlement_employee_id", "employee_id"),)
 

@@ -49,6 +49,7 @@ def upgrade() -> None:
     sa.UniqueConstraint('snapshot_hash')
     )
     op.create_index('ix_approval_request_status', 'approval_request', ['status'], unique=False)
+    op.create_index('ix_approval_request_ticket_id', 'approval_request', ['ticket_id'], unique=False)
 
     op.create_table('approval_decision',
     sa.Column('id', sa.Integer(), nullable=False),
@@ -62,6 +63,7 @@ def upgrade() -> None:
     sa.ForeignKeyConstraint(['approver_id'], ['employee.id'], ),
     sa.PrimaryKeyConstraint('id')
     )
+    op.create_index('ix_approval_decision_approval_request_id', 'approval_decision', ['approval_request_id'], unique=False)
 
     op.create_table('approval_policy',
     sa.Column('id', sa.Integer(), nullable=False),
@@ -119,9 +121,11 @@ def upgrade() -> None:
     sa.PrimaryKeyConstraint('id')
     )
     op.create_index('ix_tool_call_idempotency_key', 'tool_call', ['idempotency_key'], unique=False)
+    op.create_index('ix_tool_call_approval_request_id', 'tool_call', ['approval_request_id'], unique=False)
 
 
 def downgrade() -> None:
+    op.drop_index('ix_tool_call_approval_request_id', table_name='tool_call')
     op.drop_index('ix_tool_call_idempotency_key', table_name='tool_call')
     op.drop_table('tool_call')
     op.drop_index('ix_employee_entitlement_employee_id', table_name='employee_entitlement')
@@ -129,6 +133,8 @@ def downgrade() -> None:
     op.drop_table('entitlement')
     op.drop_table('access_group')
     op.drop_table('approval_policy')
+    op.drop_index('ix_approval_decision_approval_request_id', table_name='approval_decision')
     op.drop_table('approval_decision')
+    op.drop_index('ix_approval_request_ticket_id', table_name='approval_request')
     op.drop_index('ix_approval_request_status', table_name='approval_request')
     op.drop_table('approval_request')

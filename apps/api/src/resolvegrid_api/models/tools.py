@@ -16,7 +16,10 @@ class ToolCall(Base):
     """
 
     __tablename__ = "tool_call"
-    __table_args__ = (Index("ix_tool_call_idempotency_key", "idempotency_key"),)
+    __table_args__ = (
+        Index("ix_tool_call_idempotency_key", "idempotency_key"),
+        Index("ix_tool_call_approval_request_id", "approval_request_id"),
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True)
     agent_run_id: Mapped[str | None] = mapped_column(default=None)
