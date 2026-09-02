@@ -69,3 +69,38 @@ class RoleAssignment(Base):
     granted_by_id: Mapped[int | None] = mapped_column(ForeignKey("employee.id"))
     granted_at: Mapped[datetime] = mapped_column(server_default=func.now())
     expires_at: Mapped[datetime | None] = mapped_column(default=None)
+
+
+class AccessGroup(Base):
+    """A named grouping of related Entitlements (e.g. "Networking", "Finance Systems")."""
+
+    __tablename__ = "access_group"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str] = mapped_column(unique=True)
+    description: Mapped[str | None] = mapped_column(default=None)
+
+
+class Entitlement(Base):
+    """A single grantable access right (e.g. "VPN Access"), belonging to an AccessGroup."""
+
+    __tablename__ = "entitlement"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    access_group_id: Mapped[int] = mapped_column(ForeignKey("access_group.id"))
+    name: Mapped[str]
+    description: Mapped[str | None] = mapped_column(default=None)
+
+
+class EmployeeEntitlement(Base):
+    """One grant of an Entitlement to an Employee, revocable via `revoked_at`."""
+
+    __tablename__ = "employee_entitlement"
+    __table_args__ = (Index("ix_employee_entitlement_employee_id", "employee_id"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    employee_id: Mapped[int] = mapped_column(ForeignKey("employee.id"))
+    entitlement_id: Mapped[int] = mapped_column(ForeignKey("entitlement.id"))
+    granted_at: Mapped[datetime] = mapped_column(server_default=func.now())
+    revoked_at: Mapped[datetime | None] = mapped_column(default=None)
+    source_ticket_id: Mapped[int | None] = mapped_column(ForeignKey("ticket.id"), default=None)
