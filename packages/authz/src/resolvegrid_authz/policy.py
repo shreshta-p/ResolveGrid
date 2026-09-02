@@ -46,6 +46,19 @@ _STAFF_ONLY_ACTIONS = {"ticket.transition"}
 _KNOWN_ACTIONS = _SELF_SCOPED_ACTIONS | _STAFF_ONLY_ACTIONS
 
 
+def _is_global_admin(principal: Principal) -> bool:
+    """Does `principal` hold an admin grant scoped globally?
+
+    The single shared definition of "admin dominates" -- both `authorize()`
+    and `principal_has_role()` call this instead of each inlining
+    `any(g.role == "admin" and g.scope == "global" for g in
+    principal.roles)`. If this check ever needs to change (a new admin
+    scope type, a revoked-admin flag, etc.), both callers pick up the
+    change automatically instead of silently drifting apart.
+    """
+    return any(g.role == "admin" and g.scope == "global" for g in principal.roles)
+
+
 def authorize(principal: Principal, action: str) -> Decision:
     """Authorize an action for a principal.
 
@@ -77,7 +90,7 @@ def authorize(principal: Principal, action: str) -> Decision:
     if action not in _KNOWN_ACTIONS:
         return Decision(allowed=False, reason=f"unknown action: {action}")
 
-    if any(g.role == "admin" and g.scope == "global" for g in principal.roles):
+    if _is_global_admin(principal):
         return Decision(allowed=True, reason="admin: global access")
 
     department_ids = tuple(
@@ -118,13 +131,15 @@ def principal_has_role(principal: Principal, role: str) -> bool:
     package remains the single source of truth for "what can this
     principal do."
 
-    Mirrors `authorize()`'s admin-dominates precedent: a global admin grant
-    satisfies any requested role, regardless of scope. Otherwise, true iff
-    `principal.roles` contains a grant with `role == role` in ANY scope
-    (global/department/team) -- unlike `authorize()`, this check doesn't
-    interpret `scope`/`scope_id` into a Decision, since callers of this
-    helper only need a yes/no role check, not a resource-filtering scope.
+    Shares `authorize()`'s admin-dominates precedent via `_is_global_admin`
+    -- a global admin grant satisfies any requested role, regardless of
+    scope -- rather than inlining an independent copy of that check.
+    Otherwise, true iff `principal.roles` contains a grant with `role ==
+    role` in ANY scope (global/department/team) -- unlike `authorize()`,
+    this check doesn't interpret `scope`/`scope_id` into a Decision, since
+    callers of this helper only need a yes/no role check, not a
+    resource-filtering scope.
     """
-    if any(g.role == "admin" and g.scope == "global" for g in principal.roles):
+    if _is_global_admin(principal):
         return True
     return any(g.role == role for g in principal.roles)

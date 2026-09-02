@@ -12,6 +12,7 @@ the registry could change.
 import pytest
 from resolvegrid_authz import Principal, RoleGrant
 from resolvegrid_contracts.tools import TOOL_REGISTRY
+from resolvegrid_api import tool_execution
 from resolvegrid_api.tool_execution import (
     ToolNotAllowedError,
     ToolValidationError,
@@ -71,6 +72,40 @@ def test_global_admin_sees_both_tools_regardless_of_specific_role_match():
     available = available_tools_for_principal(principal)
     names = {tool.name for tool in available}
     assert names == {"lookup_employee_entitlements", "grant_vpn_access"}
+
+
+def test_held_entitlements_filters_a_gated_tool_in_and_out(monkeypatch):
+    # Neither registered tool sets required_entitlement today, so exercise
+    # the held_entitlements branch against a synthetic entitlement-gated
+    # ToolContract monkeypatched into the module's TOOL_REGISTRY, proving
+    # the filter actually excludes it when the entitlement isn't held and
+    # includes it once it is -- not just passing it through unconditionally.
+    gated_tool = LOOKUP_TOOL.model_copy(
+        update={"name": "gated_tool", "required_entitlement": "vpn_admin"}
+    )
+    monkeypatch.setattr(
+        tool_execution, "TOOL_REGISTRY", {"gated_tool": gated_tool}, raising=True
+    )
+
+    principal = Principal(
+        employee_id=9, roles=(RoleGrant(role="analyst", scope="department", scope_id=5),)
+    )
+
+    # Role satisfied, entitlement not held (default None/empty) -> excluded.
+    without_entitlement = available_tools_for_principal(principal)
+    assert without_entitlement == []
+
+    # Role satisfied, entitlement not held explicitly -> still excluded.
+    with_wrong_entitlement = available_tools_for_principal(
+        principal, held_entitlements=frozenset({"some_other_entitlement"})
+    )
+    assert with_wrong_entitlement == []
+
+    # Role satisfied, required entitlement held -> included.
+    with_entitlement = available_tools_for_principal(
+        principal, held_entitlements=frozenset({"vpn_admin"})
+    )
+    assert with_entitlement == [gated_tool]
 
 
 def test_select_tool_returns_matching_contract():

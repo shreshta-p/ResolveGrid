@@ -126,6 +126,14 @@ def validate_tool_schema(tool: ToolContract, params: dict) -> dict:
     message) if not -- e.g. a missing required param, a wrong type, or an
     extra param not in `params_schema["properties"]` (every registered
     tool's schema sets `additionalProperties: false`).
+
+    Does NOT guard against `jsonschema.exceptions.SchemaError` (a
+    malformed `params_schema` itself, as opposed to malformed `params`).
+    `params_schema` is static and developer-authored in `TOOL_REGISTRY`
+    (see `resolvegrid_contracts.tools`), not user/model-controlled input,
+    so a malformed schema is a registry bug to fix at the source rather
+    than a runtime condition this function needs to translate into
+    `ToolValidationError`.
     """
     try:
         jsonschema.validate(instance=params, schema=tool.params_schema)
