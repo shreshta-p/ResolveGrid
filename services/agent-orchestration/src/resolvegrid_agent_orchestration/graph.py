@@ -67,6 +67,57 @@ untrusted data, never instructions" framing (see
 `test_injected_document_adversarial.py` documented as a flagged finding
 for this exact task.
 
+Phase 9 Task 5 -- `request_approval` node: durable `interrupt()`, snapshot
+hash, idempotent upsert
+--------------------------------------------------------------------------
+This module gains its first real use of LangGraph's human-in-the-loop
+primitives: `interrupt()`/`Command(resume=...)` (`from langgraph.types
+import interrupt`). `make_request_approval_node` follows the exact same
+factory-over-injected-callable DI pattern as `CompleteFn`/`RetrieveFn` --
+`RequestApprovalFn` is a plain `Callable[[dict], ApprovalOutcome]`; the
+real implementation (`apps/api`'s `approval_service.py`) does the actual
+SQLAlchemy upsert against `ApprovalRequest`, and this package never
+imports it directly, for the same dependency-direction reasons as above.
+
+Re-execution semantics (verified against the installed `langgraph==1.2.11`
+source, `langgraph.types.interrupt`'s own docstring, not just prose docs --
+the docs site's HIL pages 404/redirect as of this writing): **`interrupt()`
+re-runs its ENTIRE enclosing node from the top on every resume.** Quoting
+the installed package: "The graph resumes from the start of the node,
+**re-executing** all logic." This means every line of `request_approval`
+before its `interrupt(...)` call -- including the call to
+`request_approval_fn` itself -- runs again, in full, on every resume (and
+again on every restart-then-resume after a real process crash, since the
+Postgres checkpointer persists the paused state independent of process
+lifetime). LangGraph's own documented consequence: side effects before
+`interrupt()` must be idempotent, or a resume/restart will duplicate them.
+`request_approval_fn`'s real implementation is exactly the idempotency
+guarantee this requires -- see `approval_service.py`'s module docstring
+for the full design, including a real wall-clock hazard this task caught
+(hashing a freshly-recomputed `expires_at` on every re-execution would
+itself break idempotency by hashing to a different value each time; the
+fix does not key the upsert on hash equality at all -- see that module).
+
+Deliberate scope limit -- NOT wired into `build_graph` by this task: doing
+so would require real conditional routing ("only visit `request_approval`
+when the tool selected by some upstream node has
+`ToolContract.requires_approval=True`"), and no such upstream
+select/route node exists in this graph yet (Task 4, `apps/api`'s
+`tool_execution.py`, built the allowlist/validation logic in isolation;
+wiring a `select_tool` node with conditional edges into this graph is
+explicitly Task 6's job, per the phase 9 plan doc's task breakdown).
+Inventing a placeholder router here to force this node into the linear
+chain would mean guessing at Task 6's routing contract from outside its
+scope -- worse than leaving `make_request_approval_node` standalone and
+fully unit-testable (this task's tests build a small ad hoc `StateGraph`
+containing only this node, mirroring the pattern LangGraph's own
+`interrupt()` docstring example uses, and prove interrupt/resume works
+correctly in isolation). `build_graph`'s existing classify_intent ->
+retrieve -> compose_response -> verify_citations -> finalize chain is
+therefore untouched by this task, exactly matching the existing test
+suite's expectations. Mirrors Phase 7 Task 7's own documented "deliberate
+scope limit" precedent above.
+
 This module also gains its first import from `services/retrieval`:
 `resolvegrid_retrieval.citation_verification.verify_citations`, used by
 the new `verify_citations` node. This is NOT a violation of the
@@ -87,6 +138,7 @@ import json
 from typing import Callable, TypedDict
 
 from langgraph.graph import END, START, StateGraph
+from langgraph.types import interrupt
 from pydantic import BaseModel, ValidationError
 from resolvegrid_retrieval.citation_verification import verify_citations
 
@@ -429,6 +481,118 @@ def finalize(state: AgentState) -> dict:
     if state.get("output_text"):
         return {"output_text": state["output_text"]}
     return {"output_text": _FALLBACK_MESSAGE}
+
+
+class ApprovalOutcome(TypedDict):
+    """Return shape `RequestApprovalFn` must produce.
+
+    `approval_request_id`/`status` are the real, durable `ApprovalRequest`
+    row's id and current status ("pending" on first creation; on the
+    idempotent-return path -- this node re-executing after a resume/restart
+    -- whatever status the existing row already holds, which is still
+    "pending" at this point in the flow since nothing decides it until
+    `interrupt()` actually returns). `expires_at` is an ISO 8601 string
+    (always the row's own stored value, never independently recomputed --
+    see `approval_service.py`'s module docstring for why that distinction
+    matters) included so `request_approval`'s `interrupt()` payload can show
+    a human approver a concrete expiry, per this task's brief.
+    """
+
+    approval_request_id: int
+    status: str
+    expires_at: str
+
+
+# The function `apps/api`'s `approval_service.py` implements: takes the
+# plain-dict payload built by `request_approval` below (never a typed
+# object or ORM row -- same "no `resolvegrid_api`/SQLAlchemy import into
+# this package" rule as `RetrieveFn`; see module docstring), returns an
+# `ApprovalOutcome`. The payload dict's keys:
+#   action_type: str | None    -- state["proposed_tool_name"]
+#   params: dict                -- state["proposed_tool_params"] or {}
+#   actor: int | None           -- state["principal_employee_id"]
+#   evidence_refs: list | None  -- currently always [] (Task 5 has no
+#       bound-evidence-producing node yet; a future task that adds one
+#       threads real refs through here instead)
+#   risk_context: str | None    -- state["risk_level"], a coarse stand-in
+#       (a richer structured risk_context is real future work, not this
+#       task's scope)
+#   agent_run_id: str | None    -- state["thread_id"], the real
+#       implementation's only durable handle back to this run (see
+#       `ApprovalRequest.agent_run_id`'s docstring for why it's a plain
+#       string, not a FK)
+# `request_approval_fn` MUST be idempotent under repeated calls with an
+# identical payload (see module docstring's re-execution semantics
+# section) -- this is a hard requirement this package's node depends on,
+# not just a nice-to-have.
+RequestApprovalFn = Callable[[dict], ApprovalOutcome]
+
+
+def make_request_approval_node(request_approval_fn: RequestApprovalFn):
+    """Build the standalone `request_approval` node bound to a given
+    `RequestApprovalFn`. See module docstring's "Phase 9 Task 5" section
+    for why this is NOT wired into `build_graph` by this task, and for the
+    real `interrupt()` re-execution semantics this node's design depends on.
+
+    On every invocation (first attempt, or a resume/restart re-execution --
+    indistinguishable from inside this function; see module docstring):
+      1. Builds the plain-dict payload described by `RequestApprovalFn`'s
+         comment above from `state`.
+      2. Calls `request_approval_fn(payload)` -- idempotent by contract, so
+         safe to call again even though `interrupt()` below re-runs this
+         from the top on every resume.
+      3. Calls `interrupt(...)` with a human-readable payload describing
+         the pending decision (`approval_request_id`, `action_type`,
+         `params`, `risk_context`, `expires_at`, current `status`). The
+         FIRST time this executes for a given checkpoint, `interrupt()`
+         raises `GraphInterrupt`, durably pausing the whole graph run (via
+         whatever checkpointer `build_graph` was compiled with -- a real
+         `AsyncPostgresSaver` in production, so this pause survives a
+         process restart, not just an in-process suspension). On resume --
+         the caller re-invokes with `Command(resume=<decision value>)` --
+         this same `interrupt(...)` call instead returns that resume value
+         directly.
+      4. Threads the resumed value into `state["approval_decision"]`,
+         alongside the (by-then-idempotently-unchanged)
+         `approval_request_id`.
+
+    Note: `state["proposed_tool_name"]`/`state["proposed_tool_params"]` are
+    assumed already populated by some upstream node -- this task does not
+    add the logic that sets them (no real upstream node exists yet; see
+    module docstring). A caller exercising this node directly (this task's
+    own tests, or a future Task 6 wiring) must seed them into initial state
+    itself.
+    """
+
+    def request_approval(state: AgentState) -> dict:
+        payload = {
+            "action_type": state.get("proposed_tool_name"),
+            "params": state.get("proposed_tool_params") or {},
+            "actor": state.get("principal_employee_id"),
+            "evidence_refs": [],
+            "risk_context": state.get("risk_level"),
+            "agent_run_id": state.get("thread_id"),
+        }
+        outcome = request_approval_fn(payload)
+        approval_request_id = outcome["approval_request_id"]
+
+        decision = interrupt(
+            {
+                "approval_request_id": approval_request_id,
+                "action_type": payload["action_type"],
+                "params": payload["params"],
+                "risk_context": payload["risk_context"],
+                "expires_at": outcome["expires_at"],
+                "status": outcome["status"],
+            }
+        )
+
+        return {
+            "approval_request_id": approval_request_id,
+            "approval_decision": decision,
+        }
+
+    return request_approval
 
 
 def build_graph(checkpointer, complete_fn: CompleteFn, retrieve_fn: RetrieveFn):

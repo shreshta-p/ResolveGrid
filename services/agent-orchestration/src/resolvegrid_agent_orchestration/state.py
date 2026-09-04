@@ -109,3 +109,41 @@ class AgentState(TypedDict):
     citations_verified: bool | None
     verified_chunk_ids: list[int] | None
     fabricated_chunk_ids: list[int] | None
+    # Phase 9 Task 5: the tool call a not-yet-built upstream node (Task 6's
+    # select_tool/routing work) is expected to propose for approval. This
+    # task's `request_approval` node (graph.py, currently standalone -- see
+    # its module docstring's documented scope limit) reads these but does
+    # NOT set them -- `None` unless some prior node in a given run has
+    # populated them, which today only a test harness seeding initial state
+    # directly does. `proposed_tool_name` is the `resolvegrid_contracts.
+    # tools.ToolContract.name` of the tool being proposed (e.g.
+    # "grant_vpn_access").
+    proposed_tool_name: str | None
+    # The concrete call arguments paired with `proposed_tool_name` above --
+    # becomes `ApprovalRequest.action_params_json` (JSON-encoded with sorted
+    # keys) via `request_approval_fn`'s real implementation (`apps/api`'s
+    # `approval_service.py`); also one of the fields bound into the
+    # snapshot hash that request re-verifies at execution time (Task 6).
+    proposed_tool_params: dict | None
+    # Populated by the `request_approval` node from its injected
+    # `RequestApprovalFn`'s return value -- the real, durable
+    # `ApprovalRequest.id` row this run's approval lives at (created, or
+    # found via the idempotent upsert if this node re-executed after a
+    # checkpoint restore -- see graph.py's `RequestApprovalFn`/
+    # `make_request_approval_node` docstrings for why plain snapshot-hash
+    # equality alone is not what makes that upsert idempotent). `None`
+    # before `request_approval` runs, or on any run that never proposes a
+    # tool requiring approval.
+    approval_request_id: int | None
+    # Populated by the `request_approval` node from the value LangGraph's
+    # `interrupt()` returns on resume -- i.e. whatever an approver's
+    # decision was passed as `Command(resume=<value>)`'s argument.
+    # "approved" | "rejected" | `None`. Note `None` here does NOT mean "a
+    # decision is pending" -- a genuinely pending decision means the graph
+    # run itself is paused mid-`interrupt()` and `ainvoke()` has not
+    # returned at all (observable via the compiled graph's own
+    # `get_state(config).next`, not this field); by the time any caller
+    # reads `state["approval_decision"]` from a *completed* `ainvoke()`
+    # result, it is either a real decision string or this run never reached
+    # `request_approval` in the first place.
+    approval_decision: str | None
