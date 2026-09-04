@@ -124,6 +124,13 @@ class AgentState(TypedDict):
     # keys) via `request_approval_fn`'s real implementation (`apps/api`'s
     # `approval_service.py`); also one of the fields bound into the
     # snapshot hash that request re-verifies at execution time (Task 6).
+    # Whatever node sets this (Task 6+) must keep it plain, JSON-safe data
+    # (str/int/float/bool/None/list/dict only) -- like every other
+    # `AgentState` field it is checkpointed to Postgres after every graph
+    # superstep (see this module's docstring), and it is separately
+    # `json.dumps(..., sort_keys=True)`-encoded by `approval_service.py`
+    # for both `action_params_json` and the snapshot hash -- a
+    # non-JSON-safe value (e.g. a raw `datetime`) would fail there.
     proposed_tool_params: dict | None
     # Populated by the `request_approval` node from its injected
     # `RequestApprovalFn`'s return value -- the real, durable

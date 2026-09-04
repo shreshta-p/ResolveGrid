@@ -18,6 +18,7 @@ Docker/Postgres required: these tests need the real `resolvegrid` Postgres
 container running (see repo's `docker-compose.yml` / `Makefile`).
 """
 
+import threading
 from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import delete, select
@@ -105,6 +106,70 @@ def test_request_approval_for_agent_is_idempotent_across_repeated_identical_call
 
         rows = _rows_for(raw_db_session, agent_run_id)
         assert len(rows) == 1
+    finally:
+        _cleanup(raw_db_session, agent_run_id)
+
+
+def test_request_approval_for_agent_closes_the_concurrent_insert_race(raw_db_session):
+    """Real, multi-threaded proof that a genuine concurrent-insert race for
+    an IDENTICAL payload is closed by the `pg_advisory_xact_lock`-based
+    critical section in `request_approval_for_agent` -- code review on an
+    earlier version of this module correctly flagged that the
+    `_insert_new_request` `IntegrityError` catch alone never actually
+    fires for this race (two concurrent callers compute different
+    `expires_at` values, hence different `snapshot_hash` values, so no
+    UNIQUE-constraint violation occurs and both inserts would silently
+    succeed, producing two `ApprovalRequest` rows for one logical
+    approval -- exactly what this phase's exit criteria "zero duplicate
+    mutation side effects" exists to catch).
+
+    Two real threads call `request_approval_for_agent` with the exact same
+    payload, released simultaneously via a `Barrier` to maximize the
+    chance of a genuine race window if the lock were not actually
+    serializing them (a sequential call pair, by contrast, could pass even
+    with no locking at all, since the first call's commit would already be
+    visible before the second call's SELECT -- this test is deliberately
+    concurrent, not sequential, to actually exercise the lock).
+    """
+    agent_run_id = "test-approval-svc-race-1"
+    payload = {
+        "action_type": "grant_vpn_access",
+        "params": {"employee_id": 55, "justification": "race test"},
+        "actor": None,
+        "evidence_refs": [],
+        "risk_context": "medium",
+        "agent_run_id": agent_run_id,
+    }
+    results: list[dict] = []
+    errors: list[Exception] = []
+    barrier = threading.Barrier(2)
+
+    def call() -> None:
+        try:
+            barrier.wait(timeout=10)
+            results.append(request_approval_for_agent(payload))
+        except Exception as exc:  # noqa: BLE001 -- capture any failure from
+            # either thread so the assertions below can report it, rather
+            # than letting a background-thread exception vanish silently.
+            errors.append(exc)
+
+    try:
+        threads = [threading.Thread(target=call) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=15)
+
+        assert not errors, f"unexpected errors from concurrent calls: {errors!r}"
+        assert len(results) == 2
+        assert results[0]["approval_request_id"] == results[1]["approval_request_id"]
+
+        rows = _rows_for(raw_db_session, agent_run_id)
+        assert len(rows) == 1, (
+            f"expected exactly 1 ApprovalRequest row for identical concurrent "
+            f"payloads, found {len(rows)} -- the advisory-lock critical "
+            f"section failed to serialize the concurrent inserts"
+        )
     finally:
         _cleanup(raw_db_session, agent_run_id)
 

@@ -84,16 +84,48 @@ about-to-be-persisted value, and insert -- at which point `snapshot_hash`
 is exactly what Task 6 needs it to be: a tamper-detection digest, computed
 once at creation time over values that are then fixed and non-drifting for
 the row's entire lifetime, re-derivable byte-for-byte from that row later.
-`snapshot_hash` stays UNIQUE-constrained (Task 1's schema) as a
-defense-in-depth backstop against a genuine concurrent-insert race for the
-identical identity -- see `_insert_new_request`'s docstring.
+
+Concurrent-insert race -- closed with a Postgres advisory lock, NOT a DB
+uniqueness constraint (a real gap an earlier version of this module had --
+recorded here, not silently fixed and forgotten): the identity tuple above
+has no database-level uniqueness constraint. `snapshot_hash` IS unique
+(Task 1's schema), but two truly concurrent callers with an IDENTICAL
+payload compute DIFFERENT `expires_at` values (real wall-clock time
+advances between them) and therefore DIFFERENT hashes -- so a naive "catch
+the `snapshot_hash` UNIQUE-constraint violation" guard never actually
+fires for this race; both concurrent inserts would succeed, producing two
+`ApprovalRequest` rows for one logical approval. A composite unique
+constraint over the identity fields was considered and rejected: several
+of those columns are nullable (`agent_run_id`, `requested_by_id`,
+`bound_evidence_refs_json`, `risk_context`), and Postgres unique
+constraints treat NULL as distinct-from-every-other-NULL by default, so a
+plain `UniqueConstraint` would silently fail to dedupe the common case
+where several of those are `None` -- fixing that NULL-safety properly
+needs a NULLS NOT DISTINCT / COALESCE-based expression index, plus
+`action_params_json` is unbounded text that risks exceeding a btree
+index's per-entry size limit for pathological large `params`. Instead,
+`request_approval_for_agent` wraps its whole check-then-insert critical
+section in a Postgres session-level advisory lock,
+`pg_advisory_xact_lock(key)`, keyed on a hash of the SAME identity tuple
+(`_advisory_lock_key`) -- this blocks a second concurrent caller with an
+identical identity until the first caller's transaction (holding the
+lock) commits or rolls back, at which point the second caller's own
+`_find_existing_request` lookup (now running after the first row is
+committed) finds the row the first caller just inserted, instead of racing
+past the check and inserting a second one. The lock is transaction-scoped
+(`_xact_`), so it releases automatically at `session.commit()` -- no
+separate unlock call is needed or made. `_insert_new_request`'s
+`IntegrityError` catch remains as residual defense-in-depth for a
+genuinely different scenario (an actual `snapshot_hash` collision across
+two DIFFERENT identities, astronomically unlikely but still guarded), not
+as this race's primary defense -- see that function's docstring.
 """
 
 import hashlib
 import json
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -125,6 +157,13 @@ def compute_snapshot_hash(
     stored fields untouched instead (see `request_approval_for_agent`).
     This function is only ever called once, at the moment a brand new
     `ApprovalRequest` row is about to be inserted.
+
+    Task 6's `execute_mutation` MUST import and call this exact function to
+    re-derive a fetched row's hash for its tamper check -- it must NOT
+    re-implement this composition by hand from the module docstring's
+    description, since any incidental drift between a hand-rolled
+    reimplementation and this function would itself produce false-positive
+    tamper detections on perfectly legitimate, unmodified rows.
     """
     payload = {
         "action_type": action_type,
@@ -152,6 +191,17 @@ def _find_existing_request(
     idempotent -- deliberately does NOT include `expires_at`/
     `snapshot_hash` (see module docstring's "wall-clock idempotency
     hazard" note for why those two must never participate in this check).
+
+    Uses `.scalar_one_or_none()` (matching Task 3's
+    `grant_vpn_access`/`ensure_vpn_entitlement_seeded` convention), not
+    `.scalars().first()` -- `.first()` would silently return an arbitrary
+    one of several matching rows if this identity ever somehow had more
+    than one (which should be structurally impossible now that
+    `request_approval_for_agent` serializes same-identity inserts via
+    `pg_advisory_xact_lock` -- see module docstring's "Concurrent-insert
+    race" section). `.scalar_one_or_none()` instead raises
+    `MultipleResultsFound` in that case, surfacing real data corruption
+    loudly instead of papering over it.
     """
     stmt = select(ApprovalRequest).where(
         ApprovalRequest.agent_run_id == agent_run_id,
@@ -161,7 +211,53 @@ def _find_existing_request(
         ApprovalRequest.bound_evidence_refs_json == bound_evidence_refs_json,
         ApprovalRequest.risk_context == risk_context,
     )
-    return session.execute(stmt).scalars().first()
+    return session.execute(stmt).scalar_one_or_none()
+
+
+def _advisory_lock_key(
+    *,
+    agent_run_id: str | None,
+    action_type: str,
+    action_params_json: str,
+    requested_by_id: int | None,
+    bound_evidence_refs_json: str | None,
+    risk_context: str | None,
+) -> int:
+    """A stable, signed 64-bit integer derived from the same identity
+    tuple `_find_existing_request` matches on -- used only as a
+    `pg_advisory_xact_lock` key (see module docstring's "Concurrent-insert
+    race" section), never persisted anywhere. Not `compute_snapshot_hash`
+    itself (that hash's composition also includes `expires_at`, which this
+    lock key must NOT depend on -- two concurrent callers with an
+    identical *identity* but not-yet-decided, potentially different
+    `expires_at` values must still map to the SAME lock key so they
+    actually serialize against each other).
+
+    Postgres advisory lock keys are a single `bigint` (signed 64-bit).
+    `sha256`'s first 8 digest bytes, read as a big-endian unsigned 64-bit
+    integer, are folded into that signed range the standard way
+    (subtracting 2**64 when the top bit is set). A hash collision between
+    two DIFFERENT identities here would only cause harmless, unnecessary
+    extra serialization between unrelated requests (they'd briefly
+    contend on the same lock key) -- never an incorrect result, since
+    `_find_existing_request`'s actual column-equality check still runs
+    inside the lock and is what determines correctness.
+    """
+    digest = hashlib.sha256(
+        json.dumps(
+            {
+                "agent_run_id": agent_run_id,
+                "action_type": action_type,
+                "action_params_json": action_params_json,
+                "requested_by_id": requested_by_id,
+                "bound_evidence_refs_json": bound_evidence_refs_json,
+                "risk_context": risk_context,
+            },
+            sort_keys=True,
+        ).encode()
+    ).digest()
+    unsigned = int.from_bytes(digest[:8], "big")
+    return unsigned - 2**64 if unsigned >= 2**63 else unsigned
 
 
 def _insert_new_request(
@@ -177,21 +273,19 @@ def _insert_new_request(
     risk_context: str | None,
 ) -> ApprovalRequest:
     """Picks a fresh `expires_at`, computes the snapshot hash over it, and
-    inserts. Guards against a genuine concurrent-insert race for the exact
-    same identity (two near-simultaneous calls both missing
-    `_find_existing_request`'s lookup before either commits) by catching
-    the `snapshot_hash` UNIQUE-constraint violation... but a hash collision
-    is not actually what a same-identity race would trigger here (each
-    concurrent caller computes its OWN fresh `expires_at`, hence its own
-    distinct hash) -- so the real guard against that race is re-running
-    the identity lookup after an `IntegrityError` of any kind on insert,
-    which catches both a literal hash collision (astronomically unlikely)
-    and the more realistic case of a unique-constraint-adjacent conflict.
-    This is defense-in-depth, not this task's primary correctness
-    mechanism: LangGraph's own single-writer-per-node-per-checkpoint
-    execution model means the actual re-execution scenario this task must
-    handle (sequential resume/restart, not concurrent threads) never hits
-    this race at all -- `_find_existing_request` alone handles it.
+    inserts.
+
+    Callers MUST already hold `_advisory_lock_key`'s Postgres advisory
+    lock for this identity before calling this function (see
+    `request_approval_for_agent` and module docstring's "Concurrent-insert
+    race" section) -- that lock, not this function's `IntegrityError`
+    catch, is what actually prevents two concurrent callers with an
+    identical identity from both inserting. The `IntegrityError` catch
+    here is narrower residual defense-in-depth for a genuinely different,
+    much rarer scenario: an actual `snapshot_hash` collision between two
+    DIFFERENT identities (astronomically unlikely for sha256, but still a
+    real UNIQUE-constraint column, so still guarded rather than left to
+    raise an unhandled 500).
     """
     expires_at = datetime.now(timezone.utc) + _DEFAULT_APPROVAL_TTL
     snapshot_hash = compute_snapshot_hash(
@@ -244,7 +338,13 @@ def request_approval_for_agent(payload: dict) -> dict:
     with an identical `payload` -- exactly what happens when the injected
     `request_approval` node re-executes on a LangGraph resume/restart --
     returns the SAME existing row's id/status/expires_at, never inserting
-    a duplicate `ApprovalRequest`.
+    a duplicate `ApprovalRequest`. This holds under genuine concurrency
+    too (two overlapping calls with an identical payload), not just
+    sequential re-execution -- see module docstring's "Concurrent-insert
+    race" section for the `pg_advisory_xact_lock` mechanism this relies on,
+    and `apps/api/tests/test_approval_service.py`'s
+    `test_request_approval_for_agent_closes_the_concurrent_insert_race`
+    for a real multi-threaded proof against Postgres.
     """
     action_type = payload["action_type"]
     params = payload.get("params") or {}
@@ -259,6 +359,23 @@ def request_approval_for_agent(payload: dict) -> dict:
     )
 
     with session_factory() as session:
+        # Acquire the identity's advisory lock BEFORE the identity lookup
+        # below -- this is what actually closes the concurrent-insert race
+        # (see module docstring's "Concurrent-insert race" section); a
+        # second concurrent caller with the same identity blocks here
+        # until the first caller's transaction commits (releasing this
+        # transaction-scoped lock), then re-runs its own lookup and finds
+        # the row the first caller just inserted.
+        lock_key = _advisory_lock_key(
+            agent_run_id=agent_run_id,
+            action_type=action_type,
+            action_params_json=action_params_json,
+            requested_by_id=actor,
+            bound_evidence_refs_json=bound_evidence_refs_json,
+            risk_context=risk_context,
+        )
+        session.execute(select(func.pg_advisory_xact_lock(lock_key)))
+
         existing = _find_existing_request(
             session,
             agent_run_id=agent_run_id,
@@ -279,6 +396,12 @@ def request_approval_for_agent(payload: dict) -> dict:
             bound_evidence_refs_json=bound_evidence_refs_json,
             risk_context=risk_context,
         )
+        # Explicit commit even on the found-existing (no-write) path --
+        # releases the advisory lock promptly rather than relying on the
+        # `with session_factory()` context manager's implicit
+        # close()-triggered rollback to eventually do so. A no-op if
+        # `_insert_new_request` already committed.
+        session.commit()
 
         return {
             "approval_request_id": row.id,
