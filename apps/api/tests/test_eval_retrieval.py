@@ -50,14 +50,16 @@ import pytest
 from resolvegrid_api.eval_retrieval import (
     DEFAULT_K,
     DEFAULT_RERANKER_MODEL,
-    _ndcg_at_k,
-    _precision_at_k,
-    _recall_at_k,
-    _reciprocal_rank,
     load_golden_cases,
     run_eval,
 )
 from resolvegrid_api.ingestion_worker import run_seed_corpus_ingestion
+from resolvegrid_evaluation.retrieval_metrics import (
+    ndcg_at_k,
+    precision_at_k,
+    recall_at_k,
+    reciprocal_rank,
+)
 
 # See module docstring: measured once against the real ingested corpus
 # (see docs/EXPERIMENT_REGISTRY.md for the exact recorded run: recall@5=
@@ -219,25 +221,25 @@ def test_recall_at_k_hand_computed():
     ranked = [10, 20, 30, 40, 50]
     relevant = frozenset({20, 40, 99})  # 99 never appears in ranked
     # 2 of 3 relevant chunks (20, 40) are within top-5.
-    assert _recall_at_k(ranked, relevant, k=5) == 2 / 3
+    assert recall_at_k(ranked, relevant, k=5) == 2 / 3
 
 
 def test_recall_at_k_respects_k_cutoff():
     ranked = [10, 20, 30, 40, 50]
     relevant = frozenset({50})
-    assert _recall_at_k(ranked, relevant, k=2) == 0.0
-    assert _recall_at_k(ranked, relevant, k=5) == 1.0
+    assert recall_at_k(ranked, relevant, k=2) == 0.0
+    assert recall_at_k(ranked, relevant, k=5) == 1.0
 
 
 def test_recall_at_k_empty_relevant_is_none():
-    assert _recall_at_k([1, 2, 3], frozenset(), k=5) is None
+    assert recall_at_k([1, 2, 3], frozenset(), k=5) is None
 
 
 def test_precision_at_k_hand_computed():
     ranked = [10, 20, 30, 40, 50]
     relevant = frozenset({20, 40})
     # 2 hits in top-5, divided by k=5 (not by len(ranked)).
-    assert _precision_at_k(ranked, relevant, k=5) == 2 / 5
+    assert precision_at_k(ranked, relevant, k=5) == 2 / 5
 
 
 def test_precision_at_k_divides_by_k_not_by_result_count():
@@ -245,30 +247,30 @@ def test_precision_at_k_divides_by_k_not_by_result_count():
     # must still be 2/5, not 2/2, per the standard IR definition.
     ranked = [10, 20]
     relevant = frozenset({10, 20})
-    assert _precision_at_k(ranked, relevant, k=5) == 2 / 5
+    assert precision_at_k(ranked, relevant, k=5) == 2 / 5
 
 
 def test_reciprocal_rank_hand_computed():
     ranked = [10, 20, 30]
     relevant = frozenset({30})
-    assert _reciprocal_rank(ranked, relevant) == 1 / 3
+    assert reciprocal_rank(ranked, relevant) == 1 / 3
 
 
 def test_reciprocal_rank_no_hit_is_zero():
     ranked = [10, 20, 30]
     relevant = frozenset({99})
-    assert _reciprocal_rank(ranked, relevant) == 0.0
+    assert reciprocal_rank(ranked, relevant) == 0.0
 
 
 def test_reciprocal_rank_empty_relevant_is_none():
-    assert _reciprocal_rank([1, 2, 3], frozenset()) is None
+    assert reciprocal_rank([1, 2, 3], frozenset()) is None
 
 
 def test_ndcg_at_k_perfect_ranking_is_one():
     ranked = [10, 20, 30]
     relevant = frozenset({10, 20})
     # Both relevant chunks placed first -- this IS the ideal ranking.
-    assert _ndcg_at_k(ranked, relevant, k=3) == pytest.approx(1.0)
+    assert ndcg_at_k(ranked, relevant, k=3) == pytest.approx(1.0)
 
 
 def test_ndcg_at_k_hand_computed():
@@ -277,8 +279,8 @@ def test_ndcg_at_k_hand_computed():
     # DCG@3 = 1/log2(2+1) (chunk 20 is at rank 2) = 1/log2(3)
     # IDCG@3 = 1/log2(1+1) = 1/log2(2) = 1.0 (ideal: the 1 relevant chunk at rank 1)
     expected = (1 / math.log2(3)) / 1.0
-    assert _ndcg_at_k(ranked, relevant, k=3) == pytest.approx(expected)
+    assert ndcg_at_k(ranked, relevant, k=3) == pytest.approx(expected)
 
 
 def test_ndcg_at_k_empty_relevant_is_none():
-    assert _ndcg_at_k([1, 2, 3], frozenset(), k=5) is None
+    assert ndcg_at_k([1, 2, 3], frozenset(), k=5) is None

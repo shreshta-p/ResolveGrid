@@ -58,14 +58,15 @@ that signal's list before fusion even has a chance to combine them.
 
 Metric formulas (Phase 10 Task 3: moved to `resolvegrid_evaluation.
 retrieval_metrics` as public `recall_at_k`/`precision_at_k`/
-`reciprocal_rank`/`ndcg_at_k` -- this module re-exports them under their
-original `_`-prefixed names below, a pure refactor-for-reuse with zero
-behavior change, so `apps/api/tests/test_eval_retrieval.py`'s existing
-imports/assertions keep working unmodified. See
+`reciprocal_rank`/`ndcg_at_k` -- `evaluate_case` below calls them
+indirectly via that package's `grade_retrieval_case`, a pure
+refactor-for-reuse with zero behavior change. See
 `services/evaluation/src/resolvegrid_evaluation/retrieval_metrics.py`'s
-module docstring for each formula, and both that package's
-`tests/test_retrieval_metrics.py` and this module's own
-`apps/api/tests/test_eval_retrieval.py` for hand-computed unit tests
+module docstring for each formula, and
+`apps/api/tests/test_eval_retrieval.py` (which imports these public
+functions directly from `resolvegrid_evaluation.retrieval_metrics`, the
+single source of truth for their hand-computed unit tests -- not
+duplicated in this package's own test suite) for hand-computed unit tests
 against small fixed examples)
 ------------------------------------------------------------------------
 - recall@k    = |relevant chunks in top-k| / |relevant chunks|
@@ -165,14 +166,7 @@ from resolvegrid_api.db import DATABASE_URL
 from resolvegrid_api.models.knowledge import Chunk, Document, DocumentVersion
 from resolvegrid_api.retrieval import assess_sufficiency, fuse_rrf, lexical_search, vector_search
 from resolvegrid_api.retrieval_authz import AuthzFilter
-from resolvegrid_evaluation.retrieval_metrics import (
-    RetrievalCase,
-    grade_retrieval_case,
-    ndcg_at_k as _ndcg_at_k,
-    precision_at_k as _precision_at_k,
-    recall_at_k as _recall_at_k,
-    reciprocal_rank as _reciprocal_rank,
-)
+from resolvegrid_evaluation.retrieval_metrics import RetrievalCase, grade_retrieval_case
 from resolvegrid_retrieval.dedup import DEFAULT_DEDUP_THRESHOLD, dedup
 from resolvegrid_retrieval.embedder import DEFAULT_EMBEDDING_MODEL, embed_texts
 from resolvegrid_retrieval.reranker import DEFAULT_RERANKER_MODEL, rerank
@@ -281,16 +275,6 @@ def resolve_relevant_chunk_ids(
             )
         resolved.add(chunk_ids[0])
     return frozenset(resolved)
-
-
-# ---------------------------------------------------------------------------
-# Metric formulas: moved to `resolvegrid_evaluation.retrieval_metrics`
-# (Phase 10 Task 3) as public `recall_at_k`/`precision_at_k`/
-# `reciprocal_rank`/`ndcg_at_k` -- imported above and re-exported here under
-# their original `_`-prefixed names (`_recall_at_k` etc.) so every existing
-# caller/test of this module keeps working unmodified. See that package's
-# module docstring for each formula.
-# ---------------------------------------------------------------------------
 
 
 # ---------------------------------------------------------------------------
