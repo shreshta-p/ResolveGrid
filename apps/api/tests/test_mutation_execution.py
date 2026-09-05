@@ -38,6 +38,7 @@ from resolvegrid_api.mutation_execution import (
     ApprovalExpiredError,
     ApprovalNotDecidedError,
     ApprovalNotFoundError,
+    ApprovalParamsMismatchError,
     ApprovalTamperError,
     execute_mutation,
     execute_readonly_tool,
@@ -214,7 +215,9 @@ def test_execute_mutation_raises_tamper_error_when_action_params_json_is_altered
     assert error_call.error_taxonomy_code == "ApprovalTamperError"
 
 
-def test_execute_mutation_raises_tamper_error_when_tool_params_argument_does_not_match_approved_params(db_session):
+def test_execute_mutation_raises_params_mismatch_error_when_tool_params_argument_does_not_match_approved_params(
+    db_session,
+):
     """The real gap this task caught in the plan doc's literal instructions:
     `execute_mutation`'s snapshot-hash check alone only re-verifies the
     ROW's own stored fields against themselves -- it says nothing about
@@ -223,6 +226,17 @@ def test_execute_mutation_raises_tamper_error_when_tool_params_argument_does_not
     valid approved approval_request_id alongside a DIFFERENT tool_params
     (e.g. a different employee_id) and silently execute an action that was
     never approved. See mutation_execution.py's `execute_mutation` docstring.
+
+    Raises `ApprovalParamsMismatchError` specifically (a subclass of
+    `ApprovalTamperError`, so still caught by a bare `except
+    ApprovalTamperError:`) -- distinct from a genuine stored-row hash
+    mismatch, per code review: the recorded `ToolCall.error_taxonomy_code`
+    must let the audit trail distinguish "the row itself was altered on
+    disk" from "a caller tried to slip different params through a valid
+    approval id" (a confused-deputy attempt), since those are materially
+    different security narratives. See
+    `test_execute_mutation_tamper_and_params_mismatch_produce_distinguishable_error_taxonomy_codes`
+    for the side-by-side proof.
     """
     employee = _make_employee(db_session, "mismatch")
     other_employee = _make_employee(db_session, "mismatch-victim")
@@ -240,12 +254,95 @@ def test_execute_mutation_raises_tamper_error_when_tool_params_argument_does_not
             tool_params=forged_params,
             actor_employee_id=employee.id,
         )
-        assert False, "expected ApprovalTamperError"
+        assert False, "expected ApprovalParamsMismatchError"
+    except ApprovalParamsMismatchError:
+        pass
+    # Also still catchable as the base ApprovalTamperError -- confirms the
+    # subclass relationship a caller relying on the broader catch depends on.
+    try:
+        execute_mutation(
+            db_session,
+            approval_request_id=row.id,
+            tool_name=_ACTION_TYPE,
+            tool_params=forged_params,
+            actor_employee_id=employee.id,
+        )
+        assert False, "expected ApprovalTamperError (via the subclass)"
     except ApprovalTamperError:
         pass
 
     assert _active_grant_count(db_session, employee.id) == 0
     assert _active_grant_count(db_session, other_employee.id) == 0
+
+    idempotency_key = f"approval:{row.id}"
+    error_codes = {
+        call.error_taxonomy_code
+        for call in db_session.execute(
+            select(ToolCall).where(ToolCall.idempotency_key == idempotency_key, ToolCall.status == "error")
+        )
+        .scalars()
+        .all()
+    }
+    assert error_codes == {"ApprovalParamsMismatchError"}
+
+
+def test_execute_mutation_tamper_and_params_mismatch_produce_distinguishable_error_taxonomy_codes(db_session):
+    """Side-by-side proof (per code review) that a genuine stored-row hash
+    tamper and a caller tool_params/row mismatch record DIFFERENT
+    `ToolCall.error_taxonomy_code` values, even though both are instances
+    of `ApprovalTamperError` -- the audit trail must be able to tell these
+    two materially different security narratives apart.
+    """
+    hash_tamper_employee = _make_employee(db_session, "distinguish-hash")
+    hash_tamper_row, hash_tamper_params = _make_approval_request(
+        db_session, agent_run_id="test-mutexec-distinguish-hash-1", employee_id=hash_tamper_employee.id
+    )
+    hash_tamper_row.action_params_json = json.dumps(
+        {"employee_id": hash_tamper_employee.id, "justification": "TAMPERED"}, sort_keys=True
+    )
+    db_session.flush()
+
+    mismatch_employee = _make_employee(db_session, "distinguish-mismatch")
+    victim_employee = _make_employee(db_session, "distinguish-mismatch-victim")
+    mismatch_row, _mismatch_params = _make_approval_request(
+        db_session, agent_run_id="test-mutexec-distinguish-mismatch-1", employee_id=mismatch_employee.id
+    )
+    forged_params = {"employee_id": victim_employee.id, "justification": "new hire onboarding"}
+
+    for row, tool_params, expected_error_cls in (
+        (hash_tamper_row, hash_tamper_params, ApprovalTamperError),
+        (mismatch_row, forged_params, ApprovalParamsMismatchError),
+    ):
+        try:
+            execute_mutation(
+                db_session,
+                approval_request_id=row.id,
+                tool_name=_ACTION_TYPE,
+                tool_params=tool_params,
+                actor_employee_id=None,
+            )
+            assert False, f"expected {expected_error_cls.__name__}"
+        except expected_error_cls:
+            pass
+
+    hash_tamper_error_call = (
+        db_session.execute(
+            select(ToolCall).where(ToolCall.idempotency_key == f"approval:{hash_tamper_row.id}", ToolCall.status == "error")
+        )
+        .scalars()
+        .one()
+    )
+    mismatch_error_call = (
+        db_session.execute(
+            select(ToolCall).where(ToolCall.idempotency_key == f"approval:{mismatch_row.id}", ToolCall.status == "error")
+        )
+        .scalars()
+        .one()
+    )
+
+    assert hash_tamper_error_call.error_taxonomy_code == "ApprovalTamperError"
+    assert mismatch_error_call.error_taxonomy_code == "ApprovalParamsMismatchError"
+    assert hash_tamper_error_call.error_taxonomy_code != mismatch_error_call.error_taxonomy_code
 
 
 # --- execute_mutation: expiry ------------------------------------------------

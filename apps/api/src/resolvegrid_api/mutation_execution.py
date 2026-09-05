@@ -79,6 +79,21 @@ simpler and, unlike a hashed key, can never collide with a different
 `approval_service.py`'s hashed composite key, discussed in that module's
 own docstring).
 
+Cross-module keyspace note: `pg_advisory_xact_lock` keys are session-scoped
+across the WHOLE Postgres session/connection, not per-module -- this
+module's raw `approval_request_id` keys and `approval_service.py`'s hashed
+composite keys share that one 64-bit keyspace. This is still safe by the
+identical "harmless extra serialization, never wrong data" property
+`approval_service.py`'s own docstring already argues for a same-module hash
+collision: at worst, a `request_approval_for_agent` call and an `execute_
+mutation` call happen to compute/use the same 64-bit key value and briefly
+contend on each other's lock (unnecessary, momentary blocking) -- neither
+module's own identity-equality check (this module's row-identity fetch by
+primary key; that module's `_find_existing_request` column-equality lookup)
+depends on the OTHER module never having used that key, so no incorrect
+result can follow from the shared keyspace, only, in the astronomically
+unlikely worst case, a harmless extra wait.
+
 Why this concern is real, not hypothetical, for this specific node: Task 7
 (not yet built) is expected to call `execute_mutation` from an approver-
 decide HTTP endpoint. An HTTP client's retried/duplicated request (a
@@ -179,6 +194,42 @@ class ApprovalTamperError(MutationExecutionError):
     creation (e.g. direct DB tampering, a bug elsewhere mutating the row).
     "Shouldn't be reachable" per the plan doc, but this is the actual
     defense plan.md requires, not a formality -- see module docstring.
+
+    Raised directly ONLY for this hash-mismatch case. The related, but
+    materially different, "caller passed different tool_params than what
+    was actually approved" case (see module docstring's "Caller-supplied
+    tool_name/tool_params vs. the row's own approved action_type/
+    action_params_json" section) raises `ApprovalParamsMismatchError`
+    below instead -- a subclass of this one, not this class directly, so
+    an existing `except ApprovalTamperError:` catch still catches both
+    ("something is wrong with this approval, refuse to execute"), while
+    the recorded `ToolCall.error_taxonomy_code` (via `.__name__`) stays
+    distinguishable between the two: a stored row that was altered on
+    disk (a DB-tampering incident) is a different, more alarming security
+    narrative than a caller passing mismatched params against an otherwise
+    perfectly valid, untampered row (a confused-deputy attempt, or an
+    honest caller bug) -- and this audit trail's whole purpose is exactly
+    this kind of post-hoc forensic distinction, so collapsing both into one
+    indistinguishable error_taxonomy_code would defeat that purpose.
+    """
+
+
+class ApprovalParamsMismatchError(ApprovalTamperError):
+    """`execute_mutation`'s caller-supplied `tool_name`/`tool_params`
+    arguments do not match the `ApprovalRequest` row's own (hash-verified,
+    untampered) `action_type`/`action_params_json`.
+
+    A subclass of `ApprovalTamperError`, not a sibling -- both represent
+    "the action about to execute is not the action that was actually
+    approved," so both should be caught by the same `except
+    ApprovalTamperError:` a caller reaches for when it just wants to know
+    "refuse to execute, something doesn't line up." Given its own name
+    (and hence its own `error_taxonomy_code` in the recorded `ToolCall`
+    row -- see `_record_error_tool_call`) specifically so the audit trail
+    can distinguish this case (a params/identity mismatch presented at
+    call time) from a genuine `ApprovalTamperError` hash mismatch (the
+    stored row itself was altered) -- see that class's docstring for why
+    this distinction matters for forensics.
     """
 
 
@@ -427,9 +478,9 @@ def execute_mutation(
             tool_name=tool_name,
             tool_params=tool_params,
             idempotency_key=idempotency_key,
-            error_cls=ApprovalTamperError,
+            error_cls=ApprovalParamsMismatchError,
         )
-        raise ApprovalTamperError(
+        raise ApprovalParamsMismatchError(
             f"tool_name/tool_params passed to execute_mutation do not match the approved "
             f"ApprovalRequest id={approval_request_id}'s own action_type/action_params_json "
             "-- refusing to execute a different action than the one that was actually approved"
