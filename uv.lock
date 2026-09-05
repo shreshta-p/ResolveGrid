@@ -1813,7 +1813,9 @@ name = "resolvegrid-evaluation"
 version = "0.1.0"
 source = { editable = "services/evaluation" }
 dependencies = [
+    { name = "jsonschema" },
     { name = "pydantic" },
+    { name = "resolvegrid-contracts" },
 ]
 
 [package.dev-dependencies]
@@ -1822,7 +1824,11 @@ dev = [
 ]
 
 [package.metadata]
-requires-dist = [{ name = "pydantic", specifier = ">=2.9" }]
+requires-dist = [
+    { name = "jsonschema", specifier = ">=4.26.0" },
+    { name = "pydantic", specifier = ">=2.9" },
+    { name = "resolvegrid-contracts", editable = "packages/contracts" },
+]
 
 [package.metadata.requires-dev]
 dev = [{ name = "pytest", specifier = ">=8.3" }]

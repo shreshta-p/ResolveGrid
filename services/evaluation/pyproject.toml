@@ -11,7 +11,23 @@ requires-python = ">=3.13"
 # reverse.
 dependencies = [
     "pydantic>=2.9",
+    # Task 2 (graders.py): grade_schema_validity validates a tool-dimension
+    # case's actual_result against the tool's own params_schema. This needs
+    # `resolvegrid_contracts.tools.TOOL_REGISTRY` -- a sibling *packages/*
+    # library (not apps/api, not DB-shaped), so depending on it does not
+    # violate this package's dependency-direction rule (see schema.py's
+    # module docstring). `apps/api/src/resolvegrid_api/tool_execution.py`'s
+    # `validate_tool_schema` does the equivalent validation but lives in
+    # apps/api, which this package must never import -- so the thin
+    # `jsonschema.validate(...)` call itself is reimplemented here directly
+    # rather than importing across that forbidden boundary. Same
+    # `jsonschema` version floor apps/api already pins.
+    "resolvegrid-contracts",
+    "jsonschema>=4.26.0",
 ]
+
+[tool.uv.sources]
+resolvegrid-contracts = { workspace = true }
 
 [dependency-groups]
 dev = [
