@@ -1,6 +1,7 @@
 from resolvegrid_api.models.agent import AgentRun, Span
 from resolvegrid_api.models.approvals import ApprovalDecision, ApprovalPolicy, ApprovalRequest
 from resolvegrid_api.models.base import Base
+from resolvegrid_api.models.evaluation import EvalCaseResult, EvalRun
 from resolvegrid_api.models.knowledge import (
     Chunk,
     Document,
@@ -38,6 +39,8 @@ __all__ = [
     "Employee",
     "EmployeeEntitlement",
     "Entitlement",
+    "EvalCaseResult",
+    "EvalRun",
     "IngestionRun",
     "Location",
     "ModelCall",

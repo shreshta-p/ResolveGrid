@@ -133,6 +133,17 @@ jobs:
       - run: uv sync --all-packages
       - run: uv run --package resolvegrid-agent-orchestration pytest services/agent-orchestration/tests -v
 
+  evaluation:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v3
+        with:
+          version: "0.8.13"
+      - run: uv sync --all-packages
+      - run: uv run --package resolvegrid-evaluation pytest services/evaluation/tests -v
+
   retrieval:
     runs-on: ubuntu-latest
     # Higher than the other uv-based jobs: test_reranker.py (Phase 8 Task 1)

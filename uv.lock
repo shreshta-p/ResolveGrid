@@ -12,6 +12,7 @@ members = [
     "resolvegrid-api",
     "resolvegrid-authz",
     "resolvegrid-contracts",
+    "resolvegrid-evaluation",
     "resolvegrid-retrieval",
     "resolvegrid-telemetry",
     "resolvegrid-workspace",
@@ -1792,6 +1793,25 @@ dev = [{ name = "pytest", specifier = ">=8.3" }]
 name = "resolvegrid-contracts"
 version = "0.1.0"
 source = { editable = "packages/contracts" }
+dependencies = [
+    { name = "pydantic" },
+]
+
+[package.dev-dependencies]
+dev = [
+    { name = "pytest" },
+]
+
+[package.metadata]
+requires-dist = [{ name = "pydantic", specifier = ">=2.9" }]
+
+[package.metadata.requires-dev]
+dev = [{ name = "pytest", specifier = ">=8.3" }]
+
+[[package]]
+name = "resolvegrid-evaluation"
+version = "0.1.0"
+source = { editable = "services/evaluation" }
 dependencies = [
     { name = "pydantic" },
 ]
