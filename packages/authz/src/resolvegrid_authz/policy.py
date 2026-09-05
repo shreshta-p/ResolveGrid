@@ -41,7 +41,14 @@ _SELF_SCOPED_ACTIONS = {
 # Actions that require an actual staff/admin grant -- a principal with no
 # matching grant is DENIED outright, never silently downgraded to self-scope
 # (e.g. a plain employee must never be able to transition ticket status).
-_STAFF_ONLY_ACTIONS = {"ticket.transition"}
+# Phase 9 Task 7b: "approval.list"/"approval.decide" join this set for the
+# identical reason -- an ApprovalRequest is never a personal resource an
+# ordinary employee should see or decide on (unlike, say, their own ticket),
+# so a principal with no admin/department-scoped analyst-or-approver grant
+# must be denied outright, exactly matching ticket.transition's precedent,
+# not downgraded to a self-scoped Decision that would (incorrectly) let them
+# see/decide approvals they merely requested or are the subject of.
+_STAFF_ONLY_ACTIONS = {"ticket.transition", "approval.list", "approval.decide"}
 
 _KNOWN_ACTIONS = _SELF_SCOPED_ACTIONS | _STAFF_ONLY_ACTIONS
 
