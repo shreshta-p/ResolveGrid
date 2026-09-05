@@ -154,3 +154,26 @@ class AgentState(TypedDict):
     # result, it is either a real decision string or this run never reached
     # `request_approval` in the first place.
     approval_decision: str | None
+    # Phase 9 Task 7a: populated by `execute_mutation` (graph.py's
+    # `make_execute_mutation_node`) -- the outcome of dispatching (or
+    # deliberately not dispatching) `proposed_tool_name` after
+    # `request_approval`'s `interrupt()` resume boundary. A plain dict,
+    # `{"status": "success" | "error" | "rejected", "output": dict | list |
+    # None, "error": str | None}` -- mirrors `ExecuteMutationFn`'s return
+    # shape (see graph.py) verbatim, since this node's only job is to
+    # attach that return value to state, not reshape it further.
+    #
+    # Deliberately a NEW field, not a reuse of `output_text`: `output_text`
+    # is this graph's OTHER compiled flow's (`build_graph`'s chat pipeline)
+    # field for a natural-language answer meant for `finalize`/`/chat` to
+    # surface directly to a user as prose. A tool invocation's result is
+    # structured data (a dict/list of granted-entitlement fields, or an
+    # error taxonomy code), not prose, and the tool-invocation graph has no
+    # `finalize` node of its own to blur the two purposes together. Reusing
+    # `output_text` for both would make a future reader of a checkpointed
+    # `AgentState` row unable to tell, without also checking which graph
+    # produced it, whether the value is a chat answer or a tool result --
+    # a new, clearly-named field avoids that ambiguity entirely, at the
+    # cost of one more (optional, `None`-by-default) key on this shared
+    # TypedDict.
+    tool_invocation_result: dict | None

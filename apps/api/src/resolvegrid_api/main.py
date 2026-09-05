@@ -7,13 +7,15 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from opentelemetry import trace
-from resolvegrid_agent_orchestration import build_graph
+from resolvegrid_agent_orchestration import build_graph, build_tool_invocation_graph
 from resolvegrid_telemetry import init_tracing
 
 from resolvegrid_api import llm_gateway
+from resolvegrid_api.agent_mutation_execution import execute_mutation_for_agent
 from resolvegrid_api.agent_retrieval import retrieve_for_agent
+from resolvegrid_api.approval_service import request_approval_for_agent
 from resolvegrid_api.db import DATABASE_URL
-from resolvegrid_api.routers import chat, directory, tickets
+from resolvegrid_api.routers import chat, directory, tickets, tools
 
 # `langgraph-checkpoint-postgres`'s AsyncPostgresSaver uses psycopg's async
 # driver, which raises psycopg.InterfaceError unconditionally under Windows'
@@ -89,6 +91,20 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         # gets per-request DB/authz behavior without a live Session ever
         # crossing into checkpointed graph state.
         app.state.agent_graph = build_graph(checkpointer, complete_fn, retrieve_for_agent)
+        # Phase 9 Task 7a: a second, separate compiled graph
+        # (`request_approval -> execute_mutation`) sharing this SAME
+        # checkpointer instance -- confirmed safe by reading the installed
+        # `AsyncPostgresSaver` source (every checkpoint row is keyed by the
+        # caller's own `(thread_id, checkpoint_ns)` pair, never by which
+        # compiled graph made the call; see `graph.py`'s "Phase 9 Task 7a"
+        # docstring section for the full analysis). `request_approval_for_
+        # agent`/`execute_mutation_for_agent` are each built once here, at
+        # startup, mirroring `complete_fn`/`retrieve_for_agent`'s own
+        # "closure over apps/api internals, opens its own session per call"
+        # pattern -- see their respective modules' docstrings.
+        app.state.tool_invocation_graph = build_tool_invocation_graph(
+            checkpointer, request_approval_for_agent, execute_mutation_for_agent
+        )
         yield
     trace.get_tracer_provider().shutdown()
 
@@ -104,6 +120,7 @@ app.add_middleware(
 app.include_router(directory.router)
 app.include_router(tickets.router)
 app.include_router(chat.router)
+app.include_router(tools.router)
 
 
 @app.get("/health")

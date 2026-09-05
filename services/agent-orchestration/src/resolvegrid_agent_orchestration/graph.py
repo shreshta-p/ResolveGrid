@@ -118,6 +118,60 @@ therefore untouched by this task, exactly matching the existing test
 suite's expectations. Mirrors Phase 7 Task 7's own documented "deliberate
 scope limit" precedent above.
 
+Phase 9 Task 7a -- the tool-invocation graph: `build_tool_invocation_graph`
+--------------------------------------------------------------------------
+Task 6 built `execute_mutation`/`execute_readonly_tool` (`apps/api`'s
+`mutation_execution.py`) as plain, directly-callable functions with NO
+LangGraph node wrapper and NO wiring into any compiled graph -- deliberately,
+per that module's own docstring, since the routing needed to reach them
+(`request_approval`'s `interrupt()` resume boundary) didn't exist in any real
+running graph yet. That leaves a real gap: as of Task 6, nothing in this
+app ever actually calls `interrupt()` for real outside of Task 5's own
+standalone unit tests (which build their own throwaway single-node graph,
+never wired to a real endpoint or a real `AsyncPostgresSaver`). Task 8's
+restart-mid-approval test -- this phase's core exit criterion -- needs a
+REAL paused `interrupt()` run reachable through the actual app to restart
+against, not just a test harness's ad hoc graph.
+
+This task closes that gap with a second, separate compiled graph,
+`build_tool_invocation_graph`, rather than teaching the existing `build_graph`
+chat pipeline (`classify_intent -> retrieve -> compose_response ->
+verify_citations -> finalize`) to infer tool intent from free-form chat
+text. That would be a much larger, genuinely different undertaking (real
+LLM-driven tool selection out of arbitrary user text) that no task in this
+phase actually specifies, and folding `request_approval`/`execute_mutation`
+into the chat graph's linear chain would risk regressing that graph's
+already-established, well-tested behavior for a use case
+(`classify_intent`/`retrieve`/`compose_response`) that has nothing to do
+with an analyst explicitly invoking a named tool. A real IT-analyst UI
+doesn't work by typing free text and hoping an LLM infers "grant this
+person VPN access" either -- it works by the analyst deliberately choosing
+that action from a form, which is exactly the explicit
+`proposed_tool_name`/`proposed_tool_params` input this graph expects
+already sitting in initial state (see `apps/api`'s new `routers/tools.py`
+`POST /tools/{tool_name}/invoke` endpoint, this graph's real caller).
+
+`build_tool_invocation_graph` has exactly two nodes: `request_approval`
+(Task 5's `make_request_approval_node`, reused verbatim -- not
+reimplemented) and this task's new `execute_mutation`
+(`make_execute_mutation_node`), wired `START -> request_approval ->
+execute_mutation -> END`. It is compiled with the SAME real
+`AsyncPostgresSaver` checkpointer instance `build_graph`'s chat pipeline
+uses (see `apps/api`'s `main.py` for where both are constructed) --
+confirmed safe by reading the installed `langgraph-checkpoint-postgres`
+source (`AsyncPostgresSaver.aget_tuple`/`.aput`): every checkpoint row is
+keyed by the `(thread_id, checkpoint_ns)` pair from the caller's own
+`config["configurable"]`, never by anything identifying which compiled
+`Pregel`/`StateGraph` object made the call. Two different compiled graphs
+sharing one checkpointer instance is therefore exactly as safe as two
+different `thread_id`s ever calling the same graph -- there is no
+graph-identity information stored anywhere in the checkpoint tuple that
+either graph could clash over, so the ONLY real requirement is that a given
+`thread_id` is never invoked against both graphs (this task's `apps/api`
+caller guarantees that: `chat.py` and `routers/tools.py` each mint their
+own fresh `uuid4().hex` per call and never share one across the two
+endpoints).
+
 This module also gains its first import from `services/retrieval`:
 `resolvegrid_retrieval.citation_verification.verify_citations`, used by
 the new `verify_citations` node. This is NOT a violation of the
@@ -593,6 +647,151 @@ def make_request_approval_node(request_approval_fn: RequestApprovalFn):
         }
 
     return request_approval
+
+
+# The function `apps/api`'s real `ExecuteMutationFn` implementation lives
+# behind (Phase 9 Task 7a; see that module for the concrete implementation
+# and why it lives in its own file rather than `approval_service.py` --
+# a circular import with `mutation_execution.py`, which already imports
+# `approval_service.compute_snapshot_hash`). Mirrors `RequestApprovalFn`'s
+# DI shape exactly: a plain dict in, plain dict out, so this package never
+# imports `resolvegrid_api`/SQLAlchemy/Task 6's typed errors directly (see
+# module docstring's dependency-direction rule).
+#
+# Input payload dict keys (built by `make_execute_mutation_node` below from
+# `state`, only ever called when `state["approval_decision"] == "approved"`):
+#   approval_request_id: int | None -- state["approval_request_id"]
+#   tool_name: str | None            -- state["proposed_tool_name"]
+#   tool_params: dict                -- state["proposed_tool_params"] or {}
+#   actor_employee_id: int | None    -- state["principal_employee_id"]
+#
+# Return dict shape (an `ExecuteMutationOutcome`-shaped plain dict; kept as
+# an untyped `dict` rather than a `TypedDict` like `ApprovalOutcome` above
+# since Task 6's `execute_mutation`'s own success/error result shapes
+# already vary slightly by case -- see `mutation_execution.py` -- and this
+# node only ever forwards it to `state["tool_invocation_result"]` rather
+# than reading individual keys back out of it):
+#   {"status": "success" | "error", "output": dict | list | None,
+#    "error": str | None}
+#
+# Error-translation judgment call (documented per this task's brief): the
+# real implementation behind this callable is expected to catch Task 6's
+# typed `MutationExecutionError` subclasses (`ApprovalTamperError`,
+# `ApprovalNotDecidedError`, `ApprovalExpiredError`, etc.) ITSELF and
+# translate them into the `{"status": "error", "error": ...}` shape above,
+# rather than letting them propagate as raw exceptions into this package.
+# Rationale: those error types are declared in `apps/api`'s
+# `mutation_execution.py`, which this package must never import (same
+# dependency-direction rule as everything else in this module) -- so this
+# package has no way to `except` them by type even if it wanted to. The
+# node below still wraps the call in a bare `try/except Exception` as
+# defense-in-depth (matching `classify_intent`/`retrieve`'s soft-degrade
+# convention), but that is a safety net for an implementation bug, not
+# this callable's primary error-handling path.
+ExecuteMutationFn = Callable[[dict], dict]
+
+
+def make_execute_mutation_node(execute_mutation_fn: ExecuteMutationFn):
+    """Build the `execute_mutation` node bound to a given `ExecuteMutationFn`
+    -- the second (and last) node of `build_tool_invocation_graph`, placed
+    strictly after `request_approval`'s `interrupt()` resume boundary (see
+    this module's "Phase 9 Task 7a" docstring section).
+
+    Branches on `state["approval_decision"]` (set by `request_approval` from
+    whatever an approver's `Command(resume=<value>)` supplied):
+
+    - `"approved"`: builds the plain-dict payload described by
+      `ExecuteMutationFn`'s comment above and calls `execute_mutation_fn`.
+      A bare `try/except Exception` around this call is defense-in-depth
+      only (see `ExecuteMutationFn`'s comment for why the real
+      translation of Task 6's typed errors is expected to happen inside
+      the injected callable itself, in `apps/api`) -- if the callable
+      somehow still raises, this node degrades to a generic
+      `{"status": "error", ...}` result rather than letting an unhandled
+      exception blow up the graph run, mirroring every other node in this
+      module's soft-degrade convention.
+    - `"rejected"`: records that outcome directly, WITHOUT calling
+      `execute_mutation_fn` at all -- a rejected approval must never reach
+      the real mutating adapter, no matter what. `{"status": "rejected",
+      "output": None, "error": None}`.
+    - anything else (most importantly `None`): defensive fallback for a
+      state this node should never actually observe if it only ever runs
+      after a real `interrupt()` resume (an approver's decision is always
+      `"approved"` or `"rejected"` by the time `request_approval` returns
+      it into state -- see that node's own docstring) -- but per this
+      codebase's established "soft-degrade rather than crash" convention
+      (see `classify_intent`/`retrieve`), an unexpected value here still
+      records a clear, structured error instead of raising or silently
+      dispatching the mutating adapter anyway.
+    """
+
+    def execute_mutation(state: AgentState) -> dict:
+        decision = state.get("approval_decision")
+
+        if decision == "rejected":
+            return {
+                "tool_invocation_result": {
+                    "status": "rejected",
+                    "output": None,
+                    "error": None,
+                }
+            }
+
+        if decision == "approved":
+            payload = {
+                "approval_request_id": state.get("approval_request_id"),
+                "tool_name": state.get("proposed_tool_name"),
+                "tool_params": state.get("proposed_tool_params") or {},
+                "actor_employee_id": state.get("principal_employee_id"),
+            }
+            try:
+                result = execute_mutation_fn(payload)
+            except Exception as exc:  # noqa: BLE001 -- defense-in-depth only;
+                # see this node's docstring for why the real error
+                # translation is expected to already have happened inside
+                # `execute_mutation_fn` itself.
+                result = {"status": "error", "output": None, "error": str(exc)}
+            return {"tool_invocation_result": result}
+
+        return {
+            "tool_invocation_result": {
+                "status": "error",
+                "output": None,
+                "error": (
+                    f"execute_mutation reached with an unexpected "
+                    f"approval_decision={decision!r} (expected 'approved' or "
+                    "'rejected' -- this node should only ever run after a "
+                    "real request_approval interrupt() resume)"
+                ),
+            }
+        }
+
+    return execute_mutation
+
+
+def build_tool_invocation_graph(
+    checkpointer, request_approval_fn: RequestApprovalFn, execute_mutation_fn: ExecuteMutationFn
+):
+    """Build and compile the `request_approval -> execute_mutation`
+    tool-invocation graph -- a real, running graph that a caller (e.g.
+    `apps/api`'s `POST /tools/{tool_name}/invoke`) invokes with
+    `proposed_tool_name`/`proposed_tool_params` already populated in
+    initial state, and which durably pauses at a real `interrupt()` for a
+    human approver to resume via `Command(resume="approved"|"rejected")`.
+
+    See this module's "Phase 9 Task 7a" docstring section for the full
+    rationale for why this is a SEPARATE compiled graph from `build_graph`'s
+    chat pipeline, rather than new routing spliced into that graph, and for
+    why sharing one checkpointer instance between the two compiled graphs
+    is safe.
+    """
+    builder = StateGraph(AgentState)
+    builder.add_node("request_approval", make_request_approval_node(request_approval_fn))
+    builder.add_node("execute_mutation", make_execute_mutation_node(execute_mutation_fn))
+    builder.add_edge(START, "request_approval")
+    builder.add_edge("request_approval", "execute_mutation")
+    builder.add_edge("execute_mutation", END)
+    return builder.compile(checkpointer=checkpointer)
 
 
 def build_graph(checkpointer, complete_fn: CompleteFn, retrieve_fn: RetrieveFn):
