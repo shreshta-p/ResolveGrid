@@ -308,11 +308,22 @@ immediately with no `ApprovalRequest` created.
 
 #### Task 7b — Approver API + minimal approver UI surface (depends on 7a)
 
-- `apps/api/src/resolvegrid_api/routers/approvals.py`: `GET /approvals` (list pending, filtered by
-  the approver's department/role via `authorize()` — new `"approval.list"`/`"approval.decide"`
-  actions in `packages/authz/policy.py`, following the exact `_SELF_SCOPED_ACTIONS`/
-  `_STAFF_ONLY_ACTIONS` pattern already established — `approval.decide` should be staff-only, never
-  self-scoped, matching `ticket.transition`'s precedent), `POST /approvals/{id}/decide` (body:
+- `apps/api/src/resolvegrid_api/routers/approvals.py`: `GET /approvals` (new `"approval.list"`/
+  `"approval.decide"` actions in `packages/authz/policy.py`, following the exact
+  `_SELF_SCOPED_ACTIONS`/`_STAFF_ONLY_ACTIONS` pattern already established — both staff-only, never
+  self-scoped, matching `ticket.transition`'s precedent). **Amended during execution:**
+  department-scoping the result set (via `authorize()`'s `department_ids`, the way `tickets.py`
+  scopes by `Queue.department_id`) was deliberately NOT built this task: `ApprovalRequest` has no
+  department column, and this phase's only `action_type` (`grant_vpn_access`) has no
+  department-routing semantics anywhere yet (`ApprovalPolicy.stages_json` exists but nothing reads
+  it) — a join through `requested_by_id -> Employee.department_id` would filter by the
+  *requester's* department, which isn't necessarily the right scoping semantic for "which approver
+  should see this" either. Real per-department approval routing is real future work once
+  `ApprovalPolicy` is actually wired up (tracked in Task 9's decision log), not built speculatively
+  here against a single action type that doesn't need it yet. Any principal who passes the
+  `approval.list`/`approval.decide` staff-only authz check (global admin, or any department-scoped
+  analyst/approver grant) sees and can decide on every pending request, company-wide — an honestly
+  disclosed, documented scope limit, not silently-faked filtering. `POST /approvals/{id}/decide` (body:
   `{decision: "approved"|"rejected", comment}` — writes `ApprovalDecision`, updates
   `ApprovalRequest.status`, then resumes the paused graph run for real: fetch the row's
   `agent_run_id` (== `thread_id`), call the SAME compiled `build_tool_invocation_graph` graph's
