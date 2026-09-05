@@ -161,15 +161,33 @@ def test_execute_mutation_happy_path_grants_vpn_and_records_audit_trail(db_sessi
     assert success_calls[0].tool_name == _ACTION_TYPE
     assert success_calls[0].approval_request_id == row.id
 
+    # Scoped by entity_id (this test's own EmployeeEntitlement row), not just
+    # by action -- a real fragility this task's audit pass caught (not
+    # hypothetical): on a long-lived dev Postgres instance, AuditLog is
+    # permanent/append-only (no cascade delete -- see audit.py's module
+    # docstring) and other tests/prior runs also write
+    # action="tool.grant_vpn_access" rows for their OWN employees, so an
+    # unscoped `AuditLog.action == ...` query picks up every such row ever
+    # committed, not just this test's -- an unordered query's `[-1]` then
+    # asserts against an arbitrary one of them (observed failing against a
+    # different test's actor_id when the full suite ran against an
+    # already-populated dev DB). Filtering by this test's own `entity_id`
+    # (mirrors test_approvals_router.py's already-correct precedent) makes
+    # this assertion correct regardless of what else the DB accumulates.
     audit_rows = (
-        db_session.execute(select(AuditLog).where(AuditLog.action == f"tool.{_ACTION_TYPE}"))
+        db_session.execute(
+            select(AuditLog).where(
+                AuditLog.action == f"tool.{_ACTION_TYPE}",
+                AuditLog.entity_id == result["output"]["employee_entitlement_id"],
+            )
+        )
         .scalars()
         .all()
     )
-    assert len(audit_rows) >= 1
-    assert audit_rows[-1].entity_type == "employee_entitlement"
-    assert audit_rows[-1].actor_type == "agent"
-    assert audit_rows[-1].actor_id == employee.id
+    assert len(audit_rows) == 1
+    assert audit_rows[0].entity_type == "employee_entitlement"
+    assert audit_rows[0].actor_type == "agent"
+    assert audit_rows[0].actor_id == employee.id
 
     assert verify_chain_integrity(db_session) is True
 
