@@ -56,7 +56,7 @@ class EvalCaseResult(Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     eval_run_id: Mapped[int] = mapped_column(ForeignKey("eval_run.id"))
     case_id: Mapped[str]
-    dimension: Mapped[str]
+    dimension: Mapped[str]  # "chat" | "retrieval" | "tool" | "approval" | "adversarial"
     passed: Mapped[bool]
     score: Mapped[float | None] = mapped_column(default=None)  # some graders are pass/fail only
     grader_type: Mapped[str]  # "deterministic" | "judge"

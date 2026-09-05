@@ -73,6 +73,43 @@ def test_load_eval_cases_skips_blank_lines_and_preserves_order(tmp_path):
     ]
 
 
+def test_load_eval_cases_round_trips_retrieval_dimension_tuple_fields(tmp_path):
+    # Verifies, through the real JSONL loader (not direct EvalCase(**kwargs)
+    # construction), that a JSON list-of-lists for relevant/distractor/
+    # must_not_appear round-trips into list[tuple[str, int]] -- Pydantic v2
+    # coerces this on its own (confirmed empirically), so load_eval_cases
+    # does no manual conversion for these fields; this test is what proves
+    # that reliance is actually correct rather than assumed.
+    path = _write_jsonl(
+        tmp_path,
+        [
+            {
+                "case_id": "retrieval.vpn.001",
+                "dataset_version": "v2",
+                "dimension": "retrieval",
+                "answerable": True,
+                "relevant": [["VPN Access Policy v2", 0]],
+                "distractor": [["VPN Access Policy v1", 0]],
+                "must_not_appear": [["Confidential HR Policy", 0], ["Confidential HR Policy", 1]],
+                "authz": {"unrestricted": False, "allowed_tags": ["it"]},
+                "provenance": "hand_written",
+                "human_review_status": "approved",
+            }
+        ],
+    )
+    cases = load_eval_cases(path)
+    assert len(cases) == 1
+    case = cases[0]
+    assert case.relevant == [("VPN Access Policy v2", 0)]
+    assert case.distractor == [("VPN Access Policy v1", 0)]
+    assert case.must_not_appear == [
+        ("Confidential HR Policy", 0),
+        ("Confidential HR Policy", 1),
+    ]
+    # Genuinely tuples, not lists left untouched by construction.
+    assert isinstance(case.relevant[0], tuple)
+
+
 def test_eval_case_instances_are_frozen():
     # Mirrors packages/contracts/tests/test_tools.py's
     # test_tool_contract_instances_are_frozen pattern: EvalCase is a fixed
@@ -101,12 +138,12 @@ def test_chat_dimension_fields_populate():
         dimension="chat",
         input_text="hi there",
         expected_intent="greeting",
-        expected_risk_level="none",
+        expected_risk_level="low",
         provenance="hand_written",
         human_review_status="approved",
     )
     assert case.expected_intent == "greeting"
-    assert case.expected_risk_level == "none"
+    assert case.expected_risk_level == "low"
     assert case.input_text == "hi there"
 
 
@@ -204,3 +241,24 @@ def test_dimension_rejects_unknown_literal():
             provenance="hand_written",
             human_review_status="approved",
         )
+
+
+@pytest.mark.parametrize(
+    "field_name,bad_value",
+    [
+        ("expected_risk_level", "critical"),  # not in {"low", "medium", "high"}
+        ("risk_level", "critical"),
+        ("difficulty", "impossible"),  # not in {"easy", "medium", "hard"}
+        ("expected_final_status", "cancelled"),  # not in ApprovalRequest.status's value set
+    ],
+)
+def test_closed_vocabulary_fields_reject_invalid_literal(field_name, bad_value):
+    base_kwargs = dict(
+        case_id="bad.002",
+        dataset_version="v2",
+        dimension="chat",
+        provenance="hand_written",
+        human_review_status="approved",
+    )
+    with pytest.raises(ValidationError):
+        EvalCase(**base_kwargs, **{field_name: bad_value})

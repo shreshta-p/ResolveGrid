@@ -54,6 +54,19 @@ ApprovalDecisionLiteral = Literal["approved", "rejected"]
 JudgeDimension = Literal["groundedness", "correctness", "abstention_appropriateness"]
 Provenance = Literal["hand_written", "model_drafted"]
 HumanReviewStatus = Literal["draft", "approved", "rejected"]
+# Matches `services/agent-orchestration/src/resolvegrid_agent_orchestration/
+# graph.py`'s `_VALID_RISK_LEVELS = {"low", "medium", "high"}` -- the exact
+# set `classify_intent` ever assigns and `eval/golden/phase6_chat_v1.jsonl`'s
+# real cases already use for `expected_risk_level`. Reused verbatim for the
+# cross-cutting `risk_level` field too, rather than inventing a second,
+# looser vocabulary for what is the same underlying concept.
+RiskLevel = Literal["low", "medium", "high"]
+Difficulty = Literal["easy", "medium", "hard"]
+# Matches `ApprovalRequest.status`'s value set
+# (`apps/api/src/resolvegrid_api/models/approvals.py`) verbatim -- an
+# approval-dimension case's expected final status is, by definition, one of
+# the same four values that column can ever actually hold.
+FinalStatus = Literal["pending", "approved", "rejected", "expired"]
 
 
 class EvalCase(BaseModel):
@@ -81,7 +94,7 @@ class EvalCase(BaseModel):
 
     # --- Chat dimension (Phase 6 shape) --------------------------------
     expected_intent: str | None = None
-    expected_risk_level: str | None = None
+    expected_risk_level: RiskLevel | None = None
 
     # --- Retrieval dimension (Phase 7 shape, reused verbatim) ----------
     answerable: bool | None = None
@@ -98,7 +111,7 @@ class EvalCase(BaseModel):
 
     # --- Approval dimension ---------------------------------------------
     expected_approval_decision: ApprovalDecisionLiteral | None = None
-    expected_final_status: str | None = None
+    expected_final_status: FinalStatus | None = None
 
     # --- Cross-cutting (any dimension) ----------------------------------
     # Must never be taken, regardless of dimension -- zero-tolerance,
@@ -109,26 +122,14 @@ class EvalCase(BaseModel):
     rubric: str | None = None
     judge_dimensions: list[JudgeDimension] | None = None
 
-    risk_level: str | None = None
-    difficulty: str | None = None
+    risk_level: RiskLevel | None = None
+    difficulty: Difficulty | None = None
 
     # --- Provenance / review gate ----------------------------------------
     provenance: Provenance
     human_review_status: HumanReviewStatus
 
     note: str | None = None
-
-
-def _tuple_pairs_from_json(raw: list | None) -> list[tuple[str, int]] | None:
-    """Mirrors `eval_retrieval._pairs_from_json`'s shape, but returns a
-    `list` (not `frozenset`) to preserve `EvalCase`'s pydantic field type
-    exactly as specified (`list[tuple[str, int]] | None`) -- `None` stays
-    `None` (field genuinely absent), an empty list stays `[]` (field
-    present but empty), distinct states a JSONL case may legitimately use.
-    """
-    if raw is None:
-        return None
-    return [(title, ordinal) for title, ordinal in raw]
 
 
 def load_eval_cases(path: Path) -> list[EvalCase]:
@@ -143,6 +144,14 @@ def load_eval_cases(path: Path) -> list[EvalCase]:
     loader keeps `authz`/`principal_fixture` as plain dicts -- resolving
     them to real objects is `apps/api`'s job, per this package's
     dependency-direction rule.
+
+    No manual coercion of `relevant`/`distractor`/`must_not_appear` is
+    needed here: Pydantic v2 already coerces a JSON list-of-lists (e.g.
+    `[["title", 0]]`) directly into `list[tuple[str, int]]` on model
+    construction, verified empirically against this exact field type --
+    `EvalCase(**raw)` alone produces the identical tuples a hand-written
+    conversion loop would, so that loop would have been untested,
+    redundant code.
     """
     cases: list[EvalCase] = []
     with path.open(encoding="utf-8") as f:
@@ -151,9 +160,5 @@ def load_eval_cases(path: Path) -> list[EvalCase]:
             if not line:
                 continue
             raw = json.loads(line)
-            raw = dict(raw)
-            for field_name in ("relevant", "distractor", "must_not_appear"):
-                if field_name in raw:
-                    raw[field_name] = _tuple_pairs_from_json(raw[field_name])
             cases.append(EvalCase(**raw))
     return cases
