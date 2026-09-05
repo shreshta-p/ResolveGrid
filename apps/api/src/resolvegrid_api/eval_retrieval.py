@@ -56,10 +56,17 @@ capping the per-signal search at exactly k=5 would let a chunk that's
 merely mediocre on one signal (but excellent on the other) fall out of
 that signal's list before fusion even has a chance to combine them.
 
-Metric formulas (implemented directly, no new dependency -- see
-`_recall_at_k`/`_precision_at_k`/`_reciprocal_rank`/`_ndcg_at_k` below for
-each, and `apps/api/tests/test_eval_retrieval.py` for hand-computed unit
-tests against small fixed examples)
+Metric formulas (Phase 10 Task 3: moved to `resolvegrid_evaluation.
+retrieval_metrics` as public `recall_at_k`/`precision_at_k`/
+`reciprocal_rank`/`ndcg_at_k` -- this module re-exports them under their
+original `_`-prefixed names below, a pure refactor-for-reuse with zero
+behavior change, so `apps/api/tests/test_eval_retrieval.py`'s existing
+imports/assertions keep working unmodified. See
+`services/evaluation/src/resolvegrid_evaluation/retrieval_metrics.py`'s
+module docstring for each formula, and both that package's
+`tests/test_retrieval_metrics.py` and this module's own
+`apps/api/tests/test_eval_retrieval.py` for hand-computed unit tests
+against small fixed examples)
 ------------------------------------------------------------------------
 - recall@k    = |relevant chunks in top-k| / |relevant chunks|
 - precision@k = |relevant chunks in top-k| / k   (the standard IR
@@ -111,6 +118,12 @@ baseline run can be compared on more than the pass/fail outcome: the
 margin can widen or narrow even when neither run's boolean outcome
 changes (see `main()`'s baseline-vs-reranked comparison).
 
+Phase 10 Task 3: this per-case leakage/distractor computation (previously
+inline in `evaluate_case`) now delegates to `resolvegrid_evaluation.
+retrieval_metrics.grade_retrieval_case` -- see that function's docstring
+for the exact same logic, now independently testable and reusable outside
+`apps/api`.
+
 Reranking-enabled evaluation path (Phase 8 Task 6)
 ------------------------------------------------------------------------
 `evaluate_case`/`run_eval` both take an optional `reranker_model`
@@ -142,7 +155,6 @@ what's measured.
 """
 
 import json
-import math
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -153,6 +165,14 @@ from resolvegrid_api.db import DATABASE_URL
 from resolvegrid_api.models.knowledge import Chunk, Document, DocumentVersion
 from resolvegrid_api.retrieval import assess_sufficiency, fuse_rrf, lexical_search, vector_search
 from resolvegrid_api.retrieval_authz import AuthzFilter
+from resolvegrid_evaluation.retrieval_metrics import (
+    RetrievalCase,
+    grade_retrieval_case,
+    ndcg_at_k as _ndcg_at_k,
+    precision_at_k as _precision_at_k,
+    recall_at_k as _recall_at_k,
+    reciprocal_rank as _reciprocal_rank,
+)
 from resolvegrid_retrieval.dedup import DEFAULT_DEDUP_THRESHOLD, dedup
 from resolvegrid_retrieval.embedder import DEFAULT_EMBEDDING_MODEL, embed_texts
 from resolvegrid_retrieval.reranker import DEFAULT_RERANKER_MODEL, rerank
@@ -264,46 +284,13 @@ def resolve_relevant_chunk_ids(
 
 
 # ---------------------------------------------------------------------------
-# Metric formulas (pure functions, no DB) -- see module docstring for each
+# Metric formulas: moved to `resolvegrid_evaluation.retrieval_metrics`
+# (Phase 10 Task 3) as public `recall_at_k`/`precision_at_k`/
+# `reciprocal_rank`/`ndcg_at_k` -- imported above and re-exported here under
+# their original `_`-prefixed names (`_recall_at_k` etc.) so every existing
+# caller/test of this module keeps working unmodified. See that package's
+# module docstring for each formula.
 # ---------------------------------------------------------------------------
-
-
-def _recall_at_k(ranked_ids: list[int], relevant_ids: frozenset[int], k: int) -> float | None:
-    if not relevant_ids:
-        return None
-    hits = len(set(ranked_ids[:k]) & relevant_ids)
-    return hits / len(relevant_ids)
-
-
-def _precision_at_k(ranked_ids: list[int], relevant_ids: frozenset[int], k: int) -> float | None:
-    if not relevant_ids:
-        return None
-    hits = len(set(ranked_ids[:k]) & relevant_ids)
-    return hits / k
-
-
-def _reciprocal_rank(ranked_ids: list[int], relevant_ids: frozenset[int]) -> float | None:
-    if not relevant_ids:
-        return None
-    for position, chunk_id in enumerate(ranked_ids, start=1):
-        if chunk_id in relevant_ids:
-            return 1.0 / position
-    return 0.0
-
-
-def _ndcg_at_k(ranked_ids: list[int], relevant_ids: frozenset[int], k: int) -> float | None:
-    if not relevant_ids:
-        return None
-    dcg = sum(
-        1.0 / math.log2(position + 1)
-        for position, chunk_id in enumerate(ranked_ids[:k], start=1)
-        if chunk_id in relevant_ids
-    )
-    ideal_hits = min(len(relevant_ids), k)
-    idcg = sum(1.0 / math.log2(position + 1) for position in range(1, ideal_hits + 1))
-    if idcg == 0:
-        return 0.0
-    return dcg / idcg
 
 
 # ---------------------------------------------------------------------------
@@ -422,27 +409,6 @@ def evaluate_case(
 
     sufficiency = assess_sufficiency(fused)
 
-    distractor_beats_best_relevant: bool | None = None
-    distractor_margin: int | None = None
-    if distractor_ids and relevant_ids:
-        rank_of = {chunk_id: position for position, chunk_id in enumerate(ranked_chunk_ids)}
-        best_relevant_rank = min(
-            (rank_of[c] for c in relevant_ids if c in rank_of), default=None
-        )
-        best_distractor_rank = min(
-            (rank_of[c] for c in distractor_ids if c in rank_of), default=None
-        )
-        if best_relevant_rank is None:
-            # Relevant chunk didn't even appear -- trivially, any present
-            # distractor "beats" it.
-            distractor_beats_best_relevant = best_distractor_rank is not None
-        else:
-            distractor_beats_best_relevant = (
-                best_distractor_rank is not None and best_distractor_rank < best_relevant_rank
-            )
-        if best_relevant_rank is not None and best_distractor_rank is not None:
-            distractor_margin = best_distractor_rank - best_relevant_rank
-
     # Leakage check for must_not_appear: these chunks must be absent from
     # the RAW vector_search/lexical_search result sets entirely (not just
     # the fused top-k) -- authz filtering happens in the SQL query itself
@@ -451,23 +417,38 @@ def evaluate_case(
     # this task's own golden queries. Unaffected by reranking/dedup (both
     # operate only on chunks that already passed the authz-filtered SQL
     # query), so this check is identical in both evaluation paths.
-    raw_ids = {c for c, _ in vector_results} | {c for c, _ in lexical_results}
-    leaked_chunk_ids = frozenset(must_not_appear_ids & raw_ids)
+    raw_ids = frozenset({c for c, _ in vector_results} | {c for c, _ in lexical_results})
+
+    # recall/precision/MRR/nDCG plus the leakage and distractor-beats-
+    # relevant checks now live in `resolvegrid_evaluation.retrieval_metrics`
+    # (Phase 10 Task 3) -- this delegates to the exact same logic that used
+    # to be inline here, just consolidated into a reusable, independently
+    # testable pure function. See that function's docstring.
+    grade = grade_retrieval_case(
+        RetrievalCase(
+            relevant_ids=relevant_ids,
+            distractor_ids=distractor_ids,
+            must_not_appear_ids=must_not_appear_ids,
+            raw_retrieved_ids=raw_ids,
+        ),
+        ranked_chunk_ids,
+        k=k,
+    )
 
     return CaseResult(
         query=case.query,
         note=case.note,
         relevant_count=len(relevant_ids),
         ranked_chunk_ids=ranked_chunk_ids,
-        recall_at_k=_recall_at_k(ranked_chunk_ids, relevant_ids, k),
-        precision_at_k=_precision_at_k(ranked_chunk_ids, relevant_ids, k),
-        reciprocal_rank=_reciprocal_rank(ranked_chunk_ids, relevant_ids),
-        ndcg_at_k=_ndcg_at_k(ranked_chunk_ids, relevant_ids, k),
+        recall_at_k=grade.recall_at_k,
+        precision_at_k=grade.precision_at_k,
+        reciprocal_rank=grade.reciprocal_rank,
+        ndcg_at_k=grade.ndcg_at_k,
         sufficient=sufficiency.sufficient,
         top_score=sufficiency.top_score,
-        distractor_beats_best_relevant=distractor_beats_best_relevant,
-        leaked_chunk_ids=leaked_chunk_ids,
-        distractor_margin=distractor_margin,
+        distractor_beats_best_relevant=grade.distractor_beats_best_relevant,
+        leaked_chunk_ids=grade.leaked_chunk_ids,
+        distractor_margin=grade.distractor_margin,
     )
 
 

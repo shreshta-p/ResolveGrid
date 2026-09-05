@@ -11,6 +11,7 @@ dependencies = [
     "resolvegrid-contracts",
     "resolvegrid-agent-orchestration",
     "resolvegrid-retrieval",
+    "resolvegrid-evaluation",
     "alembic>=1.13",
     "psycopg[binary,pool]>=3.2",
     "sqlalchemy>=2.0",
@@ -29,6 +30,7 @@ resolvegrid-authz = { workspace = true }
 resolvegrid-contracts = { workspace = true }
 resolvegrid-agent-orchestration = { workspace = true }
 resolvegrid-retrieval = { workspace = true }
+resolvegrid-evaluation = { workspace = true }
 
 [dependency-groups]
 dev = [
