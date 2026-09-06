@@ -124,7 +124,7 @@ class JudgeVerdict(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     case_id: str
-    dimension: str
+    dimension: JudgeDimension
     passed: bool
     reasoning: str
 
@@ -286,12 +286,12 @@ class AgreementReport(BaseModel):
 
     model_config = ConfigDict(frozen=True)
 
-    per_dimension: dict[str, DimensionAgreement]
+    per_dimension: dict[JudgeDimension, DimensionAgreement]
     overall_agreement_pct: float | None
 
 
 def calculate_agreement(
-    judge_verdicts: list[JudgeVerdict], human_labels: dict[str, dict[str, bool]]
+    judge_verdicts: list[JudgeVerdict], human_labels: dict[str, dict[JudgeDimension, bool]]
 ) -> AgreementReport:
     """Compute per-dimension exact-agreement between `judge_verdicts` and
     human-assigned ground truth.
@@ -324,8 +324,8 @@ def calculate_agreement(
     `judge_verdicts`/`human_labels` were built in a different iteration
     order upstream) always produce the same dict insertion order.
     """
-    agreed_by_dimension: dict[str, int] = {}
-    total_by_dimension: dict[str, int] = {}
+    agreed_by_dimension: dict[JudgeDimension, int] = {}
+    total_by_dimension: dict[JudgeDimension, int] = {}
 
     for verdict in judge_verdicts:
         case_labels = human_labels.get(verdict.case_id)
@@ -336,7 +336,7 @@ def calculate_agreement(
         if verdict.passed == human_passed:
             agreed_by_dimension[verdict.dimension] = agreed_by_dimension.get(verdict.dimension, 0) + 1
 
-    per_dimension: dict[str, DimensionAgreement] = {}
+    per_dimension: dict[JudgeDimension, DimensionAgreement] = {}
     for dimension in sorted(total_by_dimension.keys()):
         total = total_by_dimension[dimension]
         agreed = agreed_by_dimension.get(dimension, 0)
@@ -366,7 +366,7 @@ class CalibrationCase(BaseModel):
     actual_result: dict
     # {dimension: human-assigned ground-truth passed} for this one case --
     # the per-case slice of `calculate_agreement`'s `human_labels` shape.
-    human_labels: dict[str, bool]
+    human_labels: dict[JudgeDimension, bool]
 
 
 def load_calibration_cases(path: Path) -> list[CalibrationCase]:
@@ -375,9 +375,12 @@ def load_calibration_cases(path: Path) -> list[CalibrationCase]:
 
     IMPORTANT -- these are SYNTHETIC, hand-authored labels for this dev
     environment's calibration harness, not results from an actual blind
-    human-review process. See `eval/golden/judge_calibration_v1.jsonl`'s
-    own header comment for the full disclosure; nothing in this loader or
-    its callers should ever be mistaken for real human-subject data.
+    human-review process. Nothing in this loader or its callers should
+    ever be mistaken for real human-subject data. (The calibration JSONL
+    file itself cannot carry a header comment corroborating this -- every
+    non-blank line is parsed with `json.loads`, so a comment line would
+    crash this very loader; each row's own `"provenance": "hand_written"`
+    field is the real per-record corroboration instead.)
 
     On-disk row shape, one JSON object per line: every field `EvalCase`
     accepts (`case_id`, `dataset_version`, `dimension`, `input_text`,
