@@ -200,17 +200,31 @@ def test_summarize_ticket_rejects_employee_outside_scope(summarize_fixtures):
     assert response.status_code == 403
 
 
-def test_summarize_ticket_records_fallback_when_gateway_reports_one(summarize_fixtures, raw_db_session):
-    # Simulates what llm_gateway.complete() returns after a real forced
-    # primary-failure-then-successful-fallback (empirically verified header
-    # contract in docs/superpowers/plans/2026-08-25-phase5-cloud-fallback.md's
-    # "Task 1 status": x-litellm-attempted-fallbacks > 0 and
-    # x-litellm-model-group=cloud-fallback). This is a unit-level mock of the
-    # gateway's OUTPUT, matching this file's established pattern for every
-    # other test here -- no real LiteLLM/Anthropic/OpenAI call is made.
-    requester, analyst, outsider, queue, dept = summarize_fixtures
-    ticket_id = _create_ticket(requester.id, queue.id)
+def assert_ticket_summarize_reports_fallback_and_records_model_call(
+    api_client, *, employee_id: int, ticket_id: int, raw_db_session
+) -> dict:
+    """Simulates what `llm_gateway.complete()` returns after a real forced
+    primary-provider-outage-then-successful-fallback (empirically verified
+    header contract in
+    docs/superpowers/plans/2026-08-25-phase5-cloud-fallback.md's "Task 1
+    status": x-litellm-attempted-fallbacks > 0 and
+    x-litellm-model-group=cloud-fallback), and asserts
+    `/tickets/{id}/summarize` degrades gracefully: 200 response, and the
+    persisted `ModelCall` row records the fallback truthfully. This is a
+    unit-level mock of the gateway's OUTPUT, matching this file's
+    established pattern for every other test here -- no real
+    LiteLLM/Anthropic/OpenAI call is made.
 
+    Extracted into its own function (Phase 10 Task 6) so this exact
+    assertion can be called from two places without drifting apart: the
+    regression test below, and
+    `apps/api/tests/test_adversarial_suite.py`'s "simulated provider
+    outage" adversarial case, which reuses this real, already-passing
+    assertion rather than re-implementing a second copy of it (see that
+    module's docstring for the reuse-over-reimplementation rationale this
+    phase's plan requires). Returns a plain dict summarizing the verified
+    outcome for a caller that wants to record it.
+    """
     fake_result = CompletionResult(
         text="Summary produced after a fallback to the secondary provider.",
         input_tokens=96, output_tokens=40, latency_ms=610,
@@ -218,9 +232,9 @@ def test_summarize_ticket_records_fallback_when_gateway_reports_one(summarize_fi
         fallback_occurred=True, serving_model_group="cloud-fallback",
     )
     with patch("resolvegrid_api.routers.tickets.llm_gateway.complete", return_value=fake_result):
-        response = client.post(
+        response = api_client.post(
             f"/tickets/{ticket_id}/summarize",
-            headers={"X-Debug-Employee-Id": str(requester.id)},
+            headers={"X-Debug-Employee-Id": str(employee_id)},
         )
 
     assert response.status_code == 200
@@ -234,6 +248,23 @@ def test_summarize_ticket_records_fallback_when_gateway_reports_one(summarize_fi
     assert call.status == "success"
     assert call.fallback_occurred is True
     assert call.serving_model_group == "cloud-fallback"
+
+    return {
+        "passed": True,
+        "http_status": response.status_code,
+        "model_call_status": call.status,
+        "fallback_occurred": call.fallback_occurred,
+        "serving_model_group": call.serving_model_group,
+    }
+
+
+def test_summarize_ticket_records_fallback_when_gateway_reports_one(summarize_fixtures, raw_db_session):
+    requester, analyst, outsider, queue, dept = summarize_fixtures
+    ticket_id = _create_ticket(requester.id, queue.id)
+
+    assert_ticket_summarize_reports_fallback_and_records_model_call(
+        client, employee_id=requester.id, ticket_id=ticket_id, raw_db_session=raw_db_session
+    )
 
 
 def test_summarize_ticket_gateway_error_returns_502_and_records_model_call(summarize_fixtures, raw_db_session):

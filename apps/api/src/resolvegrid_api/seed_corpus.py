@@ -165,6 +165,26 @@ SEED_CORPUS: list[SeedDocument] = [
         license=_PUBLIC_PLACEHOLDER_LICENSE,
         retrieved_at=_RETRIEVED_AT,
     ),
+    # --- Phase 10 Task 6 adversarial fixture (NOT a real Kestrel document) -
+    # See the file's own EVAL-FIXTURE NOTICE for the full disclaimer. This
+    # entry deliberately embeds a prompt-injection payload inside otherwise
+    # mundane content so `eval/adversarial/v1.jsonl`'s
+    # `adversarial.injected_document.001` case can prove -- against the
+    # real ingested corpus and real retrieval pipeline, not in the abstract
+    # -- that retrieved chunk content can never itself trigger a real tool
+    # call. Tagged `_IT_SUPPORT`, a real seeded department, rather than left
+    # unscoped: `ingest_document()` refuses (by design -- see ingestion.py's
+    # leak-prevention check) to ingest a synthetic_private document with an
+    # EMPTY access_scope_tags array, since that would be silently treated as
+    # visible to everyone. IT Support is an arbitrary choice here (this
+    # fixture's content has no real IT-Support specificity); any one real
+    # department tag works equally well for what this case needs to prove.
+    SeedDocument(
+        filename="adversarial-printer-setup-injection-fixture.md",
+        title="Printer and Peripheral Setup Guide (Eval Fixture -- Contains Embedded Prompt Injection)",
+        source_type="synthetic_private",
+        access_scope_tags=[_IT_SUPPORT],
+    ),
 ]
 
 

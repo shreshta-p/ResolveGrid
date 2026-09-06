@@ -366,6 +366,45 @@ def test_execute_mutation_tamper_and_params_mismatch_produce_distinguishable_err
 # --- execute_mutation: expiry ------------------------------------------------
 
 
+def assert_expired_approval_raises_and_blocks_execution(
+    session, *, approval_request_id: int, tool_params: dict, employee_id: int
+) -> dict:
+    """Calls `execute_mutation` for an approval_request_id whose
+    `expires_at` is already in the past, asserting it raises
+    `ApprovalExpiredError`, grants nothing, and records exactly one error
+    `ToolCall` row tagged `error_taxonomy_code == "ApprovalExpiredError"`.
+
+    Extracted into its own function (Phase 10 Task 6) for the same reason
+    as `assert_duplicate_replay_creates_no_second_grant_or_tool_call` above
+    -- see that function's docstring. Returns a plain dict summarizing the
+    verified outcome for a caller that wants to record it.
+    """
+    try:
+        execute_mutation(
+            session,
+            approval_request_id=approval_request_id,
+            tool_name=_ACTION_TYPE,
+            tool_params=tool_params,
+            actor_employee_id=employee_id,
+        )
+        assert False, "expected ApprovalExpiredError"
+    except ApprovalExpiredError:
+        pass
+
+    assert _active_grant_count(session, employee_id) == 0
+    idempotency_key = f"approval:{approval_request_id}"
+    error_call = (
+        session.execute(
+            select(ToolCall).where(ToolCall.idempotency_key == idempotency_key, ToolCall.status == "error")
+        )
+        .scalars()
+        .one()
+    )
+    assert error_call.error_taxonomy_code == "ApprovalExpiredError"
+
+    return {"passed": True, "error_taxonomy_code": error_call.error_taxonomy_code}
+
+
 def test_execute_mutation_raises_expired_error_for_a_past_expires_at(db_session):
     employee = _make_employee(db_session, "expired")
     row, params = _make_approval_request(
@@ -375,28 +414,9 @@ def test_execute_mutation_raises_expired_error_for_a_past_expires_at(db_session)
         expires_delta=timedelta(hours=-1),
     )
 
-    try:
-        execute_mutation(
-            db_session,
-            approval_request_id=row.id,
-            tool_name=_ACTION_TYPE,
-            tool_params=params,
-            actor_employee_id=employee.id,
-        )
-        assert False, "expected ApprovalExpiredError"
-    except ApprovalExpiredError:
-        pass
-
-    assert _active_grant_count(db_session, employee.id) == 0
-    idempotency_key = f"approval:{row.id}"
-    error_call = (
-        db_session.execute(
-            select(ToolCall).where(ToolCall.idempotency_key == idempotency_key, ToolCall.status == "error")
-        )
-        .scalars()
-        .one()
+    assert_expired_approval_raises_and_blocks_execution(
+        db_session, approval_request_id=row.id, tool_params=params, employee_id=employee.id
     )
-    assert error_call.error_taxonomy_code == "ApprovalExpiredError"
 
 
 # --- execute_mutation: not approved ------------------------------------------
@@ -464,30 +484,63 @@ def test_execute_mutation_raises_not_found_for_unknown_approval_request_id(db_se
 # --- execute_mutation: duplicate-replay guard (sequential) -------------------
 
 
+def assert_duplicate_replay_creates_no_second_grant_or_tool_call(
+    session, *, approval_request_id: int, tool_params: dict, employee_id: int
+) -> dict:
+    """Calls `execute_mutation` twice for the SAME approval_request_id (a
+    duplicate replay) and asserts the second call is a safe no-op: same
+    output as the first, exactly one `EmployeeEntitlement` grant, exactly
+    one success `ToolCall` row -- never a second real grant.
+
+    Extracted into its own function (Phase 10 Task 6) so this exact
+    assertion can be called from two places without drifting apart: the
+    regression test below, and
+    `apps/api/tests/test_adversarial_suite.py`'s "duplicate/expired approval
+    replay" adversarial case, which reuses this real, already-passing
+    assertion rather than re-implementing a second copy of it (see that
+    module's docstring for the reuse-over-reimplementation rationale this
+    phase's plan requires). Returns a plain dict summarizing the verified
+    outcome for a caller that wants to record it.
+    """
+    first = execute_mutation(
+        session,
+        approval_request_id=approval_request_id,
+        tool_name=_ACTION_TYPE,
+        tool_params=tool_params,
+        actor_employee_id=employee_id,
+    )
+    second = execute_mutation(
+        session,
+        approval_request_id=approval_request_id,
+        tool_name=_ACTION_TYPE,
+        tool_params=tool_params,
+        actor_employee_id=employee_id,
+    )
+
+    assert first["output"] == second["output"]
+    grant_count = _active_grant_count(session, employee_id)
+    assert grant_count == 1
+
+    idempotency_key = f"approval:{approval_request_id}"
+    success_count = _tool_call_count(session, idempotency_key, "success")
+    assert success_count == 1
+
+    return {
+        "passed": True,
+        "first_output": first["output"],
+        "second_output": second["output"],
+        "active_grant_count": grant_count,
+        "success_tool_call_count": success_count,
+    }
+
+
 def test_execute_mutation_duplicate_replay_does_not_create_a_second_grant_or_tool_call(db_session):
     employee = _make_employee(db_session, "replay")
     row, params = _make_approval_request(db_session, agent_run_id="test-mutexec-replay-1", employee_id=employee.id)
 
-    first = execute_mutation(
-        db_session,
-        approval_request_id=row.id,
-        tool_name=_ACTION_TYPE,
-        tool_params=params,
-        actor_employee_id=employee.id,
+    assert_duplicate_replay_creates_no_second_grant_or_tool_call(
+        db_session, approval_request_id=row.id, tool_params=params, employee_id=employee.id
     )
-    second = execute_mutation(
-        db_session,
-        approval_request_id=row.id,
-        tool_name=_ACTION_TYPE,
-        tool_params=params,
-        actor_employee_id=employee.id,
-    )
-
-    assert first["output"] == second["output"]
-    assert _active_grant_count(db_session, employee.id) == 1
-
-    idempotency_key = f"approval:{row.id}"
-    assert _tool_call_count(db_session, idempotency_key, "success") == 1
 
 
 # --- execute_mutation: real concurrent replay race ---------------------------
