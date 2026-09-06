@@ -173,7 +173,7 @@ no explanation outside the JSON:
 """
 
 
-def _build_judge_prompt(case: EvalCase, actual_result: dict, dimension: str) -> str:
+def _build_judge_prompt(case: EvalCase, actual_result: dict, dimension: JudgeDimension) -> str:
     return _JUDGE_PROMPT_TEMPLATE.format(
         dimension=dimension,
         rubric=case.rubric or "(no rubric provided)",
@@ -391,9 +391,9 @@ def load_calibration_cases(path: Path) -> list[CalibrationCase]:
         every other grader's `actual_result` shape -- `output_text`,
         `citations`, `retrieved_chunk_ids`, etc., whichever keys are
         relevant to the case's judge dimensions).
-      - `human_labels` (dict[str, bool]): the ground-truth `passed` value
-        for each of this case's `judge_dimensions`, keyed by dimension
-        name -- e.g. `{"groundedness": true}`.
+      - `human_labels` (dict[JudgeDimension, bool]): the ground-truth
+        `passed` value for each of this case's `judge_dimensions`, keyed
+        by dimension name -- e.g. `{"groundedness": true}`.
     Mirrors `schema.load_eval_cases`'s JSONL-parsing convention: utf-8,
     strip each line, skip blank lines, `json.loads` each remaining line.
     """
@@ -430,7 +430,7 @@ def run_calibration(
     per this package's dependency-direction rule (see module docstring).
     """
     all_verdicts: list[JudgeVerdict] = []
-    human_labels_by_case: dict[str, dict[str, bool]] = {}
+    human_labels_by_case: dict[str, dict[JudgeDimension, bool]] = {}
     for calibration_case in calibration_cases:
         all_verdicts.extend(judge_response(complete_fn, calibration_case.case, calibration_case.actual_result))
         human_labels_by_case[calibration_case.case.case_id] = calibration_case.human_labels
