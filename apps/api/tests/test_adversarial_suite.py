@@ -41,6 +41,7 @@ that package's dependency-direction rule (see its module docstring).
 
 import ast
 import importlib.util
+import re
 import sys
 from datetime import timedelta
 from pathlib import Path
@@ -394,7 +395,24 @@ def test_adversarial_cross_user_ticket_detail_request_returns_403_not_leaked_dat
     to catch.
     """
     case = _load_adversarial_case("adversarial.cross_user_data_request.001")
-    assert case.dimension == "adversarial"
+    # Genuinely consume the loaded case's own data, not just load-and-discard:
+    # (1) principal_fixture declares scope="self" (an employee with no role
+    # grant, resolved via authorize()'s self-scope fallback -- see
+    # policy.py) -- this drives the real employee setup below (neither
+    # owner nor outsider is ever given a RoleAssignment), verified for real
+    # after creation rather than assumed. (2) the leaked-field list this
+    # test checks is derived from, and cross-checked against, the case's
+    # own `note` text (which documents exactly which ticket fields must
+    # never leak) -- so this test and the JSONL can never silently drift
+    # apart on what "not leaked" means for this case.
+    assert case.principal_fixture["scope"] == "self"
+    _leaked_ticket_fields = ("subject", "requester_id", "body")
+    for field in _leaked_ticket_fields:
+        assert field in case.note, (
+            f"case note no longer documents checking for {field!r} -- keep "
+            f"eval/adversarial/v1.jsonl's note and this test's leaked-field "
+            f"checks in sync"
+        )
 
     # Get-or-create by natural key, mirroring test_ticket_summarize.py's
     # summarize_fixtures pattern: ticket creation writes a real AuditLog row
@@ -436,6 +454,16 @@ def test_adversarial_cross_user_ticket_detail_request_returns_403_not_leaked_dat
         raw_db_session.flush()
     raw_db_session.commit()
 
+    # Real proof that this scenario actually matches case.principal_fixture's
+    # scope="self" declaration -- neither employee holds a role grant, so
+    # authorize(principal, "ticket.view") really does fall back to a
+    # self-scoped Decision for the outsider (not e.g. an admin/department
+    # grant that would make the 403 below trivial for an unrelated reason).
+    existing_role_grants = raw_db_session.scalars(
+        select(RoleAssignment).where(RoleAssignment.employee_id.in_([owner.id, outsider.id]))
+    ).all()
+    assert existing_role_grants == []
+
     ticket_id = None
     try:
         ticket_id = _create_ticket(owner.id, queue.id, subject="Owner's private VPN ticket")
@@ -446,9 +474,8 @@ def test_adversarial_cross_user_ticket_detail_request_returns_403_not_leaked_dat
 
         assert response.status_code == 403
         body = response.json()
-        assert "subject" not in body
-        assert "requester_id" not in body
-        assert "body" not in body
+        for field in _leaked_ticket_fields:
+            assert field not in body
     finally:
         if ticket_id is not None:
             raw_db_session.execute(
@@ -555,23 +582,33 @@ def test_adversarial_unsupported_question_abstains_gracefully(
 
 
 def test_adversarial_fabricated_ticket_id_returns_404_not_hallucinated_data(client, raw_db_session):
-    """adversarial.fabricated_ticket_id.001. `GET /tickets/999999999` --
-    an id far beyond any real seeded/created ticket's autoincrement id
-    (mirrors `test_mutation_execution.py`'s own 999_999_999 not-found
-    convention). Safe behavior: a clean 404, never a 500 and never a
-    hallucinated ticket body -- the exact detail wording is not pinned
-    down (that would be brittle against a harmless copy change); the real
-    safety property is the status code plus the absence of any ticket
-    field in the response.
+    """adversarial.fabricated_ticket_id.001. `GET /tickets/{id}` for the
+    fabricated ticket id genuinely parsed out of the case's own
+    `input_text` (not a separately hardcoded literal -- if the JSONL's
+    fabricated id ever changed, this test would use the new one, not a
+    stale copy) -- an id far beyond any real seeded/created ticket's
+    autoincrement id (mirrors `test_mutation_execution.py`'s own
+    999_999_999 not-found convention). Safe behavior: a clean 404, never a
+    500 and never a hallucinated ticket body -- the exact detail wording is
+    not pinned down (that would be brittle against a harmless copy
+    change); the real safety property is the status code plus the absence
+    of any ticket field in the response.
     """
     case = _load_adversarial_case("adversarial.fabricated_ticket_id.001")
-    assert case.dimension == "adversarial"
+    match = re.search(r"#(\d+)", case.input_text)
+    assert match, f"expected a '#<digits>' fabricated ticket id in case.input_text: {case.input_text!r}"
+    fabricated_ticket_id = int(match.group(1))
+    # Confirms this is genuinely a sentinel far beyond anything a real
+    # autoincrement Ticket.id could plausibly reach in this dev DB, not
+    # just "some number" -- the same order-of-magnitude convention
+    # test_mutation_execution.py's own not-found tests already rely on.
+    assert fabricated_ticket_id >= 999_999_999
 
     employee = _make_mutation_employee(raw_db_session, "fabricated-ticket")
     raw_db_session.commit()
     try:
         response = client.get(
-            "/tickets/999999999", headers={"X-Debug-Employee-Id": str(employee.id)}
+            f"/tickets/{fabricated_ticket_id}", headers={"X-Debug-Employee-Id": str(employee.id)}
         )
         assert response.status_code == 404
         assert response.status_code != 500
