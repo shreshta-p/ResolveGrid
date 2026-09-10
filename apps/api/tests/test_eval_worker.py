@@ -47,6 +47,7 @@ from sqlalchemy import delete, func, select
 if not hasattr(signal, "SIGUSR1"):
     signal.SIGUSR1 = signal.SIGTERM
 
+import resolvegrid_api.eval_worker as eval_worker_module
 from resolvegrid_api.eval_worker import REDIS_URL, WorkerSettings, run_eval_suite
 from resolvegrid_api.ingestion_worker import run_seed_corpus_ingestion
 from resolvegrid_api.models import ApprovalDecision, ApprovalRequest
@@ -139,6 +140,100 @@ def test_run_eval_suite_creates_completed_eval_run_with_real_case_coverage(db_se
         assert approved_details["approval_compliance"]["passed"] is True
     finally:
         _cleanup_side_effects(raw_db_session, before)
+
+
+def test_run_eval_suite_isolates_a_single_case_failure_and_still_completes(monkeypatch, db_session, raw_db_session):
+    """Proves the Critical fix from code review: one case's execution
+    raising (simulating a real transient failure, e.g. an Ollama timeout)
+    must NOT discard every other already-computed case's result, and the
+    run as a whole must still reach `status="completed"` -- see
+    `eval_worker.py`'s module docstring's "Per-case failure isolation"
+    section. Forces `_execute_retrieval_case` to raise for exactly one
+    retrieval-dimension case_id via monkeypatch (every other call passes
+    through to the real function unchanged), then asserts: (1) a real
+    `EvalCaseResult` row exists for every one of the 49 loaded cases,
+    including the forced failure (recorded as `passed=False` with the
+    real exception message in `details_json`, not silently dropped), and
+    (2) at least one OTHER retrieval-dimension case still produced a real,
+    passing result -- proving the failure was truly isolated, not a
+    symptom of the whole retrieval dimension having been aborted.
+    """
+    run_seed_corpus_ingestion(db_session)
+    db_session.flush()
+
+    failing_case_id = "retrieval.public_doc.001"
+    real_execute_retrieval_case = eval_worker_module._execute_retrieval_case
+
+    def _flaky_execute_retrieval_case(session, case):
+        if case.case_id == failing_case_id:
+            raise RuntimeError("simulated transient failure (e.g. a real Ollama timeout)")
+        return real_execute_retrieval_case(session, case)
+
+    monkeypatch.setattr(eval_worker_module, "_execute_retrieval_case", _flaky_execute_retrieval_case)
+
+    before = _side_effect_watermarks(raw_db_session)
+    try:
+        run = eval_worker_module.run_eval_suite(db_session)
+        db_session.flush()
+
+        # The RUN as a whole still completes -- the Critical fix this test exists to prove.
+        assert run.status == "completed"
+        assert run.error_message is None
+
+        results = {
+            r.case_id: r
+            for r in db_session.scalars(select(EvalCaseResult).where(EvalCaseResult.eval_run_id == run.id)).all()
+        }
+        all_cases = eval_worker_module._load_all_cases("v2")
+        # Every case produced a real result row -- none silently dropped
+        # because a sibling case blew up.
+        assert len(results) == len(all_cases)
+
+        # The forced failure IS recorded, as a real failed case, not
+        # silently swallowed into a false pass.
+        assert failing_case_id in results
+        failing_result = results[failing_case_id]
+        assert failing_result.passed is False
+        failing_details = json.loads(failing_result.details_json)
+        assert "simulated transient failure" in failing_details.get("error", "")
+
+        # At least one OTHER retrieval-dimension case still produced a
+        # real, passing result -- proving isolation, not a dimension-wide abort.
+        other_retrieval_case_ids = [
+            c.case_id for c in all_cases if c.dimension == "retrieval" and c.case_id != failing_case_id
+        ]
+        assert any(results[cid].passed for cid in other_retrieval_case_ids)
+
+        # Every non-retrieval dimension still has real coverage too.
+        assert {r.dimension for r in results.values()} == _EXPECTED_DIMENSIONS
+    finally:
+        _cleanup_side_effects(raw_db_session, before)
+
+
+def test_load_all_cases_filters_golden_by_dataset_version_but_always_includes_adversarial():
+    """Fast, pure unit test (no DB/network) of `_load_all_cases`'s
+    documented `dataset_version` convention (see `eval_worker.py`'s module
+    docstring's "dataset_version convention" section): golden-file cases
+    (chat/retrieval/tool/approval) ARE filtered by the passed-in
+    `dataset_version`, while every adversarial case is included
+    UNCONDITIONALLY, regardless of that argument.
+    """
+    cases_v2 = eval_worker_module._load_all_cases("v2")
+    golden_dimensions = {"chat", "retrieval", "tool", "approval"}
+    assert golden_dimensions.issubset({c.dimension for c in cases_v2})
+    assert all(c.dataset_version == "v2" for c in cases_v2 if c.dimension in golden_dimensions)
+    adversarial_cases_v2 = [c for c in cases_v2 if c.dimension == "adversarial"]
+    assert len(adversarial_cases_v2) > 0
+
+    # No golden file has ever used "v3" -- filtering by it must exclude
+    # every golden-dimension case, while adversarial cases (whose own
+    # dataset_version is "v1", independent of this argument) are still
+    # included, identically to the "v2" call above.
+    cases_v3 = eval_worker_module._load_all_cases("v3")
+    assert not any(c.dimension in golden_dimensions for c in cases_v3)
+    adversarial_cases_v3 = [c for c in cases_v3 if c.dimension == "adversarial"]
+    assert {c.case_id for c in adversarial_cases_v3} == {c.case_id for c in adversarial_cases_v2}
+    assert len(adversarial_cases_v3) == len(adversarial_cases_v2)
 
 
 def test_arq_worker_processes_run_eval_suite_task_via_real_redis(raw_db_session):
