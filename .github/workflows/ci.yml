@@ -17,11 +17,22 @@ jobs:
     # transformers + a real ~1.1GB bge-reranker-base download on first
     # use) the `retrieval` job below already budgets 15 minutes for on
     # its own, on top of this job's existing DB/Ollama/Redis setup work.
-    # Bumped from 25 to 40 for Phase 10 Task 9: a real LiteLLM proxy (see
+    # Bumped from 25 to 50 for Phase 10 Task 9: a real LiteLLM proxy (see
     # below) now also needs `qwen3:14b` (9.3GB) pulled into the Ollama
     # service container, which this job never previously needed (only
-    # the much smaller nomic-embed-text).
-    timeout-minutes: 40
+    # the much smaller nomic-embed-text). A first attempt at 40 minutes
+    # was NOT enough -- qwen3:14b text generation on this CPU-only runner
+    # (no GPU) is far slower than on local dev hardware, and the job was
+    # cancelled mid-suite. `apps/api/tests/test_eval_worker.py`'s three
+    # real-model tests were subsequently restricted to a small,
+    # representative, every-dimension-covered case sample (see that
+    # file's `_CI_SAMPLE_CASE_IDS` for the full reasoning) to bring real
+    # generation-call volume down to something this runner can finish in
+    # reasonable time; 50 minutes leaves real margin above the ~35-minute
+    # measured runtime after that fix, without the 90+ minutes a
+    # full-volume fix would have needed. See docs/DECISION_LOG.md's
+    # 2026-09-11 entry for the full investigation.
+    timeout-minutes: 50
     services:
       postgres:
         image: pgvector/pgvector:pg16

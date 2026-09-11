@@ -59,6 +59,62 @@ from resolvegrid_api.models.tools import ToolCall
 
 _EXPECTED_DIMENSIONS = {"chat", "retrieval", "tool", "approval", "adversarial"}
 
+# Real, previously-undiscovered CI-cost problem found during Phase 10 Task
+# 9's fresh-state verification (see docs/DECISION_LOG.md's 2026-09-11
+# entry): qwen3:14b text generation is dramatically slower on GitHub's
+# CPU-only hosted runners than on local dev hardware. Each of this file's
+# three real-model tests independently runs the FULL ~49-case suite
+# (chat/tool/approval dimensions all need real generation calls), and all
+# three together pushed the `api` CI job's pytest step past even a
+# generous 40-minute timeout, forcing a hard cancellation. Since the
+# actual PURPOSE of these three tests is proving the batch runner's
+# wiring is correct (every dimension gets real coverage, one case's
+# failure doesn't abort the batch, the real Arq round-trip works) --
+# not exhaustively grading all 49 cases every CI run -- each is
+# restricted, via `_patch_small_case_sample` below, to this small,
+# every-dimension-covered representative subset. Every sampled case still
+# runs for real (real DB, real graphs, real Ollama/LiteLLM) -- only the
+# CASE COUNT is reduced, not the reality of what each remaining case
+# exercises. The full 49-case suite remains fully exercisable via the
+# documented production entry point (`uv run --package resolvegrid-api
+# python -m resolvegrid_api.eval_worker`) and was genuinely, exhaustively
+# run that way during this same task's fresh-state verification -- see
+# docs/PROGRESS.md's Phase 10 row for that real EvalRun's per-dimension
+# results.
+_CI_SAMPLE_CASE_IDS = frozenset(
+    {
+        "chat.greeting.001",
+        "retrieval.public_doc.001",
+        "retrieval.public_doc.002",
+        "tool.grant_vpn_access.001",
+        "approval.grant_vpn_access.approved.001",
+        "approval.grant_vpn_access.rejected.001",
+        "adversarial.injected_document.001",
+        "adversarial.cross_user_data_request.001",
+        "adversarial.conflicting_stale_policy.001",
+        "adversarial.unsupported_question.001",
+        "adversarial.fabricated_ticket_id.001",
+        "adversarial.malformed_tool_call.001",
+        "adversarial.simulated_provider_outage.001",
+        "adversarial.duplicate_approval_replay.001",
+        "adversarial.expired_approval_replay.001",
+        "adversarial.empty_retrieval_result.001",
+    }
+)
+
+
+def _patch_small_case_sample(monkeypatch) -> None:
+    """Filters `_load_all_cases`'s REAL output (real JSONL parse, no fake
+    case list) down to `_CI_SAMPLE_CASE_IDS` for the duration of one test.
+    See `_CI_SAMPLE_CASE_IDS`'s comment above for why this exists.
+    """
+    real_load_all_cases = eval_worker_module._load_all_cases
+
+    def _small_case_loader(dataset_version):
+        return [c for c in real_load_all_cases(dataset_version) if c.case_id in _CI_SAMPLE_CASE_IDS]
+
+    monkeypatch.setattr(eval_worker_module, "_load_all_cases", _small_case_loader)
+
 
 def _side_effect_watermarks(session) -> dict[str, int]:
     """Current max id of every table `run_eval_suite`'s tool/approval
@@ -83,7 +139,8 @@ def _cleanup_side_effects(session, before: dict[str, int]) -> None:
     session.commit()
 
 
-def test_run_eval_suite_creates_completed_eval_run_with_real_case_coverage(db_session, raw_db_session):
+def test_run_eval_suite_creates_completed_eval_run_with_real_case_coverage(monkeypatch, db_session, raw_db_session):
+    _patch_small_case_sample(monkeypatch)
     run_seed_corpus_ingestion(db_session)
     db_session.flush()
 
@@ -159,6 +216,7 @@ def test_run_eval_suite_isolates_a_single_case_failure_and_still_completes(monke
     passing result -- proving the failure was truly isolated, not a
     symptom of the whole retrieval dimension having been aborted.
     """
+    _patch_small_case_sample(monkeypatch)
     run_seed_corpus_ingestion(db_session)
     db_session.flush()
 
@@ -280,7 +338,7 @@ def test_ensure_target_employee_exists_bumps_sequence_so_later_autoincrement_ins
         raw_db_session.commit()
 
 
-def test_arq_worker_processes_run_eval_suite_task_via_real_redis(raw_db_session):
+def test_arq_worker_processes_run_eval_suite_task_via_real_redis(monkeypatch, raw_db_session):
     """Unlike the direct-call test above (which ingests inside `db_session`'s
     own rolled-back transaction, invisible to any other connection),
     `run_eval_suite_task` opens its OWN session against the live DB (see
@@ -305,6 +363,7 @@ def test_arq_worker_processes_run_eval_suite_task_via_real_redis(raw_db_session)
         finally:
             await pool.aclose()
 
+    _patch_small_case_sample(monkeypatch)
     before_max_ingestion_run_id = raw_db_session.scalar(select(func.max(IngestionRun.id))) or 0
     before_max_document_id = raw_db_session.scalar(select(func.max(Document.id))) or 0
     before_max_version_id = raw_db_session.scalar(select(func.max(DocumentVersion.id))) or 0
