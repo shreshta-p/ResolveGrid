@@ -15,7 +15,7 @@ from resolvegrid_api.agent_mutation_execution import execute_mutation_for_agent
 from resolvegrid_api.agent_retrieval import retrieve_for_agent
 from resolvegrid_api.approval_service import request_approval_for_agent
 from resolvegrid_api.db import DATABASE_URL
-from resolvegrid_api.routers import approvals, chat, directory, tickets, tools
+from resolvegrid_api.routers import approvals, chat, directory, evals, tickets, tools
 
 # `langgraph-checkpoint-postgres`'s AsyncPostgresSaver uses psycopg's async
 # driver, which raises psycopg.InterfaceError unconditionally under Windows'
@@ -122,6 +122,7 @@ app.include_router(tickets.router)
 app.include_router(chat.router)
 app.include_router(tools.router)
 app.include_router(approvals.router)
+app.include_router(evals.router)
 
 
 @app.get("/health")

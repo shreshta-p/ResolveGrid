@@ -48,7 +48,12 @@ _SELF_SCOPED_ACTIONS = {
 # must be denied outright, exactly matching ticket.transition's precedent,
 # not downgraded to a self-scoped Decision that would (incorrectly) let them
 # see/decide approvals they merely requested or are the subject of.
-_STAFF_ONLY_ACTIONS = {"ticket.transition", "approval.list", "approval.decide"}
+# Phase 10 Task 8: "eval.view" joins this set for the same reason -- eval
+# run/case results can reveal internal system behavior (prompts, retrieved
+# chunk ids, tool params, approval outcomes) across every employee's data,
+# never a single employee's own resource, so a plain employee with no
+# admin/department-scoped analyst-or-approver grant must be denied outright.
+_STAFF_ONLY_ACTIONS = {"ticket.transition", "approval.list", "approval.decide", "eval.view"}
 
 _KNOWN_ACTIONS = _SELF_SCOPED_ACTIONS | _STAFF_ONLY_ACTIONS
 
