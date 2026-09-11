@@ -16,12 +16,28 @@ own resource the way a ticket or directory entry is, so (matching
 admin/department-scoped analyst-or-approver grant is denied outright, never
 downgraded to a self-scoped `Decision`.
 
-Pass-rate math: `_pass_rate_summary` groups `EvalCaseResult` rows by
-`dimension` and computes `passed_count / total_count` per dimension plus one
-overall rate across every case in the run. Division-by-zero is handled
-explicitly -- a dimension (or an entire run) with zero graded cases reports
-`pass_rate=None` rather than raising `ZeroDivisionError` or silently
-reporting a misleading `0.0`/`1.0`.
+Pass-rate math: `_summary_from_dimension_counts` turns a plain
+`{dimension: (passed_count, total_count)}` mapping into the per-dimension +
+overall pass-rate summary shape, computing `passed_count / total_count` per
+dimension plus one overall rate across every case in the run.
+Division-by-zero is handled explicitly -- a dimension (or an entire run)
+with zero graded cases reports `pass_rate=None` rather than raising
+`ZeroDivisionError` or silently reporting a misleading `0.0`/`1.0`.
+
+Two different sources feed that same shared summary function, deliberately
+kept separate for a real cost reason (code-review finding, not a guess):
+`list_eval_runs` computes its counts via a DB-side `GROUP BY` aggregate
+query (`_dimension_counts_for_runs`) -- it needs only integer counts per
+`(eval_run_id, dimension)`, so hydrating every full `EvalCaseResult` row
+(`details_json` alone can carry retrieved-chunk-id lists, tool params, or
+judge-verdict payloads -- see `details_json handling` below) across up to
+`MAX_LIMIT` runs' worth of cases would transfer far more data than the
+summary needs and would not scale as `eval_case_result` grows -- exactly
+what this endpoint's own pagination exists to guard against.
+`get_eval_run`'s detail endpoint, by contrast, genuinely needs every full
+row anyway (to return `case_results`), so it derives its summary from the
+same rows it already fetched (`_pass_rate_summary`) rather than issuing a
+second, redundant aggregate query.
 
 `details_json` handling: `EvalCaseResult.details_json` is stored as a JSON
 string (this codebase's established "JSON-as-text column" convention, same
@@ -34,7 +50,7 @@ frontend never has to `JSON.parse` a nested JSON string itself.
 import json
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from resolvegrid_api.db import get_db
@@ -65,36 +81,78 @@ def _rate(passed: int, total: int) -> float | None:
     return (passed / total) if total else None
 
 
-def _pass_rate_summary(results: list[EvalCaseResult]) -> dict:
-    """Per-dimension `passed_count`/`total_count`/`pass_rate`, plus one
-    overall `passed_count`/`total_count`/`pass_rate` across every case in
-    `results` -- the "per-dimension pass-rate summary computed by
-    joining/aggregating EvalCaseResult rows grouped by dimension" the plan
-    doc's Task 8 section asks for.
+def _summary_from_dimension_counts(dimension_counts: dict[str, tuple[int, int]]) -> dict:
+    """Turns `{dimension: (passed_count, total_count)}` into the
+    per-dimension + overall pass-rate summary shape both endpoints return --
+    the "per-dimension pass-rate summary computed by joining/aggregating
+    EvalCaseResult rows grouped by dimension" the plan doc's Task 8 section
+    asks for. The single source of truth for the summary SHAPE; see module
+    docstring for why `list_eval_runs`/`get_eval_run` compute the counts fed
+    into this function from two different sources.
     """
-    by_dimension: dict[str, dict[str, int]] = {}
-    for result in results:
-        bucket = by_dimension.setdefault(result.dimension, {"passed_count": 0, "total_count": 0})
-        bucket["total_count"] += 1
-        if result.passed:
-            bucket["passed_count"] += 1
-
     dimensions = {
         dimension: {
-            "passed_count": counts["passed_count"],
-            "total_count": counts["total_count"],
-            "pass_rate": _rate(counts["passed_count"], counts["total_count"]),
+            "passed_count": passed_count,
+            "total_count": total_count,
+            "pass_rate": _rate(passed_count, total_count),
         }
-        for dimension, counts in sorted(by_dimension.items())
+        for dimension, (passed_count, total_count) in sorted(dimension_counts.items())
     }
-    total_passed = sum(counts["passed_count"] for counts in by_dimension.values())
-    total_count = sum(counts["total_count"] for counts in by_dimension.values())
+    total_passed = sum(passed_count for passed_count, _ in dimension_counts.values())
+    total_count = sum(total_count for _, total_count in dimension_counts.values())
     return {
         "dimensions": dimensions,
         "overall_passed_count": total_passed,
         "overall_total_count": total_count,
         "overall_pass_rate": _rate(total_passed, total_count),
     }
+
+
+def _pass_rate_summary(results: list[EvalCaseResult]) -> dict:
+    """Summary computed from already-fetched full `EvalCaseResult` rows --
+    used by `get_eval_run`'s detail endpoint, which needs every full row
+    anyway (to return `case_results`) and so has no reason to issue a
+    second, DB-side aggregate query on top of what it already fetched.
+    `list_eval_runs` deliberately does NOT use this function -- see module
+    docstring and `_dimension_counts_for_runs` below.
+    """
+    dimension_counts: dict[str, tuple[int, int]] = {}
+    for result in results:
+        passed_count, total_count = dimension_counts.get(result.dimension, (0, 0))
+        total_count += 1
+        if result.passed:
+            passed_count += 1
+        dimension_counts[result.dimension] = (passed_count, total_count)
+    return _summary_from_dimension_counts(dimension_counts)
+
+
+def _dimension_counts_for_runs(session: Session, run_ids: list[int]) -> dict[int, dict[str, tuple[int, int]]]:
+    """DB-side `GROUP BY (eval_run_id, dimension)` aggregate: returns
+    `{eval_run_id: {dimension: (passed_count, total_count)}}` for every run
+    in `run_ids`, without ever hydrating a full `EvalCaseResult` row --
+    `list_eval_runs` only needs these integer counts, not `details_json`/
+    `case_id`/`score`/`grader_type`/`created_at` for every case across up to
+    `MAX_LIMIT` runs (see module docstring's "Pass-rate math" section for
+    the cost this avoids). `func.count(...).filter(...)` compiles to a
+    standard SQL `FILTER (WHERE ...)` clause on the aggregate (supported by
+    the Postgres version this codebase already requires elsewhere), letting
+    one query produce both the passed and total counts per group.
+    """
+    rows = session.execute(
+        select(
+            EvalCaseResult.eval_run_id,
+            EvalCaseResult.dimension,
+            func.count(EvalCaseResult.id).label("total_count"),
+            func.count(EvalCaseResult.id).filter(EvalCaseResult.passed.is_(True)).label("passed_count"),
+        )
+        .where(EvalCaseResult.eval_run_id.in_(run_ids))
+        .group_by(EvalCaseResult.eval_run_id, EvalCaseResult.dimension)
+    ).all()
+
+    counts_by_run: dict[int, dict[str, tuple[int, int]]] = {}
+    for eval_run_id, dimension, total_count, passed_count in rows:
+        counts_by_run.setdefault(eval_run_id, {})[dimension] = (passed_count, total_count)
+    return counts_by_run
 
 
 def _eval_run_to_dict(row: EvalRun) -> dict:
@@ -141,9 +199,10 @@ def list_eval_runs(
     principal: Principal = Depends(get_principal),
 ) -> list[dict]:
     """Newest-first `EvalRun` list, each row annotated with `summary` (see
-    `_pass_rate_summary`) computed from that run's own `EvalCaseResult`
-    rows. Paginated via `limit`/`offset` (see module-level constants for the
-    default/max).
+    `_summary_from_dimension_counts`) computed from a lean, DB-side
+    aggregate over that run's own `EvalCaseResult` rows (see
+    `_dimension_counts_for_runs`). Paginated via `limit`/`offset` (see
+    module-level constants for the default/max).
     """
     decision = authorize(principal, "eval.view")
     if not decision.allowed:
@@ -155,19 +214,16 @@ def list_eval_runs(
     if not runs:
         return []
 
-    # One query for every result row across every returned run (grouped
-    # in Python below), rather than N per-run queries -- this endpoint's
-    # whole point is a multi-run list view.
+    # One lean, DB-side GROUP BY aggregate query covering every returned
+    # run's counts at once (not N per-run queries, and not a full-row
+    # fetch) -- see `_dimension_counts_for_runs`'s docstring and this
+    # module's docstring for why the list endpoint deliberately avoids
+    # hydrating full EvalCaseResult rows just to compute a summary.
     run_ids = [run.id for run in runs]
-    results = session.scalars(
-        select(EvalCaseResult).where(EvalCaseResult.eval_run_id.in_(run_ids))
-    ).all()
-    results_by_run: dict[int, list[EvalCaseResult]] = {}
-    for result in results:
-        results_by_run.setdefault(result.eval_run_id, []).append(result)
+    counts_by_run = _dimension_counts_for_runs(session, run_ids)
 
     return [
-        {**_eval_run_to_dict(run), "summary": _pass_rate_summary(results_by_run.get(run.id, []))}
+        {**_eval_run_to_dict(run), "summary": _summary_from_dimension_counts(counts_by_run.get(run.id, {}))}
         for run in runs
     ]
 
