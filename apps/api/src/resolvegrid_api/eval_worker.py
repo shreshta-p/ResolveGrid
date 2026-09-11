@@ -202,7 +202,7 @@ from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from langgraph.types import Command
 from pydantic import BaseModel, ConfigDict
 from resolvegrid_agent_orchestration import build_graph, build_tool_invocation_graph
-from sqlalchemy import create_engine, select
+from sqlalchemy import create_engine, select, text
 from sqlalchemy.orm import Session
 
 from resolvegrid_api import llm_gateway
@@ -457,9 +457,32 @@ def _ensure_target_employee_exists(employee_id: int) -> None:
     supported SQLAlchemy/Postgres behavior for a plain serial/identity
     column (verified against this schema's migrations, which use a plain
     autoincrementing integer PK, not a `GENERATED ALWAYS` identity column)
-    -- Postgres accepts the explicit value without complaint; it just
-    doesn't advance the sequence, which is irrelevant here since this
-    function never lets the normal autoincrement path assign that same id.
+    -- Postgres accepts the explicit value without complaint.
+
+    REAL BUG FOUND AND FIXED DURING PHASE 10 TASK 9'S FRESH-STATE
+    VERIFICATION (not part of this task's original design -- see
+    `docs/DECISION_LOG.md`'s 2026-09-11 entry): this function's original
+    version claimed skipping a sequence bump was "irrelevant... since this
+    function never lets the normal autoincrement path assign that same
+    id." That claim is FALSE and was disproven by direct reproduction:
+    Postgres sequences are non-transactional, so `nextval()` calls from
+    OTHER tests' `db_session`-fixture flushes (rolled back at teardown,
+    per `apps/api/tests/conftest.py`) still permanently advance
+    `employee_id_seq`, even though the rows themselves never persist.
+    Given enough such flushes across a ~230-test suite, the sequence can
+    and did organically reach exactly one of this function's explicit
+    literal ids (42/101/205, from `eval/golden/v2/tools_approvals_v1.jsonl`)
+    -- these fixture rows are deliberately never cleaned up (see this
+    module's docstring: idempotent get-or-create, so repeated suite runs
+    don't accumulate duplicates), so the collision is a real
+    `UniqueViolation` against a genuinely still-present row, not a flake.
+    Fix: after an explicit-id insert, bump the sequence to at least the
+    table's current max id via `pg_get_serial_sequence`/`setval` -- the
+    standard, idiomatic Postgres remedy for manually assigning a serial
+    column's value. This guarantees every subsequent `nextval()` call
+    anywhere in the process returns a value strictly greater than any id
+    this function has ever explicitly assigned, permanently closing the
+    collision, not just for the ids observed so far.
     """
     with session_factory() as s:
         if s.get(Employee, employee_id) is not None:
@@ -474,6 +497,8 @@ def _ensure_target_employee_exists(employee_id: int) -> None:
                 timezone="UTC",
             )
         )
+        s.flush()
+        s.execute(text("SELECT setval(pg_get_serial_sequence('employee', 'id'), (SELECT MAX(id) FROM employee))"))
         s.commit()
 
 

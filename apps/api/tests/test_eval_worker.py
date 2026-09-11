@@ -33,12 +33,13 @@ real-corpus/real-Ollama tests (`test_eval_retrieval.py`,
 import asyncio
 import json
 import signal
+from datetime import datetime
 
 import pytest
 from arq import create_pool
 from arq.connections import RedisSettings
 from arq.worker import run_worker
-from sqlalchemy import delete, func, select
+from sqlalchemy import delete, func, select, text
 
 # See test_ingestion_worker.py's identical comment: arq.worker.Worker.close()
 # unconditionally references signal.SIGUSR1 (POSIX-only) even with
@@ -50,7 +51,7 @@ if not hasattr(signal, "SIGUSR1"):
 import resolvegrid_api.eval_worker as eval_worker_module
 from resolvegrid_api.eval_worker import REDIS_URL, WorkerSettings, run_eval_suite
 from resolvegrid_api.ingestion_worker import run_seed_corpus_ingestion
-from resolvegrid_api.models import ApprovalDecision, ApprovalRequest
+from resolvegrid_api.models import ApprovalDecision, ApprovalRequest, Employee
 from resolvegrid_api.models.evaluation import EvalCaseResult, EvalRun
 from resolvegrid_api.models.knowledge import Chunk, Document, DocumentVersion, Embedding, IngestionRun
 from resolvegrid_api.models.org import EmployeeEntitlement
@@ -234,6 +235,49 @@ def test_load_all_cases_filters_golden_by_dataset_version_but_always_includes_ad
     adversarial_cases_v3 = [c for c in cases_v3 if c.dimension == "adversarial"]
     assert {c.case_id for c in adversarial_cases_v3} == {c.case_id for c in adversarial_cases_v2}
     assert len(adversarial_cases_v3) == len(adversarial_cases_v2)
+
+
+def test_ensure_target_employee_exists_bumps_sequence_so_later_autoincrement_inserts_never_collide(raw_db_session):
+    """Regression test for a real bug found and fixed during Phase 10 Task
+    9's fresh-state verification (see `docs/DECISION_LOG.md`'s 2026-09-11
+    entry): `_ensure_target_employee_exists`'s explicit-id insert (for the
+    fixed literal target-employee ids `eval/golden/v2/tools_approvals_v1
+    .jsonl` references -- 42/101/205) must bump `employee_id_seq` past the
+    id it just used, or a later, unrelated autoincrement `Employee` insert
+    ANYWHERE ELSE in the shared test database can organically reach that
+    exact id and fail with a real `UniqueViolation` -- reproduced directly
+    (not hypothetically) during this task's own from-empty full-suite run,
+    where the sequence reached exactly 101 and collided with this
+    function's already-planted fixture row from `test_eval_worker.py`'s own
+    earlier tests in the same session.
+
+    This test picks an id one past the current real max (so it's
+    guaranteed free), calls the function with it directly, then performs a
+    normal autoincrement `Employee` insert (mirroring every other
+    Employee-creating test in this suite, e.g. `test_retrieval.py`'s
+    `_make_employee`) and asserts its id lands strictly ABOVE the explicit
+    id just used -- the exact property the original, unfixed code violated.
+    """
+    max_id = raw_db_session.execute(text("SELECT COALESCE(MAX(id), 0) FROM employee")).scalar_one()
+    target_id = max_id + 1
+
+    eval_worker_module._ensure_target_employee_exists(target_id)
+
+    probe_employee = Employee(
+        display_name="Sequence Regression Probe",
+        email=f"sequence.regression.probe.{target_id}@example.test",
+        title="Employee",
+        hire_date=datetime(2024, 1, 1),
+        timezone="UTC",
+    )
+    raw_db_session.add(probe_employee)
+    raw_db_session.commit()
+
+    try:
+        assert probe_employee.id > target_id
+    finally:
+        raw_db_session.execute(text("DELETE FROM employee WHERE id IN (:a, :b)"), {"a": target_id, "b": probe_employee.id})
+        raw_db_session.commit()
 
 
 def test_arq_worker_processes_run_eval_suite_task_via_real_redis(raw_db_session):
