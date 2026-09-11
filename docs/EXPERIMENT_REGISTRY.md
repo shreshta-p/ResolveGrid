@@ -90,3 +90,49 @@ Fixes the regression Task 6 found: `resolvegrid_retrieval.status_adjustment.appl
 All three cases now report `distractor_beats_best_relevant=False`, each with a wide (6-8 rank) positive margin, not just a narrow correct order -- the full-range penalty guarantee holds in practice, not just in theory. `apps/api/tests/test_eval_retrieval.py::test_reranked_eval_path_runs_end_to_end_against_real_corpus_and_reranker`'s distractor assertion is tightened from `<= 1` (Task 6's "known ceiling") to `== 0` (Task 7's zero-tolerance guarantee) -- a future change that reintroduces even one flip now fails CI.
 
 **Net assessment**: this closes Task 6's flagged regression with a mechanism that is correct-by-construction (not curve-fit to the one measured case), verified against the real corpus, and enforced going forward by a CI-blocking test. Deprioritization (not filtering) is deliberate -- a superseded chunk can still survive into the final context if no non-superseded chunk covers the same point (e.g. "what was the OLD policy"), matching this whole phase's established "erring toward under-hiding, not silently deleting real content" philosophy.
+
+## Phase 10 Task 9 -- confirming the re-expressed Phase 7/8 golden numbers survived Task 3's consolidation refactor
+
+Task 3 moved the retrieval IR-metric functions (`recall_at_k`/`precision_at_k`/`reciprocal_rank`/`ndcg_at_k`) out of `apps/api/src/resolvegrid_api/eval_retrieval.py` (formerly private) into `services/evaluation/src/resolvegrid_evaluation/retrieval_metrics.py` as a public library API, leaving `eval_retrieval.py` as a thin wrapper. Task 5 additionally re-expressed the same 18 golden retrieval cases into `eval/golden/v2/retrieval_v1.jsonl` under the new `EvalCase` schema. This entry records the actual re-measurement performed during this task's fresh-state verification -- not assumed, run for real -- confirming neither the refactor nor the re-expression silently changed any measured number.
+
+| Field | Value |
+|---|---|
+| Date | 2026-09-11 |
+| Git commit | `e442893543d444f0dce571699e2ace2f31a022fa` |
+| Corpus | Freshly re-ingested `eval/corpus/*.md` via `SEED_CORPUS` on a genuinely fresh database (full `docker compose down -v` + re-migrate, see `docs/PROGRESS.md`'s Phase 10 row) -- confirmed via direct SQL row counts: `document`=8, `document_version`=8, `chunk`=36, `embedding`=36 |
+| Harness | `uv run --package resolvegrid-api python -m resolvegrid_api.eval_retrieval`, run back-to-back (baseline then reranked) against this same freshly-ingested corpus, exactly as in Phase 8 Task 7 |
+
+**Measured results** (baseline = `fuse_rrf` only; reranked = `rerank` + `apply_status_adjustment` + `dedup`, both paths now calling `services/evaluation`'s consolidated metric functions internally, not `eval_retrieval.py`'s own copies):
+
+| Metric | Baseline | Reranked | Phase 7 baseline (recorded) | Phase 8 Task 7 reranked (recorded) |
+|---|---|---|---|---|
+| recall@5 | 1.0000 | 1.0000 | 1.0000 | 1.0000 |
+| precision@5 | 0.2000 | 0.2000 | 0.2000 | 0.2000 |
+| MRR | 0.9524 | 1.0000 | 0.9524 | 1.0000 |
+| nDCG@5 | 0.9643 | 1.0000 | 0.9643 | 1.0000 |
+| Adversarial authz leakage | None (0/18) | None (0/18) | None (0/18) | None (0/18) |
+| VPN distractor flips | 0/3 (margins 5/1/1) | 0/3 (margins 8/6/8) | 0/3 | 0/3 (margins 8/6/8) |
+
+**Every number reproduces exactly**, byte-for-byte against Phase 7's and Phase 8 Task 7's originally recorded baselines, including the individual distractor-case margins. This confirms Task 3's metric-function move and Task 5's schema re-expression are both genuinely behavior-preserving refactors, not just claimed to be -- the golden dataset's real measured characteristics (a small-corpus ceiling effect on recall/precision, the status-adjustment fix's wide positive margins on the three VPN v1/v2 distractor cases) are unchanged from when they were first measured.
+
+## Phase 10 Task 4 -- judge-calibration measurement (`judge_calibration_v1`)
+
+| Field | Value |
+|---|---|
+| Date measured (re-confirmed) | 2026-09-11 |
+| Git commit | `e442893543d444f0dce571699e2ace2f31a022fa` |
+| Calibration set | `eval/golden/judge_calibration_v1.jsonl` -- 18 hand-labeled cases, 6 per judge dimension (`groundedness`, `correctness`, `abstention_appropriateness`) |
+| Judge model | `qwen3:14b` (the same live local Ollama model the rest of this codebase uses -- no separate/larger judge model provisioned this phase) |
+| Threshold targeted | >=0.80 exact agreement per dimension (justified in `apps/api/tests/test_eval_judge_calibration.py`'s module docstring as a common practical LLM-judge-calibration bar) -- a target, never silently lowered to match whatever was measured |
+| Harness | `services/evaluation/src/resolvegrid_evaluation/judge.py`'s `calculate_agreement`, invoked end-to-end (real Ollama, no mocking) by `apps/api/tests/test_eval_judge_calibration.py::test_run_real_calibration_end_to_end_against_real_ollama` |
+
+**Measured results:**
+
+| Dimension | Agreement | Cases |
+|---|---|---|
+| groundedness | 1.000 | 6/6 |
+| correctness | 1.000 | 6/6 |
+| abstention_appropriateness | 1.000 | 6/6 |
+| overall | 1.000 | 18/18 |
+
+**Honestly reported, not treated as a clean win**: this exceeds the >=0.80 target on every dimension, but see `docs/EVALUATIONS.md`'s judge-calibration section for the full caveat -- independent review found the groundedness/correctness cases in this calibration set are clean, template-shaped contradiction-spotting exercises (the "false" variant directly contradicts a single short retrieved chunk immediately adjacent to it), not adversarially-hard near-misses a judge might plausibly get wrong. Only the abstention-appropriateness cases are genuinely hard. A 1.000 on this specific sample demonstrates the judge can reliably catch a flat, adjacent contradiction -- a real, narrow, useful capability -- and must **not** be read as general proof the judge is well-calibrated for subtler fabrications, partial-truth answers, or well-hedged incorrect claims that a production `/chat` conversation could plausibly produce. Revisit trigger: a future phase adding harder, more adversarial groundedness/correctness cases (paraphrased contradictions, multi-hop reasoning, plausible-but-wrong claims not directly adjacent to the contradicting evidence) would give a materially more informative number than this one.
