@@ -11,13 +11,17 @@ permissions:
 jobs:
   api:
     runs-on: ubuntu-latest
-    # 25, not the other jobs' 15: apps/api/tests/test_eval_retrieval.py's
+    # 40, not the other jobs' 15: apps/api/tests/test_eval_retrieval.py's
     # reranking-enabled eval test (Phase 8 Task 6) needs the same
     # `--extra reranker` install (sentence-transformers/torch/
     # transformers + a real ~1.1GB bge-reranker-base download on first
     # use) the `retrieval` job below already budgets 15 minutes for on
     # its own, on top of this job's existing DB/Ollama/Redis setup work.
-    timeout-minutes: 25
+    # Bumped from 25 to 40 for Phase 10 Task 9: a real LiteLLM proxy (see
+    # below) now also needs `qwen3:14b` (9.3GB) pulled into the Ollama
+    # service container, which this job never previously needed (only
+    # the much smaller nomic-embed-text).
+    timeout-minutes: 40
     services:
       postgres:
         image: pgvector/pgvector:pg16
@@ -67,13 +71,66 @@ jobs:
       - uses: astral-sh/setup-uv@v3
         with:
           version: "0.8.13"
-      - name: Pull nomic-embed-text into the Ollama service container
+      - name: Pull nomic-embed-text and qwen3:14b into the Ollama service container
         run: |
           for i in $(seq 1 30); do
             curl -sf http://localhost:11434/api/tags >/dev/null && break
             sleep 2
           done
           curl -sf http://localhost:11434/api/pull -d '{"model": "nomic-embed-text", "stream": false}'
+          # qwen3:14b (9.3GB) is new to this job as of Phase 10 Task 9 --
+          # see the LiteLLM step below for why it's now needed here.
+          curl -sf http://localhost:11434/api/pull -d '{"model": "qwen3:14b", "stream": false}'
+      # Phase 10 Task 9: apps/api/tests/test_adversarial_suite.py's
+      # test_adversarial_injected_document_never_triggers_a_real_tool_call
+      # (Phase 10 Task 6) is the first test in this repo's history to call
+      # the real /chat endpoint WITHOUT mocking `llm_gateway.complete` --
+      # deliberately, since mocking the model's response for a
+      # prompt-injection case would be circular (see that test file's
+      # module docstring). This means it needs a real, reachable LiteLLM
+      # proxy, which this job never provisioned before (every other real-
+      # Ollama test in this suite calls Ollama directly for embeddings, or
+      # mocks llm_gateway.complete for determinism). Mirrors
+      # infra/docker-compose.yml's `litellm` service as closely as CI
+      # constraints allow:
+      #   - GitHub Actions `services:` containers start before checkout,
+      #     so `infra/litellm/config.yaml` (checked-out only once this
+      #     step runs) can't be bind-mounted via a `services:` entry --
+      #     started as a plain `docker run` step instead, after checkout.
+      #   - A DEDICATED `litellm` database, never `resolvegrid` -- per
+      #     docs/DECISION_LOG.md's "Prisma shared-DB risk" entry, LiteLLM's
+      #     Prisma startup baseline can silently DROP tables it doesn't
+      #     recognize in whatever database it's pointed at.
+      #   - `--network host` + `--add-host=ollama:127.0.0.1`: the checked
+      #     -in config.yaml hardcodes `http://ollama:11434` (Compose's
+      #     internal DNS name); host networking plus a manual hosts-file
+      #     entry makes that same hostname resolve to this runner's own
+      #     loopback, where the `ollama`/`postgres` services already
+      #     publish their ports -- no CI-only fork of config.yaml needed.
+      #   - Real cloud keys are never available here (they live only in
+      #     this repo's gitignored .env) -- ANTHROPIC_API_KEY/
+      #     OPENAI_API_KEY are passed empty, matching docker-compose.yml's
+      #     own "empty string default if unset, not an error" contract;
+      #     this test only exercises the local-qwen3 route, never cloud.
+      - name: Start a real LiteLLM proxy for the adversarial suite's one real-model test
+        run: |
+          psql "postgresql://resolvegrid:resolvegrid_dev@localhost:5433/resolvegrid" -c "CREATE DATABASE litellm"
+          docker run -d --name litellm \
+            --network host \
+            --add-host=ollama:127.0.0.1 \
+            -e DATABASE_URL="postgresql://resolvegrid:resolvegrid_dev@localhost:5433/litellm" \
+            -e LITELLM_MASTER_KEY="sk-resolvegrid-local-dev" \
+            -e ANTHROPIC_API_KEY="" \
+            -e OPENAI_API_KEY="" \
+            -v "${{ github.workspace }}/infra/litellm/config.yaml:/app/config.yaml:ro" \
+            ghcr.io/berriai/litellm:main-stable --config /app/config.yaml --port 4000
+          for i in $(seq 1 60); do
+            curl -sf http://localhost:4000/health/liveliness >/dev/null && break
+            sleep 3
+          done
+          curl -sf http://localhost:4000/health/liveliness
+        env:
+          PGPASSWORD: resolvegrid_dev
       # --extra reranker: apps/api/tests/test_eval_retrieval.py's
       # reranking-enabled eval test (Phase 8 Task 6) imports
       # resolvegrid_retrieval.reranker, which needs sentence-transformers
@@ -84,6 +141,9 @@ jobs:
       - run: uv run --package resolvegrid-api alembic -c apps/api/alembic.ini upgrade head
       - run: uv run --package resolvegrid-api pytest apps/api/tests -v
       - run: uv run --package resolvegrid-telemetry pytest packages/telemetry/tests -v
+      - name: Show LiteLLM proxy logs (diagnostic, always run)
+        if: always()
+        run: docker logs litellm --tail 200 || true
 
   authz:
     runs-on: ubuntu-latest
