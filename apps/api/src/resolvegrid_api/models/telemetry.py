@@ -62,3 +62,9 @@ class ModelCall(Base):
     status: Mapped[str]  # "success" | "error"
     error_message: Mapped[str | None] = mapped_column(default=None)
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+    # The real OTel trace id (32 lowercase hex chars) the completion's span
+    # was recorded under -- lets a ModelCall row be correlated to a real
+    # trace in Langfuse (Phase 11 Task 5) once traces are actually exported
+    # somewhere queryable. Nullable: rows written before this column existed
+    # (migration 0014) have none, and that's fine -- never backfilled.
+    trace_id: Mapped[str | None] = mapped_column(default=None)

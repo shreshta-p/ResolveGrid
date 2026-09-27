@@ -7,7 +7,8 @@ from resolvegrid_api import llm_gateway
 from resolvegrid_api.audit import record_audit_event
 from resolvegrid_api.db import get_db
 from resolvegrid_api.deps import get_principal
-from resolvegrid_api.models import ModelCall, PricingVersion, Queue, Ticket, TicketMessage, TicketStateTransition
+from resolvegrid_api.model_call_logging import current_pricing_version, log_completion
+from resolvegrid_api.models import Queue, Ticket, TicketMessage, TicketStateTransition
 from resolvegrid_api.rate_limit import check_ticket_creation_rate_limit
 from resolvegrid_authz import Decision, Principal, authorize
 from resolvegrid_contracts import TicketCreateRequest, TicketTransitionRequest, is_valid_transition
@@ -154,19 +155,6 @@ def transition_ticket(
     return _ticket_to_dict(ticket)
 
 
-def _current_pricing_version(session: Session, provider: str, model: str) -> PricingVersion | None:
-    # No `effective_at <= now()` filter -- harmless today (one seeded $0 row
-    # for ollama/local-qwen3), but once a real paid provider adds a
-    # future-dated PricingVersion row (a scheduled rate change), this would
-    # pick it up early and misprice calls made before that date. Fix before
-    # Phase 5 adds real provider pricing.
-    return session.scalar(
-        select(PricingVersion)
-        .where(PricingVersion.provider == provider, PricingVersion.model == model)
-        .order_by(PricingVersion.effective_at.desc())
-    )
-
-
 @router.post("/{ticket_id}/summarize")
 def summarize_ticket(
     ticket_id: int,
@@ -196,38 +184,19 @@ def summarize_ticket(
         f"Messages:\n{body_text}"
     )
 
-    with tracer.start_as_current_span("llm.summarize_ticket") as span:
-        span.set_attribute("gen_ai.system", "ollama")
-        span.set_attribute("gen_ai.request.model", llm_gateway.DEFAULT_MODEL)
-        try:
-            result = llm_gateway.complete(prompt)
-        except llm_gateway.LLMGatewayError as exc:
-            span.set_attribute("error.type", type(exc).__name__)
-            session.add(
-                ModelCall(
-                    purpose="ticket.summarize", provider="ollama", model=llm_gateway.DEFAULT_MODEL,
-                    pricing_version_id=None, input_tokens=0, output_tokens=0, latency_ms=0,
-                    estimated_cost_usd=0.0, status="error", error_message=str(exc),
-                )
-            )
-            session.commit()
-            raise HTTPException(status_code=502, detail=f"LLM gateway error: {exc}") from exc
+    try:
+        result = log_completion(session, tracer, purpose="ticket.summarize", prompt=prompt)
+    except llm_gateway.LLMGatewayError as exc:
+        # log_completion() already added the error-shaped ModelCall row to
+        # the session; this call site still owns the commit boundary (same
+        # convention as the success path below), so the error row must be
+        # committed here before turning the failure into an HTTP response --
+        # raw_db_session-based tests read via a separate connection and only
+        # ever see committed data.
+        session.commit()
+        raise HTTPException(status_code=502, detail=f"LLM gateway error: {exc}") from exc
 
-        span.set_attribute("gen_ai.usage.input_tokens", result.input_tokens)
-        span.set_attribute("gen_ai.usage.output_tokens", result.output_tokens)
-        # "gen_ai.response.model" is the currently-installed OTel GenAI
-        # semconv name for the model that actually served the response (see
-        # opentelemetry.semconv._incubating.attributes.gen_ai_attributes.
-        # GEN_AI_RESPONSE_MODEL) -- flagged deprecated-in-favor-of-the-
-        # standalone genai-semconv-repo in that module's docstring, but it's
-        # still the only "response model" constant this installed package
-        # ships, so it's the correct name to emit today. Only set when a
-        # fallback (or any distinct serving model group) actually occurred;
-        # a non-fallback call already has the request model on this span.
-        if result.serving_model_group:
-            span.set_attribute("gen_ai.response.model", result.serving_model_group)
-
-    pricing = _current_pricing_version(session, result.provider, result.model)
+    pricing = current_pricing_version(session, result.provider, result.model)
     if pricing is not None:
         estimated_cost_usd = (
             result.input_tokens / 1000 * pricing.input_cost_per_1k_tokens_usd
@@ -235,15 +204,6 @@ def summarize_ticket(
         )
     else:
         estimated_cost_usd = 0.0
-
-    call = ModelCall(
-        purpose="ticket.summarize", provider=result.provider, model=result.model,
-        pricing_version_id=pricing.id if pricing is not None else None,
-        input_tokens=result.input_tokens, output_tokens=result.output_tokens,
-        latency_ms=result.latency_ms, estimated_cost_usd=estimated_cost_usd, status="success",
-        fallback_occurred=result.fallback_occurred, serving_model_group=result.serving_model_group,
-    )
-    session.add(call)
     session.commit()
 
     return {
