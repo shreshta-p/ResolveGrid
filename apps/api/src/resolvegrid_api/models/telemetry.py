@@ -26,7 +26,10 @@ class PricingVersion(Base):
 
 class ModelCall(Base):
     __tablename__ = "model_call"
-    __table_args__ = (Index("ix_model_call_purpose", "purpose"),)
+    __table_args__ = (
+        Index("ix_model_call_purpose", "purpose"),
+        Index("ix_model_call_trace_id", "trace_id"),
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True)
     purpose: Mapped[str]  # e.g. "ticket.summarize" -- what the call was for
@@ -67,4 +70,8 @@ class ModelCall(Base):
     # trace in Langfuse (Phase 11 Task 5) once traces are actually exported
     # somewhere queryable. Nullable: rows written before this column existed
     # (migration 0014) have none, and that's fine -- never backfilled.
+    # Indexed (ix_model_call_trace_id) for the same reason `purpose` is
+    # indexed just above: "find all ModelCalls for this trace" is a
+    # point-lookup-by-value access pattern, and this is exactly the query
+    # Task 5's Langfuse correlation work will run.
     trace_id: Mapped[str | None] = mapped_column(default=None)

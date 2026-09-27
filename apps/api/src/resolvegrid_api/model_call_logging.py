@@ -16,6 +16,17 @@ function `session.add()`s and does NOT call `session.commit()` -- the caller
 owns the transaction boundary (e.g. `summarize_ticket` still commits once,
 after its own subsequent authz/state work, exactly as it did before this
 extraction).
+
+Span-exception-attribution note (real, silent difference from the
+pre-extraction code, documented per code review): pre-refactor,
+`summarize_ticket` raised its `HTTPException` INSIDE the same `llm.*` span,
+so that span recorded `HTTPException` (with `LLMGatewayError` as its cause)
+as the exception that ended it. Post-extraction, `log_completion`'s span
+closes on the original `LLMGatewayError` itself -- arguably more correct,
+since that's the exception this module actually raises -- and any
+`HTTPException` a caller (e.g. `summarize_ticket`) wraps it in afterward is
+raised outside any span entirely. No test depends on either shape; this is
+a deliberate outcome of the extraction, not an oversight.
 """
 
 from opentelemetry import trace as otel_trace
@@ -83,6 +94,11 @@ def log_completion(
     cost, no pricing_version_id, `error_message=str(exc)`) and re-raises the
     SAME exception unchanged -- callers still decide how to surface it (e.g.
     `summarize_ticket` turns it into an HTTP 502).
+
+    Does NOT call `session.commit()` in either the success or error path --
+    the caller owns the transaction boundary (same convention as `audit.py`'s
+    `record_audit_event`) and MUST commit (or otherwise flush/persist) the
+    session itself, or the `ModelCall` row this just added is silently lost.
     """
     with tracer.start_as_current_span(f"llm.{purpose}") as span:
         # Real OTel trace-id capture: read the actual current trace id from

@@ -62,6 +62,10 @@ def test_log_completion_success_writes_model_call_with_real_trace_id_and_correct
     fake_result = CompletionResult(
         text="a real-shaped completion", input_tokens=100, output_tokens=200, latency_ms=50,
         provider="test-provider", model="test-model-success",
+        # Non-default fallback_occurred/serving_model_group so the assertion
+        # below actually proves pass-through onto the written ModelCall row,
+        # not just that the default False/None happens to match.
+        fallback_occurred=True, serving_model_group="test-fallback-group",
     )
     with patch("resolvegrid_api.model_call_logging.llm_gateway.complete", return_value=fake_result) as mock_complete:
         result = log_completion(db_session, tracer, purpose="test.success", prompt="summarize this")
@@ -80,6 +84,8 @@ def test_log_completion_success_writes_model_call_with_real_trace_id_and_correct
     assert call.output_tokens == 200
     assert call.latency_ms == 50
     assert call.pricing_version_id == pricing.id
+    assert call.fallback_occurred is True
+    assert call.serving_model_group == "test-fallback-group"
     # 100/1000 * 2.0 + 200/1000 * 4.0 == 0.2 + 0.8 == 1.0 -- deliberately
     # distinct input/output costs so this genuinely exercises both terms of
     # the cost formula, not just a single-rate shortcut that would also pass
