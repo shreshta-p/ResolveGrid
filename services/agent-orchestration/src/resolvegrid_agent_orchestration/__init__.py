@@ -21,8 +21,8 @@ Callers (e.g. `apps/api`) should only need `build_graph`/
 types (`CompleteFn`, `ComposeCompleteFn`, `RetrieveFn`, `RequestApprovalFn`,
 `ExecuteMutationFn`) from this package -- `graph.py`'s node
 factories/prompts are internal wiring, not part of the intended public
-surface. Phase 11 Task 4 adds `ComposeCompleteFn` (`Callable[[str, str],
-str]`, prompt + risk_level) specifically for `compose_response`'s real
+surface. Phase 11 Task 4 adds `ComposeCompleteFn` (a `Protocol` taking `prompt` and a
+keyword-only `risk_level`) specifically for `compose_response`'s real
 routing-aware completion function -- see `graph.py`'s `ComposeCompleteFn`
 docstring.
 """
