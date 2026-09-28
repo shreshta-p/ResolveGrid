@@ -164,7 +164,17 @@ def _instance_b_retrieve_fn(query_text: str, scope: dict | None) -> dict:
 async def _run_instance_a_to_completion(thread_id: str) -> dict:
     async with AsyncPostgresSaver.from_conn_string(_CHECKPOINTER_DATABASE_URL) as checkpointer_a:
         await checkpointer_a.setup()
-        graph_a = build_graph(checkpointer_a, _instance_a_complete_fn(), _instance_a_retrieve_fn)
+        # Phase 11 Task 3: build_graph now takes two CompleteFns (one per
+        # LLM-calling node) -- this test's fake doesn't care about purpose
+        # attribution, so ONE closure instance is built and passed for
+        # both arguments (not two separate _instance_a_complete_fn() calls,
+        # which would each start their own independent `calls` counter at
+        # 0 and break the "1st call = classify, 2nd = compose" ordering
+        # this fake depends on).
+        instance_a_complete_fn = _instance_a_complete_fn()
+        graph_a = build_graph(
+            checkpointer_a, instance_a_complete_fn, instance_a_complete_fn, _instance_a_retrieve_fn
+        )
         result = await graph_a.ainvoke(
             _initial_state(thread_id),
             config={"configurable": {"thread_id": thread_id}},
@@ -183,7 +193,9 @@ async def _read_state_via_instance_b(thread_id: str) -> dict:
         # of its own to read data instance A already persisted, which is
         # exactly what a real fresh-process restart would also do (connect
         # and read, not re-run migrations).
-        graph_b = build_graph(checkpointer_b, _instance_b_complete_fn, _instance_b_retrieve_fn)
+        graph_b = build_graph(
+            checkpointer_b, _instance_b_complete_fn, _instance_b_complete_fn, _instance_b_retrieve_fn
+        )
         snapshot = await graph_b.aget_state({"configurable": {"thread_id": thread_id}})
         return snapshot.values
 

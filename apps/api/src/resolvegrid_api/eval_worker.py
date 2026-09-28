@@ -200,6 +200,7 @@ if sys.platform == "win32":
 from arq.connections import RedisSettings
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from langgraph.types import Command
+from opentelemetry import trace
 from pydantic import BaseModel, ConfigDict
 from resolvegrid_agent_orchestration import build_graph, build_tool_invocation_graph
 from sqlalchemy import create_engine, select, text
@@ -213,6 +214,7 @@ from resolvegrid_api.db import DATABASE_URL, session_factory
 from resolvegrid_api.eval_judge import judge_response_real
 from resolvegrid_api.eval_retrieval import GoldenCase, evaluate_case
 from resolvegrid_api.ingestion_worker import EMBEDDING_VERSION as _INGESTION_EMBEDDING_VERSION
+from resolvegrid_api.model_call_logging import make_logging_complete_fn
 from resolvegrid_api.models import ApprovalDecision, ApprovalRequest, Department, Employee, RoleAssignment
 from resolvegrid_api.models.evaluation import EvalCaseResult, EvalRun
 from resolvegrid_api.mutation_execution import execute_readonly_tool
@@ -237,6 +239,15 @@ from resolvegrid_evaluation.schema import EvalCase, load_eval_cases
 
 # Redis connection for Arq -- same env-var convention as ingestion_worker.py.
 REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6380/0")
+
+# The global tracer provider is already configured once at app startup by
+# main.py's lifespan hook (resolvegrid_telemetry.init_tracing) -- this module
+# must NOT call init_tracing again, just bind a tracer to whatever provider is
+# globally registered by the time a span is actually started (same pattern as
+# routers/chat.py/routers/tickets.py). Phase 11 Task 3: used by the real
+# ModelCall-logging chat-graph closures `_execute_graph_dimension_cases`
+# builds below.
+tracer = trace.get_tracer(__name__)
 
 # See main.py's identical comment: AsyncPostgresSaver.from_conn_string()
 # needs the plain libpq-style URI, not SQLAlchemy's "+psycopg" suffix.
@@ -755,11 +766,31 @@ async def _execute_graph_dimension_cases(
     if not (chat_cases or tool_cases or approval_cases):
         return results
 
-    complete_fn = lambda prompt: llm_gateway.complete(prompt).text  # noqa: E731
+    # Phase 11 Task 3: this module builds its OWN real closures, distinct
+    # from main.py's app-lifetime ones (confirmed by reading main.py: its
+    # `app.state.agent_graph` is built once at FastAPI startup and is not
+    # reused here -- this function builds a completely separate, short
+    # -lived chat graph instance per suite run instead, mirroring
+    # `build_tool_invocation_graph`'s already-established sibling call
+    # below). Real `ModelCall` logging via `make_logging_complete_fn`
+    # (same shared factory main.py uses) -- purposes prefixed "eval." to
+    # distinguish real eval-harness traffic from real user chat traffic in
+    # the `ModelCall` table, since both share the same underlying chat
+    # graph/prompts but are genuinely different real call sites.
+    classify_complete_fn = make_logging_complete_fn(
+        session_factory, tracer, purpose="eval.chat.classify_intent"
+    )
+    compose_complete_fn = make_logging_complete_fn(
+        session_factory, tracer, purpose="eval.chat.compose_response"
+    )
 
     async with AsyncPostgresSaver.from_conn_string(_CHECKPOINTER_DATABASE_URL) as checkpointer:
         await checkpointer.setup()
-        chat_graph = build_graph(checkpointer, complete_fn, retrieve_for_agent) if chat_cases else None
+        chat_graph = (
+            build_graph(checkpointer, classify_complete_fn, compose_complete_fn, retrieve_for_agent)
+            if chat_cases
+            else None
+        )
         tool_graph = (
             build_tool_invocation_graph(checkpointer, request_approval_for_agent, execute_mutation_for_agent)
             if (tool_cases or approval_cases)

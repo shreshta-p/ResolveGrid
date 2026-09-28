@@ -19,13 +19,15 @@ Instead, every node here is built by a factory function that takes a
 plain callable, `CompleteFn = Callable[[str], str]` -- prompt text in,
 completion text out. `apps/api` is the one that knows about
 `llm_gateway.complete()` and its richer `CompletionResult` (tokens,
-latency, provider, fallback info); Task 3 wires it in with something
-like `complete_fn = lambda prompt: llm_gateway.complete(prompt).text`
-when it calls `build_graph(checkpointer, complete_fn, retrieve_fn)`. This
-package never imports `resolvegrid_api` and has no knowledge of
-`CompletionResult` at all -- it only needs response *text*. That also
-makes every node here trivially unit-testable with a bare lambda/fake,
-no mocking of `apps/api` internals required.
+latency, provider, fallback info); Phase 11 Task 3 wires in two real,
+`ModelCall`-logging closures (one per LLM-calling node, so each gets its
+own real `purpose`) when it calls `build_graph(checkpointer,
+classify_complete_fn, compose_complete_fn, retrieve_fn)` -- see that
+function's own docstring for why two, not one. This package never imports
+`resolvegrid_api` and has no knowledge of `CompletionResult` at all -- it
+only needs response *text*. That also makes every node here trivially
+unit-testable with a bare lambda/fake, no mocking of `apps/api` internals
+required.
 
 Phase 7 Task 7 -- retrieval wiring and its scope limit
 --------------------------------------------------------------------------
@@ -850,21 +852,49 @@ def build_tool_invocation_graph(
     return builder.compile(checkpointer=checkpointer)
 
 
-def build_graph(checkpointer, complete_fn: CompleteFn, retrieve_fn: RetrieveFn):
+def build_graph(
+    checkpointer,
+    classify_complete_fn: CompleteFn,
+    compose_complete_fn: CompleteFn,
+    retrieve_fn: RetrieveFn,
+):
     """Build and compile the classify_intent -> retrieve -> compose_response
     -> verify_citations -> finalize graph, wired to `checkpointer` for
-    persistence, `complete_fn` for all LLM calls, and `retrieve_fn` for
-    knowledge retrieval (see module docstring for why both are injected
-    rather than this module importing `resolvegrid_api` directly).
+    persistence, `retrieve_fn` for knowledge retrieval (see module docstring
+    for why it's injected rather than this module importing `resolvegrid_api`
+    directly), and TWO separate `CompleteFn`s -- one per LLM-calling node.
+
+    Phase 11 Task 3 -- why two `CompleteFn`s instead of one shared one
+    (read this before reverting to a single `complete_fn` parameter):
+    `classify_intent` and `compose_response` each need their own real
+    `ModelCall` `purpose` string (`"...classify_intent"` vs
+    `"...compose_response"`) so a real completion's cost/latency/trace can
+    be attributed to the node that actually made it. A single shared
+    `CompleteFn` callable has no way to tell which node is calling it --
+    it only ever receives a prompt string, never a node name (see this
+    module's docstring for why `CompleteFn` is deliberately kept that
+    narrow: `apps/api` must remain the only place that knows about
+    `CompletionResult`/logging, and this package must stay ignorant of it).
+    `make_classify_intent_node`/`make_compose_response_node` already each
+    take their OWN `complete_fn` parameter independently (unchanged by this
+    task) -- the only thing that needed to change is `build_graph` itself,
+    which used to hand both factories the SAME object. Real callers
+    (`apps/api`'s `main.py`, `eval_worker.py`) now build two distinct
+    closures, each already carrying its own `purpose` via how it was
+    constructed (see those modules for the real logging closures) -- a
+    test harness that doesn't care about purpose attribution (e.g.
+    `services/agent-orchestration/tests/test_graph.py`) can still pass the
+    SAME plain callable for both arguments, since nothing here requires
+    them to be different objects.
 
     Phase 8 Task 7 adds `verify_citations` between `compose_response` and
     `finalize` -- see `verify_citations_node`'s docstring for what it
     checks and the graph-level consequence of a fabricated citation.
     """
     builder = StateGraph(AgentState)
-    builder.add_node("classify_intent", make_classify_intent_node(complete_fn))
+    builder.add_node("classify_intent", make_classify_intent_node(classify_complete_fn))
     builder.add_node("retrieve", make_retrieve_node(retrieve_fn))
-    builder.add_node("compose_response", make_compose_response_node(complete_fn))
+    builder.add_node("compose_response", make_compose_response_node(compose_complete_fn))
     builder.add_node("verify_citations", verify_citations_node)
     builder.add_node("finalize", finalize)
     builder.add_edge(START, "classify_intent")

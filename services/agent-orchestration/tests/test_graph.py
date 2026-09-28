@@ -317,7 +317,12 @@ def test_build_graph_runs_end_to_end_with_mocked_completion_and_memory_checkpoin
         return {"chunks": [], "sufficient": False}
 
     checkpointer = InMemorySaver()
-    graph = build_graph(checkpointer, fake_complete, fake_retrieve)
+    # Phase 11 Task 3: build_graph now takes two CompleteFns (one per
+    # LLM-calling node) -- this test doesn't care about purpose
+    # attribution, so the same fake object is passed for both; call-count
+    # tracking still works correctly since it's the same underlying
+    # callable either way.
+    graph = build_graph(checkpointer, fake_complete, fake_complete, fake_retrieve)
 
     initial_state = _state(
         thread_id="test-thread-1",
@@ -374,7 +379,7 @@ def test_build_graph_runs_end_to_end_with_sufficient_retrieval_produces_citation
         }
 
     checkpointer = InMemorySaver()
-    graph = build_graph(checkpointer, fake_complete, fake_retrieve)
+    graph = build_graph(checkpointer, fake_complete, fake_complete, fake_retrieve)
 
     result = graph.invoke(
         _state(thread_id="test-thread-2", input_text="What is the VPN policy?"),
@@ -422,7 +427,7 @@ def test_build_graph_strips_a_fabricated_citation_before_finalize():
         }
 
     checkpointer = InMemorySaver()
-    graph = build_graph(checkpointer, fake_complete, fake_retrieve)
+    graph = build_graph(checkpointer, fake_complete, fake_complete, fake_retrieve)
 
     result = graph.invoke(
         _state(thread_id="test-thread-3", input_text="What is the VPN policy?"),

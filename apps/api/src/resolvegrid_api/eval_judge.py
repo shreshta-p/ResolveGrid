@@ -8,18 +8,24 @@ docstring for the dependency-direction rule this enforces
 (`services/evaluation` must never import `apps/api`/the real gateway
 directly; it only ever takes a `complete_fn`-shaped callable).
 
-`real_complete_fn` is built exactly the way `apps/api/src/resolvegrid_api/
-main.py`'s app lifespan already builds the chat graph's `CompleteFn`
-closure: `complete_fn = lambda prompt: llm_gateway.complete(prompt).text`
-(see `main.py`). Reused verbatim here rather than re-derived, since it is
-already the established, tested pattern for turning
-`llm_gateway.complete`'s richer `CompletionResult` into the narrow
-prompt-in/text-out shape every `CompleteFn`-shaped consumer in this
-codebase expects.
+Phase 11 Task 3: `real_complete_fn` is now built via
+`resolvegrid_api.model_call_logging.make_logging_complete_fn` (the same
+shared factory `main.py`'s/`eval_worker.py`'s real chat-graph closures use)
+instead of the original bare `lambda prompt: llm_gateway.complete(prompt)
+.text` -- every real judge completion this closure makes now also writes a
+real `ModelCall` row (`purpose="eval.judge"`), closing the gap the phase's
+audit found: judge completions were real LLM calls that were never logged
+at all. `make_logging_complete_fn` opens its own short-lived session per
+call via `resolvegrid_api.db.session_factory()`, exactly like
+`agent_retrieval.py`'s established `retrieve_for_agent` pattern (this
+module is built at import time, same as those, so it has no per-request
+session to close over either -- see that factory's own docstring for the
+full rationale).
 """
 
 from pathlib import Path
 
+from opentelemetry import trace
 from resolvegrid_evaluation.judge import (
     AgreementReport,
     CalibrationCase,
@@ -31,7 +37,8 @@ from resolvegrid_evaluation.judge import (
 )
 from resolvegrid_evaluation.schema import EvalCase
 
-from resolvegrid_api import llm_gateway
+from resolvegrid_api.db import session_factory
+from resolvegrid_api.model_call_logging import make_logging_complete_fn
 
 __all__ = [
     "real_complete_fn",
@@ -42,13 +49,18 @@ __all__ = [
     "JudgeVerdict",
 ]
 
+# The global tracer provider is already configured once at app startup by
+# main.py's lifespan hook (resolvegrid_telemetry.init_tracing) -- this module
+# must NOT call init_tracing again, just bind a tracer to whatever provider is
+# globally registered by the time a span is actually started (same pattern as
+# routers/chat.py/routers/tickets.py/eval_worker.py).
+tracer = trace.get_tracer(__name__)
 
-def real_complete_fn(prompt: str) -> str:
-    """The real `CompleteFn` closure: calls the real LiteLLM/Ollama-backed
-    gateway and returns just the completion text, matching every other
-    `CompleteFn` consumer in this codebase (see module docstring).
-    """
-    return llm_gateway.complete(prompt).text
+# The real `CompleteFn` closure: a real completion through the real
+# LiteLLM/Ollama-backed gateway, logged as a real `ModelCall` row (see
+# module docstring). Built once at import time -- matches every other real
+# `CompleteFn` closure in this codebase's "built once, not per-call" shape.
+real_complete_fn = make_logging_complete_fn(session_factory, tracer, purpose="eval.judge")
 
 
 def judge_response_real(case: EvalCase, actual_result: dict) -> list[JudgeVerdict]:

@@ -29,6 +29,8 @@ raised outside any span entirely. No test depends on either shape; this is
 a deliberate outcome of the extraction, not an oversight.
 """
 
+from typing import Callable
+
 from opentelemetry import trace as otel_trace
 from opentelemetry.trace import Tracer
 from sqlalchemy import select
@@ -169,3 +171,64 @@ def log_completion(
         )
     )
     return result
+
+
+def make_logging_complete_fn(
+    session_factory_fn: Callable[[], Session],
+    tracer: Tracer,
+    *,
+    purpose: str,
+    model: str = llm_gateway.DEFAULT_MODEL,
+) -> Callable[[str], str]:
+    """Build a plain `Callable[[str], str]` ("CompleteFn"-shaped, matching
+    `resolvegrid_agent_orchestration.graph.CompleteFn` and every other
+    `CompleteFn`-consuming seam in this codebase, e.g. `eval_judge.py`'s
+    real judge closure) that opens its OWN short-lived session via
+    `session_factory_fn()`, runs a real completion through `log_completion`
+    under it, commits, and returns just the completion text.
+
+    Phase 11 Task 3: this is the one shared shape every real "closure that
+    needs to log a `ModelCall` row but is built once, outside any
+    per-request `Depends(get_db)` scope" call site uses --
+    `apps/api/main.py`'s chat-graph `classify_intent`/`compose_response`
+    closures, `eval_worker.py`'s own (separately built, per that module's
+    docstring) chat-graph closures, and `eval_judge.py`'s real judge
+    closure -- rather than duplicating the same open-session/log/commit
+    /return-text shape three times. Mirrors `agent_retrieval.py`'s
+    already-established `retrieve_for_agent` pattern exactly (see that
+    module's docstring for the full "why session_factory(), not a shared
+    request session" rationale): a closure built once at app/worker
+    startup cannot close over a live per-request `Session` (there isn't
+    one yet, and `AgentState` can never carry one across a checkpointed
+    graph run -- see `state.py`'s module docstring), so it opens its own
+    per-call session instead, commits immediately (this closure -- unlike
+    `log_completion` itself -- DOES own its own commit boundary, since
+    there is no enclosing request/case handler positioned to do it for
+    it), and hands back a live-DB-session-free `str`, the only thing
+    `CompleteFn`'s contract requires.
+
+    Not a "new global/module-level session": `session_factory_fn` is
+    itself passed in as ordinary dependency injection (real call sites
+    pass `resolvegrid_api.db.session_factory` -- itself just a factory
+    function, not a shared session object) and a genuinely fresh `Session`
+    is opened and closed on every single call.
+    """
+
+    def complete_fn(prompt: str) -> str:
+        with session_factory_fn() as session:
+            # Mirrors routers/tickets.py's summarize_ticket commit-on-both
+            # -paths precedent exactly (see that module's comment): on
+            # `LLMGatewayError`, log_completion() has already session.add()'d
+            # an error-shaped ModelCall row and re-raises -- that row must
+            # still be committed here before the exception propagates, or
+            # `Session.__exit__`'s implicit rollback-on-uncommitted-work
+            # would silently discard it, leaving no trace of a real failure.
+            try:
+                result = log_completion(session, tracer, purpose=purpose, prompt=prompt, model=model)
+            except Exception:
+                session.commit()
+                raise
+            session.commit()
+            return result.text
+
+    return complete_fn

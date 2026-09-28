@@ -9,7 +9,7 @@ from sqlalchemy import delete, func, select
 from resolvegrid_api.ingestion_worker import run_seed_corpus_ingestion
 from resolvegrid_api.llm_gateway import CompletionResult
 from resolvegrid_api.main import app
-from resolvegrid_api.models import AgentRun, Department, Employee, Location, Span
+from resolvegrid_api.models import AgentRun, Department, Employee, Location, ModelCall, Span
 from resolvegrid_api.models.knowledge import Chunk, Document, DocumentVersion, Embedding, IngestionRun
 from resolvegrid_api.seed_corpus import load_seed_corpus
 
@@ -190,6 +190,13 @@ def test_chat_success_writes_agent_run_and_four_success_spans(chat_fixtures, raw
     requester = chat_fixtures
     message = "What is a VPN?"
 
+    # Phase 11 Task 3: watermark ModelCall.id BEFORE this turn, so the
+    # assertions below can identify exactly which rows THIS chat turn wrote
+    # (ModelCall is an accumulating log table -- like every other test that
+    # asserts against it in this codebase, e.g. test_ticket_summarize.py --
+    # rows are never cleaned up afterward).
+    before_max_model_call_id = raw_db_session.scalar(select(func.max(ModelCall.id))) or 0
+
     # Two-call pattern matching the real graph: classify_intent calls
     # complete_fn once (expects JSON), compose_response calls it again
     # (expects plain answer text). Exercising the "well-formed classification"
@@ -237,6 +244,31 @@ def test_chat_success_writes_agent_run_and_four_success_spans(chat_fixtures, raw
     assert len(spans) == 4
     assert all(s.status == "success" for s in spans)
 
+    # Phase 11 Task 3's core exit criterion: a real chat turn now writes a
+    # real ModelCall row for BOTH classify_intent and compose_response --
+    # not just summarize_ticket (Task 1's only prior call site). Each is
+    # written by main.py's real per-node `make_logging_complete_fn` closure
+    # (see that module's lifespan), on its own session_factory() session,
+    # committed independently of this handler's own request-scoped session
+    # -- hence querying via raw_db_session (a separate, real connection)
+    # rather than the request's own session, which this test has no direct
+    # handle on anyway.
+    new_model_calls = raw_db_session.scalars(
+        select(ModelCall).where(ModelCall.id > before_max_model_call_id).order_by(ModelCall.id)
+    ).all()
+    purposes = [c.purpose for c in new_model_calls]
+    assert "chat.classify_intent" in purposes
+    assert "chat.compose_response" in purposes
+    for call in new_model_calls:
+        assert call.status == "success"
+        assert call.provider == "ollama"
+        assert call.model == "local-qwen3"
+        # Real OTel trace id capture (Task 1) -- 32-char lowercase hex,
+        # never the reserved all-zero invalid sentinel.
+        assert call.trace_id is not None
+        assert len(call.trace_id) == 32
+        assert call.trace_id != "0" * 32
+
 
 def _sleepy_complete_side_effect(classify_sleep_s: float, compose_sleep_s: float, answer_text: str):
     """Build a `resolvegrid_api.llm_gateway.complete` `side_effect` that
@@ -257,7 +289,17 @@ def _sleepy_complete_side_effect(classify_sleep_s: float, compose_sleep_s: float
     """
     calls = {"n": 0}
 
-    def _side_effect(prompt: str) -> CompletionResult:
+    def _side_effect(prompt: str, *, model: str = "local-qwen3") -> CompletionResult:
+        # Phase 11 Task 3: real chat-graph closures now call
+        # `llm_gateway.complete(prompt, model=model)` (via `log_completion`,
+        # same as summarize_ticket already did) instead of the old bare
+        # `llm_gateway.complete(prompt)` -- this mocked side_effect must
+        # accept that keyword too, or Mock's argument-binding itself raises
+        # a TypeError before this function's body (including its real
+        # `time.sleep()`) ever runs, which classify_intent's own
+        # `except (..., TypeError)` soft-degrade path would then silently
+        # swallow -- exactly the failure mode this comment documents so a
+        # future reader doesn't have to re-diagnose it.
         calls["n"] += 1
         if calls["n"] == 1:
             time.sleep(classify_sleep_s)
@@ -490,7 +532,10 @@ def test_chat_retrieves_and_cites_public_seed_corpus_chunk(chat_fixtures, seed_c
     # the first real id it sees, rather than guessing one.
     _call_count = {"n": 0}
 
-    def _complete_side_effect(prompt: str) -> CompletionResult:
+    def _complete_side_effect(prompt: str, *, model: str = "local-qwen3") -> CompletionResult:
+        # See `_sleepy_complete_side_effect`'s identical comment (Phase 11
+        # Task 3): real closures now call `llm_gateway.complete(prompt,
+        # model=model)`, so this side_effect must accept `model` too.
         _call_count["n"] += 1
         if _call_count["n"] == 1:
             # 1st call: classify_intent's prompt.

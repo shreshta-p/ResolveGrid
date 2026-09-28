@@ -51,7 +51,7 @@ if not hasattr(signal, "SIGUSR1"):
 import resolvegrid_api.eval_worker as eval_worker_module
 from resolvegrid_api.eval_worker import REDIS_URL, WorkerSettings, run_eval_suite
 from resolvegrid_api.ingestion_worker import run_seed_corpus_ingestion
-from resolvegrid_api.models import ApprovalDecision, ApprovalRequest, Employee
+from resolvegrid_api.models import ApprovalDecision, ApprovalRequest, Employee, ModelCall
 from resolvegrid_api.models.evaluation import EvalCaseResult, EvalRun
 from resolvegrid_api.models.knowledge import Chunk, Document, DocumentVersion, Embedding, IngestionRun
 from resolvegrid_api.models.org import EmployeeEntitlement
@@ -145,6 +145,17 @@ def test_run_eval_suite_creates_completed_eval_run_with_real_case_coverage(monke
     db_session.flush()
 
     before = _side_effect_watermarks(raw_db_session)
+    # Phase 11 Task 3: watermark ModelCall.id too -- this test's CI sample
+    # set (_CI_SAMPLE_CASE_IDS above) includes "chat.greeting.001", so this
+    # run genuinely exercises the chat dimension's real graph invocation
+    # (_execute_graph_dimension_cases -> _run_chat_case), which is exactly
+    # where eval_worker.py's own real ModelCall-logging closures (built
+    # fresh per suite run, distinct from main.py's app-lifetime ones -- see
+    # that module's docstring) get exercised. A targeted assertion added to
+    # this ALREADY-real, already-slow test, per this task's brief, rather
+    # than a whole new test that would re-pay the same real-Ollama/real-DB
+    # setup cost just to prove the same wiring.
+    before_max_model_call_id = raw_db_session.scalar(select(func.max(ModelCall.id))) or 0
     try:
         run = run_eval_suite(db_session)
         db_session.flush()
@@ -196,6 +207,19 @@ def test_run_eval_suite_creates_completed_eval_run_with_real_case_coverage(monke
         assert "approval.grant_vpn_access.approved.001" in approval_results
         approved_details = json.loads(approval_results["approval.grant_vpn_access.approved.001"].details_json)
         assert approved_details["approval_compliance"]["passed"] is True
+
+        # Phase 11 Task 3's core exit criterion for the eval-worker call
+        # site: this run's real chat-dimension case ("chat.greeting.001")
+        # must have produced real ModelCall rows for BOTH classify_intent
+        # and compose_response, via eval_worker.py's OWN real logging
+        # closures (confirmed distinct from main.py's -- see that module's
+        # docstring) -- not just main.py's app-lifetime chat traffic.
+        new_model_calls = raw_db_session.scalars(
+            select(ModelCall).where(ModelCall.id > before_max_model_call_id).order_by(ModelCall.id)
+        ).all()
+        eval_chat_purposes = [c.purpose for c in new_model_calls if c.purpose.startswith("eval.chat.")]
+        assert "eval.chat.classify_intent" in eval_chat_purposes
+        assert "eval.chat.compose_response" in eval_chat_purposes
     finally:
         _cleanup_side_effects(raw_db_session, before)
 

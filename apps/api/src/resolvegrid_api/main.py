@@ -10,11 +10,11 @@ from opentelemetry import trace
 from resolvegrid_agent_orchestration import build_graph, build_tool_invocation_graph
 from resolvegrid_telemetry import init_tracing
 
-from resolvegrid_api import llm_gateway
 from resolvegrid_api.agent_mutation_execution import execute_mutation_for_agent
 from resolvegrid_api.agent_retrieval import retrieve_for_agent
 from resolvegrid_api.approval_service import request_approval_for_agent
-from resolvegrid_api.db import DATABASE_URL
+from resolvegrid_api.db import DATABASE_URL, session_factory
+from resolvegrid_api.model_call_logging import make_logging_complete_fn
 from resolvegrid_api.routers import approvals, chat, directory, evals, tickets, tools
 
 # `langgraph-checkpoint-postgres`'s AsyncPostgresSaver uses psycopg's async
@@ -81,16 +81,35 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         # re-runs this lifespan once per test file that imports `app` at
         # module level.
         await checkpointer.setup()
-        complete_fn = lambda prompt: llm_gateway.complete(prompt).text  # noqa: E731
+        # Phase 11 Task 3: two distinct real, ModelCall-logging closures --
+        # one per LLM-calling graph node -- built via
+        # `model_call_logging.make_logging_complete_fn`, each opening its
+        # OWN short-lived session per call via `session_factory()` (same
+        # "built once at startup, no per-request session available" reason
+        # `retrieve_for_agent` below already handles this way -- see its
+        # module docstring). Each closure already carries its own `purpose`
+        # (`"chat.classify_intent"` / `"chat.compose_response"`) via how it
+        # was constructed here, which is what lets a real completion's
+        # cost/latency/trace be attributed to the node that actually made
+        # it -- see `build_graph`'s own docstring (`graph.py`) for why this
+        # needs two separate closures rather than one shared `complete_fn`.
+        classify_complete_fn = make_logging_complete_fn(
+            session_factory, tracer, purpose="chat.classify_intent"
+        )
+        compose_complete_fn = make_logging_complete_fn(
+            session_factory, tracer, purpose="chat.compose_response"
+        )
         # `retrieve_for_agent` (Phase 7 Task 7) is passed directly, not
-        # wrapped in a lambda like `complete_fn` -- its signature already
+        # wrapped like the two complete_fns above -- its signature already
         # matches `RetrieveFn` exactly (`(query_text, retrieval_scope) ->
         # RetrievalOutcome`), so no adapter is needed. See
         # `agent_retrieval.py`'s module docstring for why it's built here
         # (once, at startup) rather than per-request, and how it still
         # gets per-request DB/authz behavior without a live Session ever
         # crossing into checkpointed graph state.
-        app.state.agent_graph = build_graph(checkpointer, complete_fn, retrieve_for_agent)
+        app.state.agent_graph = build_graph(
+            checkpointer, classify_complete_fn, compose_complete_fn, retrieve_for_agent
+        )
         # Phase 9 Task 7a: a second, separate compiled graph
         # (`request_approval -> execute_mutation`) sharing this SAME
         # checkpointer instance -- confirmed safe by reading the installed
