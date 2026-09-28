@@ -14,6 +14,7 @@ services:
     volumes:
       - postgres_data:/var/lib/postgresql/data
       - ./postgres/init-litellm-db.sh:/docker-entrypoint-initdb.d/init-litellm-db.sh:ro
+      - ./postgres/init-langfuse-db.sh:/docker-entrypoint-initdb.d/init-langfuse-db.sh:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-resolvegrid} -d ${POSTGRES_DB:-resolvegrid}"]
       interval: 5s
@@ -62,11 +63,20 @@ services:
     container_name: resolvegrid-otel-collector
     restart: unless-stopped
     command: ["--config=/etc/otel-collector-config.yaml"]
+    environment:
+      # Real Langfuse project API keypair (Phase 11 Task 5) -- the
+      # config.yaml `basicauth/langfuse` extension reads these via
+      # `${env:...}`. Real values live only in .env, never here.
+      LANGFUSE_PUBLIC_KEY: ${LANGFUSE_PROJECT_PUBLIC_KEY:?LANGFUSE_PROJECT_PUBLIC_KEY must be set in .env}
+      LANGFUSE_SECRET_KEY: ${LANGFUSE_PROJECT_SECRET_KEY:?LANGFUSE_PROJECT_SECRET_KEY must be set in .env}
     volumes:
       - ./otel-collector/config.yaml:/etc/otel-collector-config.yaml:ro
     ports:
       - "4317:4317"
       - "4318:4318"
+    depends_on:
+      langfuse-web:
+        condition: service_started
 
   litellm:
     image: ghcr.io/berriai/litellm:main-stable
@@ -104,6 +114,180 @@ services:
       timeout: 5s
       retries: 10
 
+  # --- Langfuse (Phase 11 Task 5: real self-hosted trace observability) ---
+  #
+  # Reuse decisions (see docs/DECISION_LOG.md for the full write-up):
+  #  - Postgres: REUSES this compose's shared `postgres` container, via a
+  #    dedicated `langfuse` database (infra/postgres/init-langfuse-db.sh),
+  #    the exact same "own database, same container" pattern already proven
+  #    safe for `litellm` above -- NOT a shared-schema reuse (Prisma
+  #    migrate-deploy only ever sees its own tables in a database nothing
+  #    else touches).
+  #  - Redis: its OWN dedicated container. Langfuse's BullMQ worker requires
+  #    `--requirepass` + `maxmemory-policy noeviction` on whatever Redis it
+  #    talks to; forcing that auth/eviction-policy change onto the existing
+  #    unauthenticated `redis` container (shared by apps/api's arq workers)
+  #    would be an invasive, blast-radius-widening change to a resource other
+  #    real code already depends on, just to save one small container. Not
+  #    worth the risk for a lightweight service.
+  #  - ClickHouse, MinIO: neither exists anywhere else in this stack, so both
+  #    are new, dedicated containers -- there is nothing safe to reuse.
+  langfuse-clickhouse:
+    image: docker.io/clickhouse/clickhouse-server:25.12
+    container_name: resolvegrid-langfuse-clickhouse
+    restart: unless-stopped
+    user: "101:101"
+    environment:
+      CLICKHOUSE_DB: default
+      CLICKHOUSE_USER: clickhouse
+      CLICKHOUSE_PASSWORD: ${LANGFUSE_CLICKHOUSE_PASSWORD:?LANGFUSE_CLICKHOUSE_PASSWORD must be set in .env}
+    volumes:
+      - langfuse_clickhouse_data:/var/lib/clickhouse
+      - langfuse_clickhouse_logs:/var/log/clickhouse-server
+    ports:
+      - "127.0.0.1:8124:8123"
+      - "127.0.0.1:9010:9000"
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8123/ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
+
+  langfuse-minio:
+    image: cgr.dev/chainguard/minio
+    container_name: resolvegrid-langfuse-minio
+    restart: unless-stopped
+    entrypoint: sh
+    # Pre-creates the 'langfuse' bucket before starting the service, matching
+    # Langfuse's own reference docker-compose.yml exactly.
+    command: -c 'mkdir -p /data/langfuse && minio server --address ":9000" --console-address ":9001" /data'
+    environment:
+      MINIO_ROOT_USER: minio
+      MINIO_ROOT_PASSWORD: ${LANGFUSE_MINIO_ROOT_PASSWORD:?LANGFUSE_MINIO_ROOT_PASSWORD must be set in .env}
+    ports:
+      - "127.0.0.1:9020:9000"
+      - "127.0.0.1:9021:9001"
+    volumes:
+      - langfuse_minio_data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 2s
+      timeout: 5s
+      retries: 10
+      start_period: 2s
+
+  langfuse-redis:
+    image: docker.io/redis:7
+    container_name: resolvegrid-langfuse-redis
+    restart: unless-stopped
+    command: >
+      --requirepass ${LANGFUSE_REDIS_AUTH:?LANGFUSE_REDIS_AUTH must be set in .env}
+      --maxmemory-policy noeviction
+    environment:
+      # Only so the healthcheck below (which runs inside this container) can
+      # authenticate -- the actual `--requirepass` value above is what the
+      # server enforces; this just hands the same value to the shell that
+      # probes it.
+      LANGFUSE_REDIS_AUTH: ${LANGFUSE_REDIS_AUTH:?LANGFUSE_REDIS_AUTH must be set in .env}
+    ports:
+      - "127.0.0.1:6381:6379"
+    volumes:
+      - langfuse_redis_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a \"$$LANGFUSE_REDIS_AUTH\" --no-auth-warning ping"]
+      interval: 3s
+      timeout: 5s
+      retries: 10
+
+  langfuse-worker: &langfuse-worker
+    image: docker.langfuse.com/langfuse/langfuse-worker:4
+    container_name: resolvegrid-langfuse-worker
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      langfuse-clickhouse:
+        condition: service_healthy
+      langfuse-minio:
+        condition: service_healthy
+      langfuse-redis:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:3031:3030"
+    environment: &langfuse-env
+      NEXTAUTH_URL: http://localhost:3050
+      # Dedicated `langfuse` database inside the SAME postgres container as
+      # apps/api/litellm -- see the reuse-decision comment block above.
+      DATABASE_URL: postgresql://${POSTGRES_USER:-resolvegrid}:${POSTGRES_PASSWORD:-resolvegrid_dev}@postgres:5432/langfuse
+      SALT: ${LANGFUSE_SALT:?LANGFUSE_SALT must be set in .env}
+      ENCRYPTION_KEY: ${LANGFUSE_ENCRYPTION_KEY:?LANGFUSE_ENCRYPTION_KEY must be set in .env}
+      TELEMETRY_ENABLED: "false"
+      CLICKHOUSE_MIGRATION_URL: clickhouse://langfuse-clickhouse:9000
+      CLICKHOUSE_URL: http://langfuse-clickhouse:8123
+      CLICKHOUSE_USER: clickhouse
+      CLICKHOUSE_PASSWORD: ${LANGFUSE_CLICKHOUSE_PASSWORD:?LANGFUSE_CLICKHOUSE_PASSWORD must be set in .env}
+      # Explicit "false" required -- leaving this var entirely unset (rather
+      # than passing its own documented default) made the migration runner
+      # try to create a ReplicatedMergeTree table, which needs Zookeeper/
+      # cluster config this single-node ClickHouse doesn't have. Found via a
+      # real failed boot (see docs/DECISION_LOG.md).
+      CLICKHOUSE_CLUSTER_ENABLED: "false"
+      LANGFUSE_S3_EVENT_UPLOAD_BUCKET: langfuse
+      LANGFUSE_S3_EVENT_UPLOAD_REGION: auto
+      LANGFUSE_S3_EVENT_UPLOAD_ACCESS_KEY_ID: minio
+      LANGFUSE_S3_EVENT_UPLOAD_SECRET_ACCESS_KEY: ${LANGFUSE_MINIO_ROOT_PASSWORD:?LANGFUSE_MINIO_ROOT_PASSWORD must be set in .env}
+      LANGFUSE_S3_EVENT_UPLOAD_ENDPOINT: http://langfuse-minio:9000
+      LANGFUSE_S3_EVENT_UPLOAD_FORCE_PATH_STYLE: "true"
+      LANGFUSE_S3_MEDIA_UPLOAD_BUCKET: langfuse
+      LANGFUSE_S3_MEDIA_UPLOAD_REGION: auto
+      LANGFUSE_S3_MEDIA_UPLOAD_ACCESS_KEY_ID: minio
+      LANGFUSE_S3_MEDIA_UPLOAD_SECRET_ACCESS_KEY: ${LANGFUSE_MINIO_ROOT_PASSWORD:?LANGFUSE_MINIO_ROOT_PASSWORD must be set in .env}
+      LANGFUSE_S3_MEDIA_UPLOAD_ENDPOINT: http://langfuse-minio:9000
+      LANGFUSE_S3_MEDIA_UPLOAD_FORCE_PATH_STYLE: "true"
+      REDIS_HOST: langfuse-redis
+      REDIS_PORT: "6379"
+      REDIS_AUTH: ${LANGFUSE_REDIS_AUTH:?LANGFUSE_REDIS_AUTH must be set in .env}
+
+  langfuse-web:
+    <<: *langfuse-worker
+    image: docker.langfuse.com/langfuse/langfuse:4
+    container_name: resolvegrid-langfuse-web
+    ports:
+      - "3050:3000"
+    environment:
+      <<: *langfuse-env
+      NEXTAUTH_SECRET: ${LANGFUSE_NEXTAUTH_SECRET:?LANGFUSE_NEXTAUTH_SECRET must be set in .env}
+      LANGFUSE_S3_MEDIA_UPLOAD_ENDPOINT: http://localhost:9020
+      LANGFUSE_S3_MEDIA_UPLOAD_INTERNAL_ENDPOINT: http://langfuse-minio:9000
+      # Headless-init bootstrap (Langfuse's own real, documented non-UI setup
+      # path -- https://langfuse.com/self-hosting/administration/headless-initialization):
+      # creates a real org/project/user/API-keypair on first boot if they
+      # don't already exist. Real values live only in .env (never printed);
+      # LANGFUSE_INIT_ORG_ID is REQUIRED for any of the others to take effect.
+      LANGFUSE_INIT_ORG_ID: ${LANGFUSE_INIT_ORG_ID:?LANGFUSE_INIT_ORG_ID must be set in .env}
+      LANGFUSE_INIT_ORG_NAME: ${LANGFUSE_INIT_ORG_NAME:-ResolveGrid}
+      LANGFUSE_INIT_PROJECT_ID: ${LANGFUSE_INIT_PROJECT_ID:?LANGFUSE_INIT_PROJECT_ID must be set in .env}
+      LANGFUSE_INIT_PROJECT_NAME: ${LANGFUSE_INIT_PROJECT_NAME:-ResolveGrid-Phase11}
+      LANGFUSE_INIT_PROJECT_PUBLIC_KEY: ${LANGFUSE_PROJECT_PUBLIC_KEY:?LANGFUSE_PROJECT_PUBLIC_KEY must be set in .env}
+      LANGFUSE_INIT_PROJECT_SECRET_KEY: ${LANGFUSE_PROJECT_SECRET_KEY:?LANGFUSE_PROJECT_SECRET_KEY must be set in .env}
+      LANGFUSE_INIT_USER_EMAIL: ${LANGFUSE_INIT_USER_EMAIL:?LANGFUSE_INIT_USER_EMAIL must be set in .env}
+      LANGFUSE_INIT_USER_NAME: ${LANGFUSE_INIT_USER_NAME:-ResolveGrid-Admin}
+      LANGFUSE_INIT_USER_PASSWORD: ${LANGFUSE_INIT_USER_PASSWORD:?LANGFUSE_INIT_USER_PASSWORD must be set in .env}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      langfuse-clickhouse:
+        condition: service_healthy
+      langfuse-minio:
+        condition: service_healthy
+      langfuse-redis:
+        condition: service_healthy
+
 volumes:
   postgres_data:
   ollama_data:
+  langfuse_clickhouse_data:
+  langfuse_clickhouse_logs:
+  langfuse_minio_data:
+  langfuse_redis_data:

@@ -9,13 +9,47 @@ receivers:
 processors:
   batch:
 
+# Phase 11 Task 5: real Langfuse instance (infra/docker-compose.yml's
+# langfuse-web/-worker/-clickhouse/-minio/-redis services). Langfuse's own
+# OTLP ingestion endpoint (real since self-hosted OSS >= 3.22.0; confirmed
+# against the actual v4 image pinned in docker-compose.yml) is HTTP-only --
+# "OTLP over HTTP (JSON/protobuf); gRPC is not supported" -- so this uses the
+# `otlphttp` exporter, not `otlp` (gRPC), pointed at
+# http://langfuse-web:3000/api/public/otel. Auth is HTTP Basic
+# (base64(public_key:secret_key)); the `basicauth` extension below builds
+# that from plain username/password so no pre-computed base64 secret has to
+# live in this file or in .env.
+extensions:
+  basicauth/langfuse:
+    client_auth:
+      # Real values injected via this container's own environment (see
+      # infra/docker-compose.yml's otel-collector service) -- sourced from
+      # .env's LANGFUSE_PROJECT_PUBLIC_KEY/LANGFUSE_PROJECT_SECRET_KEY,
+      # never hardcoded here.
+      username: ${env:LANGFUSE_PUBLIC_KEY}
+      password: ${env:LANGFUSE_SECRET_KEY}
+
 exporters:
   debug:
     verbosity: detailed
+  otlp_http/langfuse:
+    endpoint: http://langfuse-web:3000/api/public/otel
+    auth:
+      authenticator: basicauth/langfuse
+    headers:
+      # Langfuse v4: this header is what makes ingested spans appear in
+      # real time in the UI/API; without it, ingestion still succeeds but
+      # can lag up to ~15 minutes behind.
+      x-langfuse-ingestion-version: "4"
 
 service:
+  extensions: [basicauth/langfuse]
   pipelines:
     traces:
       receivers: [otlp]
       processors: [batch]
-      exporters: [debug]
+      # Both exporters run: `debug` keeps the existing container-log
+      # visibility, `otlphttp/langfuse` is the real, newly-added export to
+      # Langfuse -- not a replacement, per the plan's "alongside (or
+      # replacing)" wording.
+      exporters: [debug, otlp_http/langfuse]
