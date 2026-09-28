@@ -283,3 +283,49 @@ def test_complete_falls_back_to_master_key_when_virtual_key_env_var_unset(monkey
 
     _, kwargs = mock_post.call_args
     assert kwargs["headers"]["Authorization"] == f"Bearer {llm_gateway.LITELLM_MASTER_KEY}"
+
+
+def test_complete_respects_an_explicitly_empty_virtual_key_rather_than_swapping_to_master(monkeypatch):
+    # Code-review fix: `_resolve_api_key` checks `is not None`, not
+    # truthiness -- an env var explicitly set to "" is a deliberate
+    # override (mirrors LITELLM_MASTER_KEY's own os.environ.get(key,
+    # default) semantics, where the default only kicks in when the var is
+    # fully ABSENT) and must be sent as-is, not silently swapped for the
+    # master key the way a bare `if virtual_key` truthy check would.
+    monkeypatch.setattr(llm_gateway, "_MODEL_TO_VIRTUAL_KEY", {"cloud-primary": ""})
+
+    with patch("resolvegrid_api.llm_gateway.httpx.post", return_value=_mock_ok_response()) as mock_post:
+        complete("hello", model="cloud-primary")
+
+    _, kwargs = mock_post.call_args
+    assert kwargs["headers"]["Authorization"] == "Bearer "
+
+
+def test_every_non_default_model_group_has_a_virtual_key_mapping_entry():
+    """Important, code-review-flagged drift guard: `_MODEL_TO_VIRTUAL_KEY`
+    and `_MODEL_GROUP_TO_PROVIDER` are legitimately different mappings
+    (different key sets/purposes -- provider identity vs. caller-budget
+    identity) and must not be merged into one. But nothing else enforces
+    they stay in sync: if a future `model_name` is added to
+    `_MODEL_GROUP_TO_PROVIDER`/`infra/litellm/config.yaml` and its virtual
+    -key entry is simply forgotten here, `_resolve_api_key` silently
+    degrades that model to the shared master key -- quietly defeating this
+    whole task's per-provider budget-cap purpose, with no error/warning at
+    runtime. This test is the guard: every `model_name` in
+    `_MODEL_GROUP_TO_PROVIDER` OTHER than `DEFAULT_MODEL` (which
+    deliberately has no entry -- Ollama has no real per-call cost, so no
+    budget cap is warranted for it) must have at least a (possibly
+    `None`-valued) key in `_MODEL_TO_VIRTUAL_KEY`. A future model addition
+    that forgets this fails CI here instead of silently degrading budget
+    enforcement in production.
+    """
+    real_model_names = set(llm_gateway._MODEL_GROUP_TO_PROVIDER) - {llm_gateway.DEFAULT_MODEL}
+    missing = real_model_names - set(llm_gateway._MODEL_TO_VIRTUAL_KEY)
+    assert not missing, (
+        f"model_name(s) {missing} exist in _MODEL_GROUP_TO_PROVIDER but have no "
+        "entry (not even a None placeholder) in _MODEL_TO_VIRTUAL_KEY -- a real "
+        "call to one of these will silently authenticate with the shared master "
+        "key instead of a per-provider budget-capped virtual key. Add an entry "
+        "(a real env-var-backed key, or explicit None if this model_name is "
+        "intentionally never budget-capped) to _MODEL_TO_VIRTUAL_KEY."
+    )

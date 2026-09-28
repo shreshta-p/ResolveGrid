@@ -44,6 +44,7 @@ from typing import Callable
 
 from opentelemetry import trace as otel_trace
 from opentelemetry.trace import Tracer
+from resolvegrid_agent_orchestration import ComposeCompleteFn
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -264,7 +265,7 @@ def make_compose_routing_complete_fn(
     tracer: Tracer,
     *,
     purpose: str,
-) -> Callable[[str, str], str]:
+) -> ComposeCompleteFn:
     """Build the real, `ModelCall`-logging `ComposeCompleteFn` (Phase 11
     Task 4) `main.py` wires into `compose_response` -- the one node with a
     real, risk-aware routing policy (see `routing.py`'s module docstring).

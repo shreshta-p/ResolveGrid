@@ -192,7 +192,7 @@ through the existing `RetrieveFn`/`RetrievalOutcome` contract.
 
 import json
 import time
-from typing import Callable, TypedDict
+from typing import Callable, Protocol, TypedDict
 
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import interrupt
@@ -229,7 +229,23 @@ CompleteFn = Callable[[str], str]
 # hands over plain data (a prompt string and a risk_level string), never
 # imports `resolvegrid_api`, and has no idea `cloud-primary`/`local-qwen3`
 # exist.
-ComposeCompleteFn = Callable[[str, str], str]
+#
+# Code-review fix: a plain `Callable[[str, str], str]` gives no type-level
+# protection against an accidentally swapped call-site argument order (both
+# params are `str`, so `complete_fn(risk_level, prompt)` would type-check
+# fine while being silently wrong). `typing.Callable` itself cannot express
+# a keyword-only parameter, so this is a small `Protocol` instead -- its
+# `__call__` signature makes `risk_level` keyword-only, and the one real
+# call site (`make_compose_response_node` below) calls it as
+# `complete_fn(prompt, risk_level=risk_level)` accordingly. Every existing
+# `ComposeCompleteFn` implementation (the real closure `model_call_logging.
+# make_compose_routing_complete_fn` builds, `eval_worker.py`'s adapter, and
+# every test fake) already declares `risk_level` as an ordinary
+# positional-or-keyword parameter, which satisfies a keyword-only caller
+# with zero changes needed on the implementer side -- only this type and
+# its one call site needed to change.
+class ComposeCompleteFn(Protocol):
+    def __call__(self, prompt: str, *, risk_level: str) -> str: ...
 
 
 class RetrievalOutcome(TypedDict):
@@ -416,37 +432,42 @@ def make_compose_response_node(complete_fn: ComposeCompleteFn):
     timed on both paths so a completion failure's real cost is still
     accounted for, not silently dropped from the total.
 
-    Phase 11 Task 4: `complete_fn` is now a `ComposeCompleteFn`
-    (`Callable[[str, str], str]`), called with `(prompt, risk_level)` --
-    see that type alias's docstring above for why this node specifically
-    needs to pass `state["risk_level"]` through as a real call argument
-    rather than leaving it implicit in the prompt text. Defaults to `"low"`
-    when unset (mirrors `_COMPOSE_PROMPT_*_TEMPLATE`'s own
-    `state.get("risk_level") or "low"` fallback a few lines below, and
-    `routing.py`'s policy already treats any non-`"high"` value, including
-    an unrecognized one, as the safe/cheap default).
+    Phase 11 Task 4: `complete_fn` is now a `ComposeCompleteFn` (see that
+    type's docstring above), called as `complete_fn(prompt,
+    risk_level=risk_level)` -- `risk_level` is keyword-only at the call
+    site specifically so an accidental positional argument swap can't
+    silently pass the wrong `str` where the other belongs. `state["risk_
+    level"]` is computed once, at the top of this function, and reused for
+    both prompt-template rendering and this call -- see this node's own
+    `state.get("risk_level") or "low"` fallback below (mirrors `routing.py`'s
+    policy, which already treats any non-`"high"` value, including an
+    unrecognized one, as the safe/cheap default).
     """
 
     def compose_response(state: AgentState) -> dict:
         start = time.monotonic()
+        # Code-review fix: computed once and reused everywhere below
+        # (previously `state.get("risk_level") or "low"` was recomputed 3
+        # separate times -- twice inline in the prompt-template .format()
+        # calls, once again as the risk_level local passed to complete_fn).
+        risk_level = state.get("risk_level") or "low"
         chunks = state.get("retrieved_chunks") or []
         context_block = state.get("context_block") or ""
         if state.get("retrieval_sufficient") and chunks and context_block:
             prompt = _COMPOSE_PROMPT_WITH_CONTEXT_TEMPLATE.format(
                 intent=state.get("intent") or "unclear",
-                risk_level=state.get("risk_level") or "low",
+                risk_level=risk_level,
                 context_block=context_block,
                 input_text=state["input_text"],
             )
         else:
             prompt = _COMPOSE_PROMPT_NO_CONTEXT_TEMPLATE.format(
                 intent=state.get("intent") or "unclear",
-                risk_level=state.get("risk_level") or "low",
+                risk_level=risk_level,
                 input_text=state["input_text"],
             )
-        risk_level = state.get("risk_level") or "low"
         try:
-            text = complete_fn(prompt, risk_level)
+            text = complete_fn(prompt, risk_level=risk_level)
         except Exception as exc:  # noqa: BLE001 -- any completion failure, of
             # whatever concrete exception type `complete_fn` raises (this
             # package doesn't know or care -- see module docstring), should

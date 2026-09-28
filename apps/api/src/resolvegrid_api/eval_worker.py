@@ -781,8 +781,8 @@ async def _execute_graph_dimension_cases(
         session_factory, tracer, purpose="eval.chat.classify_intent"
     )
     # Phase 11 Task 4: `build_graph`'s `compose_complete_fn` parameter is now
-    # a `ComposeCompleteFn` (`Callable[[str, str], str]`, prompt +
-    # risk_level -- see graph.py's `ComposeCompleteFn` docstring), since
+    # a `ComposeCompleteFn` (a `Protocol` with a keyword-only `risk_level`
+    # param -- see graph.py's `ComposeCompleteFn` docstring), since
     # `main.py`'s real user-facing chat closure needs the extra argument to
     # drive its real risk-based cloud-routing policy. This eval harness
     # deliberately does NOT adopt that same routing policy: `_eval_compose_
@@ -801,6 +801,10 @@ async def _execute_graph_dimension_cases(
     )
 
     def compose_complete_fn(prompt: str, risk_level: str) -> str:
+        """Adapter satisfying `ComposeCompleteFn`'s shape while deliberately
+        ignoring `risk_level` -- see the comment above for why real
+        eval-suite traffic always stays on the zero-cost local model
+        regardless of a case's classified risk_level."""
         return _eval_compose_base_fn(prompt)
 
     async with AsyncPostgresSaver.from_conn_string(_CHECKPOINTER_DATABASE_URL) as checkpointer:

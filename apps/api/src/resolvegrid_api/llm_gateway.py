@@ -69,9 +69,17 @@ def _resolve_api_key(model: str) -> str:
     OpenAI credential LiteLLM itself uses server-side to actually serve the
     request (that's `infra/litellm/config.yaml`'s `api_key: os.environ/
     ANTHROPIC_API_KEY`/`OPENAI_API_KEY`, unchanged by this task).
+
+    Code-review fix: checks `is not None`, not truthiness -- an env var
+    that's explicitly set to `""` is a real, deliberate override (matching
+    `LITELLM_MASTER_KEY = os.environ.get("LITELLM_MASTER_KEY", <default>)`'s
+    own semantics, where the default only applies when the var is fully
+    ABSENT, never when it's present-but-empty) and must be returned as-is,
+    not silently swapped for the master key the way a bare truthy check
+    would.
     """
     virtual_key = _MODEL_TO_VIRTUAL_KEY.get(model)
-    return virtual_key if virtual_key else LITELLM_MASTER_KEY
+    return virtual_key if virtual_key is not None else LITELLM_MASTER_KEY
 
 
 @dataclass(frozen=True)
