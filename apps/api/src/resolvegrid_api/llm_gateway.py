@@ -9,6 +9,18 @@ LITELLM_BASE_URL = os.environ.get("LITELLM_BASE_URL", "http://localhost:4000")
 LITELLM_MASTER_KEY = os.environ.get("LITELLM_MASTER_KEY", "sk-resolvegrid-local-dev")
 DEFAULT_MODEL = "local-qwen3"
 
+# Phase 11 Task 4: per-provider LiteLLM virtual keys with real budget caps
+# (generated via LiteLLM's real `/key/generate` admin API against the live
+# proxy -- see docs/SECURITY.md's "Phase 11 Task 4" section for how and why).
+# `None` when unset (e.g. a fresh dev environment that hasn't generated them
+# yet) -- `_resolve_api_key` below degrades to the shared master key in that
+# case, matching this module's existing "missing config degrades to a safe
+# default" precedent (`LITELLM_MASTER_KEY` itself already does this) rather
+# than raising. NEVER log/print these values -- same standing constraint as
+# `ANTHROPIC_API_KEY`/`OPENAI_API_KEY`.
+LITELLM_CLOUD_PRIMARY_KEY = os.environ.get("LITELLM_CLOUD_PRIMARY_KEY")
+LITELLM_CLOUD_FALLBACK_KEY = os.environ.get("LITELLM_CLOUD_FALLBACK_KEY")
+
 # Maps a LiteLLM model_name (from infra/litellm/config.yaml) to the real
 # provider that serves it. Used to derive CompletionResult.provider correctly
 # even after a fallback (see complete()'s docstring) -- a small, explicit
@@ -31,6 +43,36 @@ _MODEL_GROUP_TO_PROVIDER = {
 # target model itself was valid.
 _THINK_FALSE_MODELS = {DEFAULT_MODEL}
 
+# Phase 11 Task 4: which real virtual key a given LiteLLM `model_name`
+# authenticates as. `local-qwen3` deliberately has NO entry here -- it keeps
+# using the shared master key unconditionally (see `_resolve_api_key`'s
+# fallback below), since Ollama has no real per-call cost and therefore
+# nothing worth a per-provider budget cap. Built as an explicit dict, not a
+# formula, for the same reason `_MODEL_GROUP_TO_PROVIDER` above is: there are
+# only 2 budget-capped model_names today and this stays trivially correct as
+# more are added.
+_MODEL_TO_VIRTUAL_KEY = {
+    "cloud-primary": LITELLM_CLOUD_PRIMARY_KEY,
+    "cloud-fallback": LITELLM_CLOUD_FALLBACK_KEY,
+}
+
+
+def _resolve_api_key(model: str) -> str:
+    """Return the real bearer token `complete()` should authenticate to the
+    LiteLLM proxy with for a given `model_name` -- the model's own
+    budget-capped virtual key when one has been generated and stored in
+    `.env` (see module-level docstring comment), otherwise the shared
+    `LITELLM_MASTER_KEY` (the pre-Task-4 behavior, still correct for
+    `local-qwen3` and for any environment that hasn't generated virtual keys
+    yet). This selects which CALLER identity/budget authenticates to the
+    LiteLLM proxy -- it has no bearing on which real upstream Anthropic/
+    OpenAI credential LiteLLM itself uses server-side to actually serve the
+    request (that's `infra/litellm/config.yaml`'s `api_key: os.environ/
+    ANTHROPIC_API_KEY`/`OPENAI_API_KEY`, unchanged by this task).
+    """
+    virtual_key = _MODEL_TO_VIRTUAL_KEY.get(model)
+    return virtual_key if virtual_key else LITELLM_MASTER_KEY
+
 
 @dataclass(frozen=True)
 class CompletionResult:
@@ -51,6 +93,27 @@ class CompletionResult:
 
 class LLMGatewayError(Exception):
     pass
+
+
+def provider_for_model(model: str) -> str:
+    """Public lookup of the real provider that serves a given LiteLLM
+    `model_name` (from `infra/litellm/config.yaml`) -- e.g.
+    `"cloud-primary"` -> `"anthropic"`. Exposed (not left as the private
+    `_MODEL_GROUP_TO_PROVIDER` dict this module already keeps for
+    `complete()`'s own post-response provider derivation) specifically so
+    `model_call_logging.log_completion`'s error path (Phase 11 Task 4) can
+    derive a real provider for an ERROR-shaped `ModelCall` row too --
+    before this task, that path hardcoded `provider="ollama"` unconditionally
+    (correct only because no non-local model was ever actually requested
+    yet; see that module's pre-Task-4 comment, which flagged this exact gap
+    by name). Once real routing (this task) can request `cloud-primary`/
+    `cloud-fallback`, a failed call to either must not be mislabeled
+    "ollama" in its own error row. Falls back to `"unknown"` for a
+    `model_name` this mapping doesn't recognize, matching `complete()`'s own
+    degrade-rather-than-raise precedent for an unrecognized
+    `serving_model_group`/`model` string.
+    """
+    return _MODEL_GROUP_TO_PROVIDER.get(model, "unknown")
 
 
 def complete(prompt: str, *, model: str = DEFAULT_MODEL, timeout_seconds: float = 60.0) -> CompletionResult:
@@ -100,7 +163,7 @@ def complete(prompt: str, *, model: str = DEFAULT_MODEL, timeout_seconds: float 
     try:
         response = httpx.post(
             f"{LITELLM_BASE_URL}/v1/chat/completions",
-            headers={"Authorization": f"Bearer {LITELLM_MASTER_KEY}"},
+            headers={"Authorization": f"Bearer {_resolve_api_key(model)}"},
             json=request_body,
             timeout=timeout_seconds,
         )

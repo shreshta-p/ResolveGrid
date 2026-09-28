@@ -206,6 +206,31 @@ from resolvegrid_agent_orchestration.state import AgentState, RetrievedChunk
 # module docstring for why this package doesn't touch `CompletionResult`.
 CompleteFn = Callable[[str], str]
 
+# Phase 11 Task 4: `compose_response`'s own completion function, widened by
+# exactly one real argument -- `risk_level` -- beyond the plain `CompleteFn`
+# every other node still uses. `apps/api`'s real model-routing policy
+# (`resolvegrid_api.routing.select_model_for_risk_level`) needs the
+# CLASSIFIED risk_level to decide whether a given call should leave the
+# zero-cost local model for a real paid cloud completion (see the plan doc's
+# Task 4 section, which is explicit that this decision keys off
+# `state["risk_level"]`) -- and `state["risk_level"]` only exists inside
+# THIS package's `AgentState`, never inside the prompt-only `CompleteFn`
+# contract a closure built once at `apps/api` startup could otherwise
+# introspect. Rather than parsing risk_level back out of the prompt text
+# (fragile: it would silently couple real routing correctness to
+# `_COMPOSE_PROMPT_*_TEMPLATE`'s exact wording, breakable by an unrelated
+# prompt-copy edit with no test failure to catch it), `make_compose_response_
+# node` below passes it as a real, explicit second argument instead --
+# exactly the kind of narrow, justified `CompleteFn`-shape change Task 3's
+# own docstring already anticipated ("CompleteFn's signature can change...").
+# This does NOT weaken the dependency-direction rule: the real routing
+# DECISION still lives entirely in `apps/api` (`routing.py`, called from
+# inside the real closure `main.py` builds) -- this package still only ever
+# hands over plain data (a prompt string and a risk_level string), never
+# imports `resolvegrid_api`, and has no idea `cloud-primary`/`local-qwen3`
+# exist.
+ComposeCompleteFn = Callable[[str, str], str]
+
 
 class RetrievalOutcome(TypedDict):
     """Return shape `RetrieveFn` must produce -- exactly what the
@@ -359,7 +384,7 @@ def make_classify_intent_node(complete_fn: CompleteFn):
     return classify_intent
 
 
-def make_compose_response_node(complete_fn: CompleteFn):
+def make_compose_response_node(complete_fn: ComposeCompleteFn):
     """Build the `compose_response` node bound to a given completion function.
 
     Calls `complete_fn` again with the original input text (plus the
@@ -390,6 +415,16 @@ def make_compose_response_node(complete_fn: CompleteFn):
     and appends the real elapsed ms to `state["node_latencies_ms"]` --
     timed on both paths so a completion failure's real cost is still
     accounted for, not silently dropped from the total.
+
+    Phase 11 Task 4: `complete_fn` is now a `ComposeCompleteFn`
+    (`Callable[[str, str], str]`), called with `(prompt, risk_level)` --
+    see that type alias's docstring above for why this node specifically
+    needs to pass `state["risk_level"]` through as a real call argument
+    rather than leaving it implicit in the prompt text. Defaults to `"low"`
+    when unset (mirrors `_COMPOSE_PROMPT_*_TEMPLATE`'s own
+    `state.get("risk_level") or "low"` fallback a few lines below, and
+    `routing.py`'s policy already treats any non-`"high"` value, including
+    an unrecognized one, as the safe/cheap default).
     """
 
     def compose_response(state: AgentState) -> dict:
@@ -409,8 +444,9 @@ def make_compose_response_node(complete_fn: CompleteFn):
                 risk_level=state.get("risk_level") or "low",
                 input_text=state["input_text"],
             )
+        risk_level = state.get("risk_level") or "low"
         try:
-            text = complete_fn(prompt)
+            text = complete_fn(prompt, risk_level)
         except Exception as exc:  # noqa: BLE001 -- any completion failure, of
             # whatever concrete exception type `complete_fn` raises (this
             # package doesn't know or care -- see module docstring), should
@@ -856,7 +892,7 @@ def build_graph(
     checkpointer,
     *,
     classify_complete_fn: CompleteFn,
-    compose_complete_fn: CompleteFn,
+    compose_complete_fn: ComposeCompleteFn,
     retrieve_fn: RetrieveFn,
 ):
     """Build and compile the classify_intent -> retrieve -> compose_response

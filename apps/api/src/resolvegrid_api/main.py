@@ -14,7 +14,7 @@ from resolvegrid_api.agent_mutation_execution import execute_mutation_for_agent
 from resolvegrid_api.agent_retrieval import retrieve_for_agent
 from resolvegrid_api.approval_service import request_approval_for_agent
 from resolvegrid_api.db import DATABASE_URL, session_factory
-from resolvegrid_api.model_call_logging import make_logging_complete_fn
+from resolvegrid_api.model_call_logging import make_compose_routing_complete_fn, make_logging_complete_fn
 from resolvegrid_api.routers import approvals, chat, directory, evals, tickets, tools
 
 # `langgraph-checkpoint-postgres`'s AsyncPostgresSaver uses psycopg's async
@@ -93,10 +93,21 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         # cost/latency/trace be attributed to the node that actually made
         # it -- see `build_graph`'s own docstring (`graph.py`) for why this
         # needs two separate closures rather than one shared `complete_fn`.
+        #
+        # Phase 11 Task 4: `compose_complete_fn` specifically is now built
+        # via `make_compose_routing_complete_fn`, not the plain
+        # `make_logging_complete_fn` classify_intent still uses --
+        # `compose_response` is the one node with a real, risk-aware
+        # cloud-routing policy (`routing.py`'s `select_model_for_risk_level`)
+        # instead of always requesting `DEFAULT_MODEL` -- see that closure
+        # factory's own docstring, and `graph.py`'s `ComposeCompleteFn` type
+        # alias, for why this is the one real `CompleteFn`-shaped closure in
+        # this codebase that receives a second, explicit `risk_level`
+        # argument.
         classify_complete_fn = make_logging_complete_fn(
             session_factory, tracer, purpose="chat.classify_intent"
         )
-        compose_complete_fn = make_logging_complete_fn(
+        compose_complete_fn = make_compose_routing_complete_fn(
             session_factory, tracer, purpose="chat.compose_response"
         )
         # `retrieve_for_agent` (Phase 7 Task 7) is passed directly, not

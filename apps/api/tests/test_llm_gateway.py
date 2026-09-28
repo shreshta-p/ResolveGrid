@@ -3,6 +3,7 @@ from unittest.mock import MagicMock, patch
 import httpx
 import pytest
 
+from resolvegrid_api import llm_gateway
 from resolvegrid_api.llm_gateway import CompletionResult, LLMGatewayError, complete
 
 
@@ -216,3 +217,69 @@ def test_complete_derives_provider_from_serving_model_group_after_fallback():
         result = complete("Summarize this ticket.", model="cloud-primary")
 
     assert result.provider == "openai"
+
+
+# --- Phase 11 Task 4: per-provider virtual key resolution -------------------
+#
+# Real, CI-safe (mocked httpx.post, no network/credentials) unit tests of
+# `_resolve_api_key`/its wiring into `complete()`'s Authorization header --
+# NOT the real, cloud-reaching budget-enforcement proof (that's a separate,
+# local, evidence-cited verification step; see docs/SECURITY.md's "Phase 11
+# Task 4" section). These only prove which virtual key `complete()` DECIDES
+# to send, using fake, obviously-not-real key strings -- never touching the
+# actual `.env`-held virtual keys.
+
+
+def _mock_ok_response():
+    return _mock_response(
+        200,
+        {
+            "choices": [{"message": {"content": "ok"}}],
+            "usage": {"prompt_tokens": 3, "completion_tokens": 1},
+        },
+    )
+
+
+def test_complete_authenticates_cloud_primary_calls_with_its_own_virtual_key(monkeypatch):
+    monkeypatch.setattr(llm_gateway, "LITELLM_CLOUD_PRIMARY_KEY", "sk-fake-cloud-primary-virtual-key")
+    monkeypatch.setattr(llm_gateway, "_MODEL_TO_VIRTUAL_KEY", {"cloud-primary": "sk-fake-cloud-primary-virtual-key"})
+
+    with patch("resolvegrid_api.llm_gateway.httpx.post", return_value=_mock_ok_response()) as mock_post:
+        complete("hello", model="cloud-primary")
+
+    _, kwargs = mock_post.call_args
+    assert kwargs["headers"]["Authorization"] == "Bearer sk-fake-cloud-primary-virtual-key"
+
+
+def test_complete_authenticates_cloud_fallback_calls_with_its_own_virtual_key(monkeypatch):
+    monkeypatch.setattr(llm_gateway, "_MODEL_TO_VIRTUAL_KEY", {"cloud-fallback": "sk-fake-cloud-fallback-virtual-key"})
+
+    with patch("resolvegrid_api.llm_gateway.httpx.post", return_value=_mock_ok_response()) as mock_post:
+        complete("hello", model="cloud-fallback")
+
+    _, kwargs = mock_post.call_args
+    assert kwargs["headers"]["Authorization"] == "Bearer sk-fake-cloud-fallback-virtual-key"
+
+
+def test_complete_uses_shared_master_key_for_local_qwen3():
+    # local-qwen3 has no entry in _MODEL_TO_VIRTUAL_KEY at all -- it must
+    # keep using the shared master key unconditionally (Ollama has no real
+    # per-call cost, so no per-provider budget cap is warranted for it).
+    with patch("resolvegrid_api.llm_gateway.httpx.post", return_value=_mock_ok_response()) as mock_post:
+        complete("hello", model="local-qwen3")
+
+    _, kwargs = mock_post.call_args
+    assert kwargs["headers"]["Authorization"] == f"Bearer {llm_gateway.LITELLM_MASTER_KEY}"
+
+
+def test_complete_falls_back_to_master_key_when_virtual_key_env_var_unset(monkeypatch):
+    # A cloud model_name with no virtual key generated/configured yet (e.g. a
+    # fresh dev environment) must degrade to the shared master key, not raise
+    # or send a literal "Bearer None".
+    monkeypatch.setattr(llm_gateway, "_MODEL_TO_VIRTUAL_KEY", {"cloud-primary": None})
+
+    with patch("resolvegrid_api.llm_gateway.httpx.post", return_value=_mock_ok_response()) as mock_post:
+        complete("hello", model="cloud-primary")
+
+    _, kwargs = mock_post.call_args
+    assert kwargs["headers"]["Authorization"] == f"Bearer {llm_gateway.LITELLM_MASTER_KEY}"

@@ -164,7 +164,7 @@ def test_injected_chunk_text_flows_unmodified_into_the_real_prompt():
     """
     captured_prompts: list[str] = []
 
-    def fake_complete(prompt: str) -> str:
+    def fake_complete(prompt: str, risk_level: str) -> str:
         captured_prompts.append(prompt)
         return "mocked answer"
 
@@ -193,7 +193,7 @@ def test_fixed_prompt_template_delimits_retrieved_content_as_untrusted_data():
     """
     captured_prompts: list[str] = []
 
-    def fake_complete(prompt: str) -> str:
+    def fake_complete(prompt: str, risk_level: str) -> str:
         captured_prompts.append(prompt)
         return "mocked answer"
 

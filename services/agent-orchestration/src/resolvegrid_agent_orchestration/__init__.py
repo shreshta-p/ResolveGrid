@@ -18,14 +18,19 @@ separate compiled graph rather than new routing in `build_graph`).
 
 Callers (e.g. `apps/api`) should only need `build_graph`/
 `build_tool_invocation_graph`, `AgentState`, and the injected-callable
-types (`CompleteFn`, `RetrieveFn`, `RequestApprovalFn`, `ExecuteMutationFn`)
-from this package -- `graph.py`'s node factories/prompts are internal
-wiring, not part of the intended public surface.
+types (`CompleteFn`, `ComposeCompleteFn`, `RetrieveFn`, `RequestApprovalFn`,
+`ExecuteMutationFn`) from this package -- `graph.py`'s node
+factories/prompts are internal wiring, not part of the intended public
+surface. Phase 11 Task 4 adds `ComposeCompleteFn` (`Callable[[str, str],
+str]`, prompt + risk_level) specifically for `compose_response`'s real
+routing-aware completion function -- see `graph.py`'s `ComposeCompleteFn`
+docstring.
 """
 
 from resolvegrid_agent_orchestration.graph import (
     ApprovalOutcome,
     CompleteFn,
+    ComposeCompleteFn,
     ExecuteMutationFn,
     RequestApprovalFn,
     RetrievalOutcome,
@@ -39,6 +44,7 @@ __all__ = [
     "AgentState",
     "ApprovalOutcome",
     "CompleteFn",
+    "ComposeCompleteFn",
     "ExecuteMutationFn",
     "RequestApprovalFn",
     "RetrievalOutcome",

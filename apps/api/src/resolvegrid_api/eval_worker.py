@@ -780,9 +780,28 @@ async def _execute_graph_dimension_cases(
     classify_complete_fn = make_logging_complete_fn(
         session_factory, tracer, purpose="eval.chat.classify_intent"
     )
-    compose_complete_fn = make_logging_complete_fn(
+    # Phase 11 Task 4: `build_graph`'s `compose_complete_fn` parameter is now
+    # a `ComposeCompleteFn` (`Callable[[str, str], str]`, prompt +
+    # risk_level -- see graph.py's `ComposeCompleteFn` docstring), since
+    # `main.py`'s real user-facing chat closure needs the extra argument to
+    # drive its real risk-based cloud-routing policy. This eval harness
+    # deliberately does NOT adopt that same routing policy: `_eval_compose_
+    # base_fn` (a plain, unrouted `make_logging_complete_fn` closure,
+    # identical in kind to `classify_complete_fn` above) always requests
+    # `DEFAULT_MODEL`, and `compose_complete_fn` below is a thin adapter that
+    # accepts (and ignores) the risk_level `compose_response` now always
+    # passes, purely to satisfy `ComposeCompleteFn`'s shape. Real eval-suite
+    # runs must stay cheap and deterministic on the zero-cost local model
+    # regardless of a case's classified risk_level -- routing eval traffic
+    # to a real paid cloud call on every automated suite execution would be
+    # a genuine, unbounded real-money surprise this harness must not
+    # introduce silently.
+    _eval_compose_base_fn = make_logging_complete_fn(
         session_factory, tracer, purpose="eval.chat.compose_response"
     )
+
+    def compose_complete_fn(prompt: str, risk_level: str) -> str:
+        return _eval_compose_base_fn(prompt)
 
     async with AsyncPostgresSaver.from_conn_string(_CHECKPOINTER_DATABASE_URL) as checkpointer:
         await checkpointer.setup()

@@ -75,3 +75,23 @@ class ModelCall(Base):
     # point-lookup-by-value access pattern, and this is exactly the query
     # Task 5's Langfuse correlation work will run.
     trace_id: Mapped[str | None] = mapped_column(default=None)
+    # Phase 11 Task 4: which real POLICY INPUT drove the model= choice for
+    # this call -- distinct from fallback_occurred/serving_model_group
+    # above (those record what LiteLLM's ROUTER did after the request was
+    # already sent); this records what THIS APPLICATION'S routing policy
+    # decided BEFORE the request was ever sent, and why. Judged genuinely
+    # not redundant with the existing columns: `model`/`provider` alone
+    # tell you WHICH model served a call, never WHY that model was chosen
+    # over another -- for `purpose="chat.compose_response"` specifically
+    # (the only call site with a real routing policy as of this task -- see
+    # `routing.py`), `model="cloud-primary"` is ambiguous between "this
+    # call's risk_level was classified high" (the real, current policy) and
+    # some future, different policy input entirely; a free-text
+    # `routing_reason` (e.g. "risk_level=high") keeps that provenance
+    # genuinely inspectable without forcing every future routing input this
+    # system might add (time-of-day, principal role, ...) into its own
+    # dedicated typed column. `None` for every call site with no real
+    # routing policy yet (`ticket.summarize`, `chat.classify_intent`,
+    # judge/eval closures -- all still always request `DEFAULT_MODEL`
+    # unconditionally, per those modules' own docstrings).
+    routing_reason: Mapped[str | None] = mapped_column(default=None)

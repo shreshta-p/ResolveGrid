@@ -239,3 +239,101 @@ content never appears in the resulting `Document`/`Chunk` rows. See `docs/DECISI
 This is recorded here as a genuine caught-and-fixed security design flaw, not a hypothetical —
 the first draft would have shipped a live injection payload into every real ingestion run had
 review not caught it.
+
+## Phase 11 Task 4: real model routing policy, per-provider virtual keys, real budget enforcement
+
+Until this task, every real call path defaulted to `local-qwen3` unconditionally — the
+`cloud-primary -> cloud-fallback` config in `infra/litellm/config.yaml` was real but unreachable in
+practice, and every real call authenticated to the LiteLLM proxy with one shared master key with no
+per-provider spend limit at all.
+
+**Routing policy.** `apps/api/src/resolvegrid_api/routing.py`'s `select_model_for_risk_level`:
+`risk_level == "high"` -> `cloud-primary` (Anthropic Haiku); anything else -> `local-qwen3`. Called
+from `model_call_logging.make_compose_routing_complete_fn`, the real closure `main.py` now wires into
+`compose_response` (the one node with a real risk-aware routing policy — `classify_intent`, ticket
+summarization, and the judge/eval closures all still always request `DEFAULT_MODEL`). Which policy
+input drove a call's model choice is recorded on a new `ModelCall.routing_reason` column (migration
+0015), e.g. `"risk_level=high"` — judged worth a real column since `model`/`provider` alone say WHAT
+was chosen, never WHY.
+
+**Per-provider virtual keys.** Two real LiteLLM virtual keys were generated against the live proxy's
+real `/key/generate` admin API (LiteLLM `1.98.0`, confirmed via the running container's installed
+package metadata and the live proxy's own `/openapi.json` schema — not assumed from memory): one
+scoped to `models: ["cloud-primary"]`, one to `models: ["cloud-fallback"]`. Stored as
+`LITELLM_CLOUD_PRIMARY_KEY`/`LITELLM_CLOUD_FALLBACK_KEY` in the gitignored `.env` — raw values were
+never printed/logged/committed (verified by grepping every changed file for both values before
+commit). `llm_gateway.py`'s new `_resolve_api_key(model)` selects the model's own virtual key when
+one is configured, falling back to the shared master key for `local-qwen3` (which has no real
+per-call cost, so no budget cap is warranted).
+
+**Real infra incident found and fixed during this task's own verification**: the running
+`resolvegrid-litellm` container's actual `ANTHROPIC_API_KEY` (loaded at container-start time) was
+byte-different from the current `.env` file's value — a stale value shadowed by a pre-existing
+`ANTHROPIC_API_KEY` environment variable already exported in the operator's shell, which Docker
+Compose's variable-substitution precedence (shell env > `.env` file > compose-file default) picks
+over the `.env` file transparently. This produced real, reproducible `AnthropicException: Your credit
+balance is too low` errors through the proxy even though the `.env` file's actual key had real,
+spendable credit (confirmed directly against `api.anthropic.com`, bypassing the proxy). Fixed by
+explicitly passing the `.env` file's value into the `docker compose up --force-recreate litellm`
+invocation, overriding the ambient shell value for that command. Recorded here as a real,
+non-hypothetical operational gotcha for anyone else who keeps `ANTHROPIC_API_KEY` exported globally
+in their shell for unrelated tools.
+
+**Real, honest incident: one raw key value was printed.** During this same diagnostic process, a
+`docker compose config` invocation (run to inspect which value Compose was resolving for
+`ANTHROPIC_API_KEY`) printed the real, full `ANTHROPIC_API_KEY` value in cleartext to command output
+that became visible in this task's own tool-call transcript — a direct violation of this project's
+"never print/log real key values" constraint. This is disclosed here, not hidden: **the
+`ANTHROPIC_API_KEY` value that was live in `.env` at the time of this task should be rotated** as a
+precaution, since it was exposed outside its intended storage location. No other key (`OPENAI_API_KEY`,
+`LITELLM_MASTER_KEY`, either new virtual key) was ever printed — confirmed by a full grep of every
+file changed by this task, run before commit.
+
+**Real verification (local, not CI — see below for why).** Using a real script run against the live
+stack (`session_factory`, a real `Tracer`, and `model_call_logging.make_compose_routing_complete_fn`
+constructed exactly as `main.py` builds it — no mocking):
+
+- Low-risk real call: `ModelCall` id `490`, `provider="ollama"`, `model="local-qwen3"`,
+  `estimated_cost_usd=0.0`, `routing_reason="risk_level=low"` — the cheap-by-default path, still real.
+- High-risk real call #1: `ModelCall` id `491`, `provider="anthropic"`, `model="cloud-primary"`,
+  `routing_reason="risk_level=high"` — a genuine round trip through `log_completion`/
+  `llm_gateway.complete()` to the real Anthropic API (bypassing `classify_intent`'s own
+  unpredictability by constructing the risk_level directly, per the plan doc's explicitly sanctioned
+  approach for this exact case).
+- High-risk real call #2 against the same tiny-budget (`$0.00004`) `cloud-primary` virtual key:
+  `ModelCall` id `492`, also succeeded (LiteLLM's budget check compares CURRENT recorded spend against
+  the cap before each call, not a post-call projection — both calls' combined real cost, $0.000068,
+  only exceeded the $0.00004 cap once accrued).
+- High-risk real call #3 against the same key: **genuinely rejected** — a real `429 Too Many Requests`
+  from LiteLLM's own proxy (`ModelCall` id `493`, `status="error"`), confirmed via
+  `GET /key/info?key=...` showing the virtual key's real recorded `spend=0.000068` against
+  `max_budget=0.00004` — LiteLLM's own enforcement, not an application-level pretend-check.
+- Direct `cloud-fallback` call against its own `$0`-budget virtual key: also genuinely rejected with a
+  real `429` — proves real per-key budget enforcement independent of usage, which matters because
+  `OPENAI_API_KEY` in `.env` is separately confirmed to have **zero real credit** (a direct probe
+  against `api.openai.com` returned a real `429 insufficient_quota` / `credit_balance_exhausted`), so
+  no real successful `cloud-fallback` completion is possible in this environment at all right now —
+  the `$0` budget still proves LiteLLM's real enforcement mechanism without needing OpenAI credit.
+
+**Real dollar amount spent verifying this task**: approximately **$0.000136 USD** total (two ~$0.000034
+trial/direct-Anthropic calls plus the `cloud-primary` virtual key's real recorded `$0.000068` spend);
+**$0.00** against OpenAI (every real `cloud-fallback`-bound call was rejected before any token was
+generated). Well under the "a few cents" the user authorized for this verification.
+
+**Honest residual gaps, not silently fixed**:
+- `ModelCall.estimated_cost_usd` shows `$0.00` for the real Anthropic calls above (ids 491-493)
+  because no `PricingVersion` row exists yet for `provider="anthropic", model="cloud-primary"` — this
+  application's own cost ledger under-reports real cloud spend until that row is seeded (out of this
+  task's scope; LiteLLM's own `/key/info` `spend` figure is the real, authoritative number cited above).
+- The `cloud-primary` virtual key now stored in `.env` is, by design, exhausted (`spend=0.000068 >
+  max_budget=0.00004`) — every real high-risk chat request will be rejected with a real `429` until a
+  human regenerates it with a production-appropriate budget via a real `/key/update` (or a fresh
+  `/key/generate`) call. Left as-is deliberately: silently topping the budget back up would undermine
+  this task's own budget-rejection proof.
+
+**CI-vs-local proof split**: `apps/api/tests/test_routing.py` is the CI-safe half — a pure unit test of
+`select_model_for_risk_level` with zero real HTTP calls and zero credentials, since CI's
+`ANTHROPIC_API_KEY`/`OPENAI_API_KEY` are always empty strings (`.github/workflows/ci.yml`) and a real
+cloud round trip would fail there by design, not prove anything. Everything above (the real Anthropic
+calls, the real LiteLLM budget rejection) is the separate, real, local verification the plan doc
+requires instead — it is not, and cannot be, a pytest file in the automated suite.

@@ -96,7 +96,7 @@ def test_classify_intent_degrades_unknown_intent_value_independently_of_risk_lev
 
 
 def test_compose_response_sets_output_text_from_completion():
-    node = make_compose_response_node(lambda prompt: "Here is your answer.")
+    node = make_compose_response_node(lambda prompt, risk_level: "Here is your answer.")
     result = node(
         _state(input_text="what is a ticket?", intent="general_question", risk_level="low")
     )
@@ -107,7 +107,7 @@ def test_compose_response_sets_output_text_from_completion():
 def test_compose_response_includes_intent_context_in_prompt():
     captured_prompts = []
 
-    def fake_complete(prompt: str) -> str:
+    def fake_complete(prompt: str, risk_level: str) -> str:
         captured_prompts.append(prompt)
         return "answer"
 
@@ -117,7 +117,7 @@ def test_compose_response_includes_intent_context_in_prompt():
 
 
 def test_compose_response_records_error_on_completion_failure_instead_of_raising():
-    def failing_complete(prompt: str) -> str:
+    def failing_complete(prompt: str, risk_level: str) -> str:
         raise RuntimeError("gateway unreachable")
 
     node = make_compose_response_node(failing_complete)
@@ -135,7 +135,7 @@ def test_compose_response_uses_general_knowledge_prompt_when_retrieval_insuffici
     # answer is attempted at all.
     captured_prompts = []
 
-    def fake_complete(prompt: str) -> str:
+    def fake_complete(prompt: str, risk_level: str) -> str:
         captured_prompts.append(prompt)
         return "answer"
 
@@ -156,7 +156,7 @@ def test_compose_response_uses_general_knowledge_prompt_when_retrieval_insuffici
 def test_compose_response_uses_citation_context_prompt_when_retrieval_sufficient():
     captured_prompts = []
 
-    def fake_complete(prompt: str) -> str:
+    def fake_complete(prompt: str, risk_level: str) -> str:
         captured_prompts.append(prompt)
         return "answer"
 
@@ -197,7 +197,7 @@ def test_compose_response_falls_back_to_general_knowledge_when_chunks_present_bu
     # nothing to substitute into it.
     captured_prompts = []
 
-    def fake_complete(prompt: str) -> str:
+    def fake_complete(prompt: str, risk_level: str) -> str:
         captured_prompts.append(prompt)
         return "answer"
 
@@ -218,7 +218,7 @@ def test_compose_response_falls_back_to_general_knowledge_when_chunks_present_bu
 def test_compose_response_falls_back_to_general_knowledge_when_no_chunks():
     captured_prompts = []
 
-    def fake_complete(prompt: str) -> str:
+    def fake_complete(prompt: str, risk_level: str) -> str:
         captured_prompts.append(prompt)
         return "answer"
 
@@ -305,12 +305,14 @@ def test_finalize_falls_back_when_no_output_and_no_error():
 def test_build_graph_runs_end_to_end_with_mocked_completion_and_memory_checkpointer():
     calls = []
 
-    def fake_complete(prompt: str) -> str:
+    def fake_complete(prompt: str, risk_level: str | None = None) -> str:
         calls.append(prompt)
         if len(calls) == 1:
-            # First call is classify_intent's prompt.
+            # First call is classify_intent's prompt (called with just the
+            # prompt -- classify_intent still uses the narrower CompleteFn).
             return json.dumps({"intent": "general_question", "risk_level": "low"})
-        # Second call is compose_response's prompt.
+        # Second call is compose_response's prompt (called with (prompt,
+        # risk_level) since Phase 11 Task 4 -- see ComposeCompleteFn).
         return "This is a mocked answer about service tickets."
 
     def fake_retrieve(query_text: str, scope):
@@ -362,7 +364,7 @@ def test_build_graph_runs_end_to_end_with_mocked_completion_and_memory_checkpoin
 def test_build_graph_runs_end_to_end_with_sufficient_retrieval_produces_citation_prompt():
     calls = []
 
-    def fake_complete(prompt: str) -> str:
+    def fake_complete(prompt: str, risk_level: str | None = None) -> str:
         calls.append(prompt)
         if len(calls) == 1:
             return json.dumps({"intent": "general_question", "risk_level": "low"})
@@ -413,7 +415,7 @@ def test_build_graph_runs_end_to_end_with_sufficient_retrieval_produces_citation
 def test_build_graph_strips_a_fabricated_citation_before_finalize():
     calls = []
 
-    def fake_complete(prompt: str) -> str:
+    def fake_complete(prompt: str, risk_level: str | None = None) -> str:
         calls.append(prompt)
         if len(calls) == 1:
             return json.dumps({"intent": "general_question", "risk_level": "low"})

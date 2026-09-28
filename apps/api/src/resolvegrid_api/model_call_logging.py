@@ -49,6 +49,7 @@ from sqlalchemy.orm import Session
 
 from resolvegrid_api import llm_gateway
 from resolvegrid_api.models import ModelCall, PricingVersion
+from resolvegrid_api.routing import select_model_for_risk_level
 
 
 def current_pricing_version(session: Session, provider: str, model: str) -> PricingVersion | None:
@@ -86,6 +87,7 @@ def log_completion(
     purpose: str,
     prompt: str,
     model: str = llm_gateway.DEFAULT_MODEL,
+    routing_reason: str | None = None,
 ) -> llm_gateway.CompletionResult:
     """Run a real LLM completion under a real tracer span, log a `ModelCall`
     row (success or error shaped), and return the `CompletionResult`.
@@ -124,15 +126,16 @@ def log_completion(
         span_context = otel_trace.get_current_span().get_span_context()
         trace_id = otel_trace.format_trace_id(span_context.trace_id)
 
-        # gen_ai.system is hardcoded "ollama" here, matching
-        # summarize_ticket's exact pre-extraction behavior (it never varied
-        # by provider since only DEFAULT_MODEL was ever requested). This is
-        # a known simplification, not a general correctness fix -- Task 4's
-        # real model-routing work will need to derive this from the
-        # actually-targeted provider once calls other than local-qwen3 are
-        # routed through here. Out of scope for Task 1's behavior-preserving
-        # refactor.
-        span.set_attribute("gen_ai.system", "ollama")
+        # Phase 11 Task 4 fix (flagged by name in the comment this replaces):
+        # gen_ai.system/the error-row's `provider` used to be hardcoded
+        # "ollama" unconditionally, correct only because no non-local model
+        # was ever actually requested before this task. Now that real
+        # routing (routing.py) can request `cloud-primary`/`cloud-fallback`,
+        # deriving the requested model's real provider via
+        # `llm_gateway.provider_for_model` -- so a failed cloud call's error
+        # row is never mislabeled "ollama".
+        requested_provider = llm_gateway.provider_for_model(model)
+        span.set_attribute("gen_ai.system", requested_provider)
         span.set_attribute("gen_ai.request.model", model)
         try:
             result = llm_gateway.complete(prompt, model=model)
@@ -140,10 +143,10 @@ def log_completion(
             span.set_attribute("error.type", type(exc).__name__)
             session.add(
                 ModelCall(
-                    purpose=purpose, provider="ollama", model=model,
+                    purpose=purpose, provider=requested_provider, model=model,
                     pricing_version_id=None, input_tokens=0, output_tokens=0, latency_ms=0,
                     estimated_cost_usd=0.0, status="error", error_message=str(exc),
-                    trace_id=trace_id,
+                    trace_id=trace_id, routing_reason=routing_reason,
                 )
             )
             raise
@@ -178,7 +181,7 @@ def log_completion(
             input_tokens=result.input_tokens, output_tokens=result.output_tokens,
             latency_ms=result.latency_ms, estimated_cost_usd=estimated_cost_usd, status="success",
             fallback_occurred=result.fallback_occurred, serving_model_group=result.serving_model_group,
-            trace_id=trace_id,
+            trace_id=trace_id, routing_reason=routing_reason,
         )
     )
     return result
@@ -247,6 +250,62 @@ def make_logging_complete_fn(
             # rollback-on-close is correct, not a gap.
             try:
                 result = log_completion(session, tracer, purpose=purpose, prompt=prompt, model=model)
+            except llm_gateway.LLMGatewayError:
+                session.commit()
+                raise
+            session.commit()
+            return result.text
+
+    return complete_fn
+
+
+def make_compose_routing_complete_fn(
+    session_factory_fn: Callable[[], Session],
+    tracer: Tracer,
+    *,
+    purpose: str,
+) -> Callable[[str, str], str]:
+    """Build the real, `ModelCall`-logging `ComposeCompleteFn` (Phase 11
+    Task 4) `main.py` wires into `compose_response` -- the one node with a
+    real, risk-aware routing policy (see `routing.py`'s module docstring).
+
+    Same "open own short-lived session per call, commit on both success and
+    `LLMGatewayError` paths" shape as `make_logging_complete_fn` above (see
+    that function's docstring for the full rationale) -- the ONE real
+    difference is the extra `risk_level` argument `graph.py`'s
+    `make_compose_response_node` now passes (see that module's
+    `ComposeCompleteFn` docstring for why `compose_response` specifically
+    needs a second, real call argument rather than the narrower, prompt
+    -text-only `CompleteFn` every other node still uses): this closure
+    derives the real `model=` to request via `select_model_for_risk_level`,
+    and records WHICH risk_level drove that choice on the `ModelCall` row's
+    `routing_reason` column, e.g. `"risk_level=high"` -- see
+    `models/telemetry.py`'s `ModelCall.routing_reason` docstring for why
+    that's judged worth a real column rather than being left implicit in
+    `model`/`provider` alone.
+
+    Deliberately NOT reused by `eval_worker.py`'s own compose closure --
+    that module wraps `make_logging_complete_fn` directly instead (see its
+    own docstring for why real eval-harness traffic stays on the zero-cost
+    local model regardless of a case's classified risk_level, rather than
+    incurring real per-run cloud spend on every automated eval suite
+    execution).
+    """
+
+    def complete_fn(prompt: str, risk_level: str) -> str:
+        model = select_model_for_risk_level(risk_level)
+        routing_reason = f"risk_level={risk_level}"
+        with session_factory_fn() as session:
+            # See make_logging_complete_fn's docstring/inline comment above
+            # for why LLMGatewayError specifically must still be committed
+            # before re-raising (the error-shaped ModelCall row
+            # log_completion already session.add()'d would otherwise be
+            # silently discarded by Session.__exit__'s implicit rollback).
+            try:
+                result = log_completion(
+                    session, tracer, purpose=purpose, prompt=prompt, model=model,
+                    routing_reason=routing_reason,
+                )
             except llm_gateway.LLMGatewayError:
                 session.commit()
                 raise
