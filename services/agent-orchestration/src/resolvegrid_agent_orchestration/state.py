@@ -52,12 +52,11 @@ def _accumulate_node_latencies(
     test_graph.py`'s `test_node_latencies_ms_accumulates_across_nodes_via_
     langgraph_reducer`), not assumed from documentation alone.
 
-    Defensive against `None` on either side: the channel's own first-ever
-    update (or a node that legitimately returns no `node_latencies_ms` key
-    at all, which is fine -- `dict.get()` on a partial-update dict without
-    the key never calls this reducer for that key in the first place, but
-    a node that explicitly returns `{"node_latencies_ms": None}` would) must
-    not raise.
+    Defensive against `None` on either side. A node that omits the
+    `node_latencies_ms` key entirely never triggers this reducer for that
+    key at all -- but the channel's own first-ever update, or a node that
+    explicitly returns `{"node_latencies_ms": None}`, would call this with
+    `existing=None`; neither case should raise.
     """
     merged = dict(existing) if existing else {}
     if update:

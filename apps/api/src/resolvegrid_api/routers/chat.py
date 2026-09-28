@@ -191,14 +191,11 @@ async def chat(
     # established 4-row shape -- its real measured time is folded into
     # "finalize" instead (see docstring for why that's safe/documented).
     node_latencies_ms = final_state.get("node_latencies_ms") or {}
-    stage_latency_ms = {
-        "classify_intent": node_latencies_ms.get("classify_intent", 0),
-        "retrieve": node_latencies_ms.get("retrieve", 0),
-        "compose_response": node_latencies_ms.get("compose_response", 0),
-        "finalize": (
-            node_latencies_ms.get("verify_citations", 0) + node_latencies_ms.get("finalize", 0)
-        ),
-    }
+    # Keys derived from `_STAGE_NAMES` directly (not re-typed as separate
+    # string literals) so this dict can never silently drift out of sync
+    # with that tuple.
+    stage_latency_ms = {stage_name: node_latencies_ms.get(stage_name, 0) for stage_name in _STAGE_NAMES}
+    stage_latency_ms["finalize"] += node_latencies_ms.get("verify_citations", 0)
     for stage_name in _STAGE_NAMES:
         session.add(
             Span(

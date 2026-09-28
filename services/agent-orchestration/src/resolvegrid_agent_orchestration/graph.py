@@ -560,9 +560,10 @@ def verify_citations_node(state: AgentState) -> dict:
         }
 
     fabricated_spans = [(c.start, c.end) for c in result.citations if not c.verified]
+    stripped_output_text = _strip_spans(output_text, fabricated_spans)
     elapsed_ms = int((time.monotonic() - start) * 1000)
     return {
-        "output_text": _strip_spans(output_text, fabricated_spans),
+        "output_text": stripped_output_text,
         "citations_verified": False,
         "verified_chunk_ids": result.verified_chunk_ids,
         "fabricated_chunk_ids": result.fabricated_chunk_ids,
