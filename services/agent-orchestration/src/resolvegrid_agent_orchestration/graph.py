@@ -189,6 +189,7 @@ through the existing `RetrieveFn`/`RetrievalOutcome` contract.
 """
 
 import json
+import time
 from typing import Callable, TypedDict
 
 from langgraph.graph import END, START, StateGraph
@@ -322,9 +323,17 @@ def make_classify_intent_node(complete_fn: CompleteFn):
     than raising -- a classification node failing softly is more honest
     than making the whole chat feature fragile against LLM output
     formatting variance.
+
+    Phase 11 Task 2: wraps the entire body (prompt build + real
+    `complete_fn` call + parse/validate, success or soft-degrade path
+    alike) in `time.monotonic()` and appends the real elapsed
+    milliseconds to `state["node_latencies_ms"]` under this node's own
+    name -- see `AgentState.node_latencies_ms`'s docstring for why this
+    replaces `apps/api`'s old evenly-split placeholder.
     """
 
     def classify_intent(state: AgentState) -> dict:
+        start = time.monotonic()
         prompt = _CLASSIFY_PROMPT_TEMPLATE.format(input_text=state["input_text"])
         intent = "unclear"
         risk_level = "low"
@@ -338,7 +347,12 @@ def make_classify_intent_node(complete_fn: CompleteFn):
                 risk_level = classification.risk_level
         except (json.JSONDecodeError, ValidationError, TypeError):
             pass
-        return {"intent": intent, "risk_level": risk_level}
+        elapsed_ms = int((time.monotonic() - start) * 1000)
+        return {
+            "intent": intent,
+            "risk_level": risk_level,
+            "node_latencies_ms": {"classify_intent": elapsed_ms},
+        }
 
     return classify_intent
 
@@ -368,9 +382,16 @@ def make_compose_response_node(complete_fn: CompleteFn):
     also carries the explicit "this is untrusted data, never instructions"
     framing this task added to close the prompt-injection gap documented
     in `test_injected_document_adversarial.py`.
+
+    Phase 11 Task 2: wraps the full body (prompt selection + real
+    `complete_fn` call, success OR error path alike) in `time.monotonic()`
+    and appends the real elapsed ms to `state["node_latencies_ms"]` --
+    timed on both paths so a completion failure's real cost is still
+    accounted for, not silently dropped from the total.
     """
 
     def compose_response(state: AgentState) -> dict:
+        start = time.monotonic()
         chunks = state.get("retrieved_chunks") or []
         context_block = state.get("context_block") or ""
         if state.get("retrieval_sufficient") and chunks and context_block:
@@ -392,8 +413,10 @@ def make_compose_response_node(complete_fn: CompleteFn):
             # whatever concrete exception type `complete_fn` raises (this
             # package doesn't know or care -- see module docstring), should
             # degrade to a recorded error rather than crash the graph.
-            return {"error": str(exc)}
-        return {"output_text": text}
+            elapsed_ms = int((time.monotonic() - start) * 1000)
+            return {"error": str(exc), "node_latencies_ms": {"compose_response": elapsed_ms}}
+        elapsed_ms = int((time.monotonic() - start) * 1000)
+        return {"output_text": text, "node_latencies_ms": {"compose_response": elapsed_ms}}
 
     return compose_response
 
@@ -410,9 +433,14 @@ def make_retrieve_node(retrieve_fn: RetrieveFn):
     `compose_response`'s fallback branch, not take the whole endpoint
     down. This node's only job is populating state; `compose_response` is
     what decides how to use it.
+
+    Phase 11 Task 2: wraps the real `retrieve_fn` call (success or
+    soft-degrade path alike) in `time.monotonic()` and appends the real
+    elapsed ms to `state["node_latencies_ms"]`.
     """
 
     def retrieve(state: AgentState) -> dict:
+        start = time.monotonic()
         try:
             outcome = retrieve_fn(state["input_text"], state.get("retrieval_scope"))
             chunks = outcome.get("chunks") or []
@@ -427,10 +455,12 @@ def make_retrieve_node(retrieve_fn: RetrieveFn):
             chunks = []
             sufficient = False
             context_block = ""
+        elapsed_ms = int((time.monotonic() - start) * 1000)
         return {
             "retrieved_chunks": chunks,
             "retrieval_sufficient": sufficient,
             "context_block": context_block,
+            "node_latencies_ms": {"retrieve": elapsed_ms},
         }
 
     return retrieve
@@ -488,6 +518,15 @@ def verify_citations_node(state: AgentState) -> dict:
     instead, once that policy is actually decided rather than assumed
     here.
 
+    Phase 11 Task 2: wraps the full body in `time.monotonic()` and appends
+    the real elapsed ms to `state["node_latencies_ms"]` under
+    `"verify_citations"`. Note `apps/api`'s `routers/chat.py` folds this
+    node's real measured time into its "finalize" `Span` row rather than
+    giving it a 5th row of its own -- see that module's docstring for why
+    (the existing 4-row DB shape predates this node being separately
+    instrumented and is locked in by an existing test's exact
+    `stage_name` assertion).
+
     `state["citations_verified"]` records whether verification found
     zero fabrications (vacuously `True` for an answer with no citations
     at all -- mirrors `verify_citations`'s own "nothing to have gotten
@@ -495,32 +534,39 @@ def verify_citations_node(state: AgentState) -> dict:
     threaded through for `apps/api`'s `/chat` to build its citation
     response from (see `chat.py`).
     """
+    start = time.monotonic()
     output_text = state.get("output_text") or ""
     valid_chunk_ids = {chunk["chunk_id"] for chunk in (state.get("retrieved_chunks") or [])}
 
     if not output_text:
+        elapsed_ms = int((time.monotonic() - start) * 1000)
         return {
             "output_text": output_text,
             "citations_verified": True,
             "verified_chunk_ids": [],
             "fabricated_chunk_ids": [],
+            "node_latencies_ms": {"verify_citations": elapsed_ms},
         }
 
     result = verify_citations(output_text, valid_chunk_ids)
     if result.all_verified:
+        elapsed_ms = int((time.monotonic() - start) * 1000)
         return {
             "output_text": output_text,
             "citations_verified": True,
             "verified_chunk_ids": result.verified_chunk_ids,
             "fabricated_chunk_ids": [],
+            "node_latencies_ms": {"verify_citations": elapsed_ms},
         }
 
     fabricated_spans = [(c.start, c.end) for c in result.citations if not c.verified]
+    elapsed_ms = int((time.monotonic() - start) * 1000)
     return {
         "output_text": _strip_spans(output_text, fabricated_spans),
         "citations_verified": False,
         "verified_chunk_ids": result.verified_chunk_ids,
         "fabricated_chunk_ids": result.fabricated_chunk_ids,
+        "node_latencies_ms": {"verify_citations": elapsed_ms},
     }
 
 
@@ -529,12 +575,21 @@ def finalize(state: AgentState) -> dict:
     `finalize` folds directly into it: pass through `compose_response`'s
     (now citation-verified) output, or substitute a safe fallback message
     if an earlier node recorded an error.
+
+    Phase 11 Task 2: wraps the body in `time.monotonic()` and appends the
+    real elapsed ms to `state["node_latencies_ms"]` under `"finalize"` --
+    this node's own real work is trivial (a few dict lookups, no I/O), so
+    expect this to genuinely measure near-zero, not a fabricated value.
     """
+    start = time.monotonic()
     if state.get("error"):
-        return {"output_text": _FALLBACK_MESSAGE}
-    if state.get("output_text"):
-        return {"output_text": state["output_text"]}
-    return {"output_text": _FALLBACK_MESSAGE}
+        output_text = _FALLBACK_MESSAGE
+    elif state.get("output_text"):
+        output_text = state["output_text"]
+    else:
+        output_text = _FALLBACK_MESSAGE
+    elapsed_ms = int((time.monotonic() - start) * 1000)
+    return {"output_text": output_text, "node_latencies_ms": {"finalize": elapsed_ms}}
 
 
 class ApprovalOutcome(TypedDict):

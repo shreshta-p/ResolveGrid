@@ -82,7 +82,15 @@ def test_classify_intent_parses_scripted_response_for_every_golden_case():
         state = {**_BASE_STATE, "input_text": case["input"]}
         result = node(state)
 
-        assert result == {
-            "intent": expected_intent,
-            "risk_level": expected_risk_level,
-        }, f"mismatch for golden case input={case['input']!r}"
+        # Phase 11 Task 2: classify_intent's returned partial-state update
+        # now also carries real per-node timing under "node_latencies_ms"
+        # (see AgentState.node_latencies_ms's docstring) -- assert the two
+        # classification fields explicitly rather than exact-dict-equality
+        # against the whole return value, so this golden-set test doesn't
+        # need to know about every non-classification field the node
+        # returns.
+        assert result["intent"] == expected_intent, f"mismatch for golden case input={case['input']!r}"
+        assert (
+            result["risk_level"] == expected_risk_level
+        ), f"mismatch for golden case input={case['input']!r}"
+        assert result["node_latencies_ms"]["classify_intent"] >= 0

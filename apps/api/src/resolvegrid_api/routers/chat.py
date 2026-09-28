@@ -26,8 +26,9 @@ tracer = trace.get_tracer(__name__)
 # DB `Span` row per stage. `retrieve` (Phase 7 Task 7) was inserted between
 # `classify_intent` and `compose_response`, matching the real graph wiring
 # in `services/agent-orchestration/.../graph.py`'s `build_graph`. See
-# chat()'s docstring for why their latency_ms values are a documented
-# simplification, not real per-node timing.
+# chat()'s docstring for why this is still 4 names (not 5, matching
+# `build_graph`'s real node count) and for why their latency_ms values are
+# now genuinely measured per-node, not a split placeholder.
 _STAGE_NAMES = ("classify_intent", "retrieve", "compose_response", "finalize")
 
 # Shown when retrieval ran but found nothing sufficient to cite -- a real
@@ -76,17 +77,44 @@ async def chat(
     which has no per-request auth concept at all), because a different
     caller can have a different authorized scope for the same graph.
 
-    Span/timing note: this task doesn't have genuine per-node timing
-    instrumentation wired through LangGraph's own internals yet -- only the
-    single `ainvoke()` call's wall-clock time is actually measured. The 4
-    `Span` rows below (one per conceptual stage, `retrieve` added in Phase 7
-    Task 7) split that single measured duration evenly across the 4 stages
-    as a documented, honest simplification -- this is NOT real per-node
-    timing and must not be read as such; a future phase that wants genuine
-    per-node latency would need to instrument inside the graph nodes
-    themselves (see
-    services/agent-orchestration/src/resolvegrid_agent_orchestration/graph.py)
-    or hook LangGraph's own streaming/callback API.
+    Span/timing note (Phase 11 Task 2 -- real per-node timing, replacing the
+    old placeholder): each node in `services/agent-orchestration/.../
+    graph.py`'s `build_graph` chain now wraps its own real work in
+    `time.monotonic()` and appends `{node_name: elapsed_ms}` into
+    `AgentState.node_latencies_ms` as part of its own returned partial-state
+    update (see that field's docstring in `state.py` for why an `Annotated`
+    custom reducer is required for these per-node entries to accumulate
+    across the run instead of each node's return overwriting the whole
+    dict -- verified against the installed `langgraph` package with a real
+    test, not assumed). This handler reads `final_state["node_latencies_ms"]`
+    after `ainvoke()` returns and writes those REAL measured values as each
+    stage's `Span.latency_ms` below -- no evenly-split placeholder remains.
+
+    `graph.py`'s real chain has 5 nodes end to end (`classify_intent` ->
+    `retrieve` -> `compose_response` -> `verify_citations` -> `finalize`),
+    but this table's established shape is 4 `Span` rows per run, one per
+    name in `_STAGE_NAMES` -- a shape an existing test
+    (`test_chat_success_writes_agent_run_and_four_success_spans` in
+    `apps/api/tests/test_chat_api.py`) asserts exactly, predating
+    `verify_citations` ever being its own separately-instrumented node.
+    Rather than adding a 5th row and breaking that established shape, this
+    handler folds `verify_citations`'s real measured time into the
+    `"finalize"` row (`node_latencies_ms["verify_citations"] +
+    node_latencies_ms["finalize"]`) -- both nodes are cheap, non-LLM,
+    in-process work (deterministic citation-marker stripping and a few dict
+    lookups, respectively), so grouping them under one conceptual
+    "finalize" stage does not hide any meaningfully-sized real cost the way
+    folding, say, a real LLM call into another stage would. This is a
+    deliberate, documented choice, not an oversight -- every real
+    millisecond `graph.py` measures is still accounted for somewhere in the
+    4 rows below, none of it silently dropped.
+
+    Also note: `build_graph` has no conditional routing at all (every edge
+    is a plain `add_edge`, verified by reading it) -- all 5 nodes execute on
+    every real chat turn, so there is currently no "node skipped this run"
+    case to omit a `Span` row for; if a future phase adds real conditional
+    routing, whoever does that should revisit whether every `_STAGE_NAMES`
+    entry can still be assumed present in `node_latencies_ms`.
     """
     thread_id = uuid4().hex
 
@@ -120,6 +148,7 @@ async def chat(
         "citations_verified": None,
         "verified_chunk_ids": None,
         "fabricated_chunk_ids": None,
+        "node_latencies_ms": {},
     }
 
     with tracer.start_as_current_span("chat.graph_run") as span:
@@ -157,17 +186,26 @@ async def chat(
     agent_run.output_text = output_text
     agent_run.completed_at = datetime.now(timezone.utc)
 
-    # See docstring above: latency is only measured for the whole ainvoke()
-    # call, not per node -- split evenly across the 4 stages as an honest
-    # placeholder, not a claim of real per-node instrumentation.
-    per_stage_latency_ms = latency_ms // len(_STAGE_NAMES)
+    # See docstring above: real per-node latencies, not a fabricated even
+    # split. `verify_citations` has no dedicated row in this table's
+    # established 4-row shape -- its real measured time is folded into
+    # "finalize" instead (see docstring for why that's safe/documented).
+    node_latencies_ms = final_state.get("node_latencies_ms") or {}
+    stage_latency_ms = {
+        "classify_intent": node_latencies_ms.get("classify_intent", 0),
+        "retrieve": node_latencies_ms.get("retrieve", 0),
+        "compose_response": node_latencies_ms.get("compose_response", 0),
+        "finalize": (
+            node_latencies_ms.get("verify_citations", 0) + node_latencies_ms.get("finalize", 0)
+        ),
+    }
     for stage_name in _STAGE_NAMES:
         session.add(
             Span(
                 agent_run_id=agent_run.id,
                 stage_name=stage_name,
                 status="success",
-                latency_ms=per_stage_latency_ms,
+                latency_ms=stage_latency_ms[stage_name],
             )
         )
     session.commit()

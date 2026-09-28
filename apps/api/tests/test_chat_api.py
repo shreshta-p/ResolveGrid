@@ -1,4 +1,5 @@
 import re
+import time
 from unittest.mock import patch
 
 import pytest
@@ -235,6 +236,161 @@ def test_chat_success_writes_agent_run_and_four_success_spans(chat_fixtures, raw
     assert [s.stage_name for s in spans] == ["classify_intent", "retrieve", "compose_response", "finalize"]
     assert len(spans) == 4
     assert all(s.status == "success" for s in spans)
+
+
+def _sleepy_complete_side_effect(classify_sleep_s: float, compose_sleep_s: float, answer_text: str):
+    """Build a `resolvegrid_api.llm_gateway.complete` `side_effect` that
+    injects a REAL, deliberately different `time.sleep()` duration around
+    the 1st (classify_intent) vs 2nd (compose_response) completion call --
+    used by the Phase 11 Task 2 tests below to prove `chat.py`'s `Span`
+    rows carry genuinely per-node measured latency, not the removed
+    "split evenly across 4 stages" placeholder.
+
+    This mocks the LLM completion call itself, matching every other test
+    in this file (see `_COMPLETE_PATCH_TARGET`'s docstring above) -- the
+    thing under test here is the SPAN TIMING INSTRUMENTATION around real
+    node work, not whether a real network call reaches a real LLM
+    provider (a separate, already-covered concern). The `time.sleep()`
+    calls themselves are real, wall-clock-blocking work the test process
+    genuinely performs -- not a mocked/fabricated latency value written
+    directly into the assertion.
+    """
+    calls = {"n": 0}
+
+    def _side_effect(prompt: str) -> CompletionResult:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            time.sleep(classify_sleep_s)
+            return _classification_result()
+        time.sleep(compose_sleep_s)
+        return _answer_result(answer_text)
+
+    return _side_effect
+
+
+def _spans_for_thread(raw_db_session, thread_id: str) -> list[Span]:
+    run = raw_db_session.scalar(select(AgentRun).where(AgentRun.thread_id == thread_id))
+    assert run is not None
+    return list(
+        raw_db_session.scalars(
+            select(Span).where(Span.agent_run_id == run.id).order_by(Span.id)
+        ).all()
+    )
+
+
+def test_chat_span_latencies_are_genuinely_measured_and_non_uniform(
+    chat_fixtures, raw_db_session, client
+):
+    """Phase 11 Task 2's core exit criterion: real per-node `Span.latency_ms`
+    values, not the old "split evenly across 4 stages" placeholder.
+
+    Injects a REAL 20ms sleep around classify_intent's completion call and
+    a REAL 80ms sleep around compose_response's -- if the old placeholder
+    logic still existed (single `ainvoke()` wall-clock time divided evenly
+    by 4), every stage would measure the SAME value regardless of this
+    deliberate real timing difference. Real per-node instrumentation
+    cannot produce that: `compose_response`'s row must measure meaningfully
+    more than `classify_intent`'s, because that is where the real 80ms of
+    (test-injected, but genuinely executed) work actually happened.
+    """
+    requester = chat_fixtures
+    message = "What is a VPN?"
+
+    request_start = time.monotonic()
+    with patch(
+        _COMPLETE_PATCH_TARGET,
+        side_effect=_sleepy_complete_side_effect(
+            0.02, 0.08, "A VPN is a Virtual Private Network."
+        ),
+    ):
+        response = client.post(
+            "/chat",
+            json={"message": message},
+            headers={"X-Debug-Employee-Id": str(requester.id)},
+        )
+    request_wallclock_ms = (time.monotonic() - request_start) * 1000
+
+    assert response.status_code == 200
+    body = response.json()
+
+    spans = _spans_for_thread(raw_db_session, body["thread_id"])
+    assert [s.stage_name for s in spans] == [
+        "classify_intent",
+        "retrieve",
+        "compose_response",
+        "finalize",
+    ]
+    latencies = {s.stage_name: s.latency_ms for s in spans}
+
+    # Hard proof the placeholder is gone: an evenly-split value would make
+    # all 4 stages equal by construction, no matter what real work each
+    # node actually did. Real per-node measurement, given a real 60ms
+    # difference deliberately injected between two of the nodes, cannot.
+    assert len(set(latencies.values())) > 1
+
+    # The node that slept longer must measure as having taken longer --
+    # proves the VALUES correspond to which node did the (real, injected)
+    # work, not just "some values happen to differ."
+    assert latencies["compose_response"] > latencies["classify_intent"]
+    assert latencies["classify_intent"] >= 15  # >= 20ms sleep, minus scheduler jitter
+    assert latencies["compose_response"] >= 70  # >= 80ms sleep, minus scheduler jitter
+
+    # Every stage individually plausible.
+    for value in latencies.values():
+        assert value >= 0
+
+    # Sum of the 4 real per-node measurements should be at least the ~100ms
+    # of real sleep actually injected (minus jitter), and should not wildly
+    # exceed the real measured wall-clock time for the whole HTTP request
+    # (generous slack for FastAPI/DB/session-commit overhead the per-node
+    # timers deliberately don't capture -- they only time each graph
+    # node's own work, per this task's brief).
+    total_latency_ms = sum(latencies.values())
+    assert total_latency_ms >= 90
+    assert total_latency_ms <= request_wallclock_ms + 50
+
+
+def test_chat_span_latency_distribution_differs_across_two_different_inputs(
+    chat_fixtures, raw_db_session, client
+):
+    """Phase 11 Task 2's other required proof: two real chat turns with
+    genuinely different per-node work produce genuinely DIFFERENT
+    per-node latency distributions -- not just "non-uniform within one
+    run" (the test above), but actually different FROM EACH OTHER,
+    ruling out a fixed/hardcoded distribution that merely looks
+    non-uniform.
+    """
+    requester = chat_fixtures
+
+    def _run(classify_sleep_s: float, compose_sleep_s: float, message: str) -> str:
+        with patch(
+            _COMPLETE_PATCH_TARGET,
+            side_effect=_sleepy_complete_side_effect(
+                classify_sleep_s, compose_sleep_s, f"Answer to: {message}"
+            ),
+        ):
+            response = client.post(
+                "/chat",
+                json={"message": message},
+                headers={"X-Debug-Employee-Id": str(requester.id)},
+            )
+        assert response.status_code == 200
+        return response.json()["thread_id"]
+
+    # Run 1: classify_intent does the (relatively) heavier real work.
+    thread_id_1 = _run(0.06, 0.01, "first message, slow classification")
+    # Run 2: compose_response does the heavier real work instead.
+    thread_id_2 = _run(0.01, 0.06, "second message, slow composition")
+
+    latencies_1 = {s.stage_name: s.latency_ms for s in _spans_for_thread(raw_db_session, thread_id_1)}
+    latencies_2 = {s.stage_name: s.latency_ms for s in _spans_for_thread(raw_db_session, thread_id_2)}
+
+    assert latencies_1 != latencies_2
+    # Directly confirms the distribution is genuinely input-dependent, not
+    # coincidentally different: whichever node got the real heavier sleep
+    # in each run measures as the slower one in THAT run.
+    assert latencies_1["classify_intent"] > latencies_1["compose_response"]
+    assert latencies_2["compose_response"] > latencies_2["classify_intent"]
 
 
 def test_chat_gateway_error_returns_502_and_records_error(chat_fixtures, raw_db_session, client):

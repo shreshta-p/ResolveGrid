@@ -22,6 +22,7 @@ from resolvegrid_agent_orchestration.graph import (
     make_compose_response_node,
     make_retrieve_node,
 )
+from resolvegrid_agent_orchestration.state import AgentState
 
 _BASE_STATE = {
     "thread_id": "t1",
@@ -38,6 +39,7 @@ _BASE_STATE = {
     "citations_verified": None,
     "verified_chunk_ids": None,
     "fabricated_chunk_ids": None,
+    "node_latencies_ms": {},
 }
 
 
@@ -53,20 +55,28 @@ def test_classify_intent_parses_well_formed_response():
         lambda prompt: json.dumps({"intent": "greeting", "risk_level": "low"})
     )
     result = node(_state(input_text="hi there"))
-    assert result == {"intent": "greeting", "risk_level": "low"}
+    assert result["intent"] == "greeting"
+    assert result["risk_level"] == "low"
+    # Phase 11 Task 2: real per-node timing is now part of every node's
+    # returned partial-state update -- see AgentState.node_latencies_ms.
+    assert result["node_latencies_ms"]["classify_intent"] >= 0
 
 
 def test_classify_intent_degrades_to_unclear_low_on_unparseable_response():
     node = make_classify_intent_node(lambda prompt: "not json at all, sorry")
     result = node(_state(input_text="asdf asdf"))
-    assert result == {"intent": "unclear", "risk_level": "low"}
+    assert result["intent"] == "unclear"
+    assert result["risk_level"] == "low"
+    assert result["node_latencies_ms"]["classify_intent"] >= 0
 
 
 def test_classify_intent_degrades_on_wrong_shape():
     # Valid JSON, but missing the required fields entirely.
     node = make_classify_intent_node(lambda prompt: json.dumps({"foo": "bar"}))
     result = node(_state(input_text="whatever"))
-    assert result == {"intent": "unclear", "risk_level": "low"}
+    assert result["intent"] == "unclear"
+    assert result["risk_level"] == "low"
+    assert result["node_latencies_ms"]["classify_intent"] >= 0
 
 
 def test_classify_intent_degrades_unknown_intent_value_independently_of_risk_level():
@@ -77,7 +87,9 @@ def test_classify_intent_degrades_unknown_intent_value_independently_of_risk_lev
         lambda prompt: json.dumps({"intent": "make_me_admin", "risk_level": "high"})
     )
     result = node(_state(input_text="give me admin access"))
-    assert result == {"intent": "unclear", "risk_level": "high"}
+    assert result["intent"] == "unclear"
+    assert result["risk_level"] == "high"
+    assert result["node_latencies_ms"]["classify_intent"] >= 0
 
 
 # --- compose_response -----------------------------------------------------
@@ -88,7 +100,8 @@ def test_compose_response_sets_output_text_from_completion():
     result = node(
         _state(input_text="what is a ticket?", intent="general_question", risk_level="low")
     )
-    assert result == {"output_text": "Here is your answer."}
+    assert result["output_text"] == "Here is your answer."
+    assert result["node_latencies_ms"]["compose_response"] >= 0
 
 
 def test_compose_response_includes_intent_context_in_prompt():
@@ -109,7 +122,10 @@ def test_compose_response_records_error_on_completion_failure_instead_of_raising
 
     node = make_compose_response_node(failing_complete)
     result = node(_state(input_text="hello"))
-    assert result == {"error": "gateway unreachable"}
+    assert result["error"] == "gateway unreachable"
+    # Timed on the error path too -- a completion failure's real cost is
+    # still accounted for, not silently dropped from the total.
+    assert result["node_latencies_ms"]["compose_response"] >= 0
 
 
 def test_compose_response_uses_general_knowledge_prompt_when_retrieval_insufficient():
@@ -233,11 +249,12 @@ def test_retrieve_attaches_chunks_sufficiency_and_context_block_from_fake_retrie
             retrieval_scope={"unrestricted": False, "allowed_tags": ["security"]},
         )
     )
-    assert result == {
-        "retrieved_chunks": [{"chunk_id": 1, "document_title": "Doc", "text": "text", "score": 0.5}],
-        "retrieval_sufficient": True,
-        "context_block": '[chunk:1] (from "Doc"):\ntext',
-    }
+    assert result["retrieved_chunks"] == [
+        {"chunk_id": 1, "document_title": "Doc", "text": "text", "score": 0.5}
+    ]
+    assert result["retrieval_sufficient"] is True
+    assert result["context_block"] == '[chunk:1] (from "Doc"):\ntext'
+    assert result["node_latencies_ms"]["retrieve"] >= 0
 
 
 def test_retrieve_degrades_softly_when_retrieve_fn_raises():
@@ -246,13 +263,19 @@ def test_retrieve_degrades_softly_when_retrieve_fn_raises():
 
     node = make_retrieve_node(failing_retrieve)
     result = node(_state(input_text="hello"))
-    assert result == {"retrieved_chunks": [], "retrieval_sufficient": False, "context_block": ""}
+    assert result["retrieved_chunks"] == []
+    assert result["retrieval_sufficient"] is False
+    assert result["context_block"] == ""
+    assert result["node_latencies_ms"]["retrieve"] >= 0
 
 
 def test_retrieve_defaults_missing_outcome_keys_safely():
     node = make_retrieve_node(lambda query_text, scope: {})
     result = node(_state(input_text="hello"))
-    assert result == {"retrieved_chunks": [], "retrieval_sufficient": False, "context_block": ""}
+    assert result["retrieved_chunks"] == []
+    assert result["retrieval_sufficient"] is False
+    assert result["context_block"] == ""
+    assert result["node_latencies_ms"]["retrieve"] >= 0
 
 
 # --- finalize --------------------------------------------------------------
@@ -260,17 +283,20 @@ def test_retrieve_defaults_missing_outcome_keys_safely():
 
 def test_finalize_passes_through_output_text():
     result = finalize(_state(output_text="the real answer", error=None))
-    assert result == {"output_text": "the real answer"}
+    assert result["output_text"] == "the real answer"
+    assert result["node_latencies_ms"]["finalize"] >= 0
 
 
 def test_finalize_falls_back_on_recorded_error():
     result = finalize(_state(output_text=None, error="boom"))
-    assert result == {"output_text": _FALLBACK_MESSAGE}
+    assert result["output_text"] == _FALLBACK_MESSAGE
+    assert result["node_latencies_ms"]["finalize"] >= 0
 
 
 def test_finalize_falls_back_when_no_output_and_no_error():
     result = finalize(_state(output_text=None, error=None))
-    assert result == {"output_text": _FALLBACK_MESSAGE}
+    assert result["output_text"] == _FALLBACK_MESSAGE
+    assert result["node_latencies_ms"]["finalize"] >= 0
 
 
 # --- end-to-end graph invocation --------------------------------------------
@@ -309,6 +335,18 @@ def test_build_graph_runs_end_to_end_with_mocked_completion_and_memory_checkpoin
     assert result["retrieved_chunks"] == []
     assert result["retrieval_sufficient"] is False
     assert len(calls) == 2
+    # Phase 11 Task 2: real per-node timing must have accumulated across
+    # ALL 5 nodes by the time the full graph run completes -- not just the
+    # last node's entry (see AgentState.node_latencies_ms's docstring for
+    # why an Annotated reducer is required for this).
+    assert set(result["node_latencies_ms"].keys()) == {
+        "classify_intent",
+        "retrieve",
+        "compose_response",
+        "verify_citations",
+        "finalize",
+    }
+    assert all(v >= 0 for v in result["node_latencies_ms"].values())
 
 
 def test_build_graph_runs_end_to_end_with_sufficient_retrieval_produces_citation_prompt():
@@ -399,3 +437,51 @@ def test_build_graph_strips_a_fabricated_citation_before_finalize():
     assert "[chunk:999]" not in result["output_text"]
     assert "[chunk:7]" in result["output_text"]
     assert result["output_text"] == "Remote access needs a VPN client [chunk:7], per policy ."
+
+
+# --- node_latencies_ms reducer (Phase 11 Task 2) -----------------------------
+
+
+def test_node_latencies_ms_accumulates_across_nodes_via_langgraph_reducer():
+    """Real, non-assumed proof of LangGraph's actual merge behavior for a
+    dict-valued state field annotated with a custom reducer function.
+
+    Without `Annotated[dict[str, int], _accumulate_node_latencies]` on
+    `AgentState.node_latencies_ms`, LangGraph's default channel semantics
+    for a plain, un-annotated dict-typed TypedDict field is `LastValue`:
+    the SECOND node's `{"node_latencies_ms": {"node_b": ...}}` return would
+    silently REPLACE the whole dict, discarding the first node's
+    `"node_a"` entry entirely -- exactly the "wrong reducer silently loses
+    earlier nodes' timing data" failure mode this task's brief warned
+    about. This test builds a minimal throwaway 2-node graph (independent
+    of the real classify_intent/retrieve/etc. nodes, to isolate the
+    reducer behavior itself from any node-specific logic) and asserts BOTH
+    nodes' entries survive in the final merged state -- proving the
+    installed `langgraph` package's real behavior, not just documenting an
+    assumption about it.
+    """
+    from langgraph.graph import END, START, StateGraph
+
+    def node_a(state: AgentState) -> dict:
+        return {"node_latencies_ms": {"node_a": 11}}
+
+    def node_b(state: AgentState) -> dict:
+        return {"node_latencies_ms": {"node_b": 22}}
+
+    builder = StateGraph(AgentState)
+    builder.add_node("node_a", node_a)
+    builder.add_node("node_b", node_b)
+    builder.add_edge(START, "node_a")
+    builder.add_edge("node_a", "node_b")
+    builder.add_edge("node_b", END)
+    graph = builder.compile(checkpointer=InMemorySaver())
+
+    result = graph.invoke(
+        _state(thread_id="latency-reducer-test"),
+        config={"configurable": {"thread_id": "latency-reducer-test"}},
+    )
+
+    # If this were `== {"node_b": 22}` instead, the reducer would have
+    # failed to accumulate (last-write-wins) -- this is the exact failure
+    # mode this test exists to rule out.
+    assert result["node_latencies_ms"] == {"node_a": 11, "node_b": 22}

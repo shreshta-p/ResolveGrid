@@ -25,7 +25,44 @@ opaque, pre-built authz predicate (`retrieval_scope`) and the *results* of
 retrieval (`retrieved_chunks`), both plain data.
 """
 
-from typing import TypedDict
+from typing import Annotated, TypedDict
+
+
+def _accumulate_node_latencies(
+    existing: dict[str, int] | None, update: dict[str, int] | None
+) -> dict[str, int]:
+    """Reducer for `AgentState.node_latencies_ms` (see that field's
+    docstring for why one is required at all).
+
+    LangGraph's default channel semantics for a plain, un-annotated
+    `dict`-typed `TypedDict` field is `LastValue`: whatever the most
+    recently-executed node returns for that key REPLACES the whole
+    existing value, it does not merge into it. Since every node in this
+    graph (Phase 11 Task 2) returns its own partial update -- e.g.
+    `{"node_latencies_ms": {"classify_intent": 42}}` -- an un-annotated
+    field would mean each later node's single-key dict silently discards
+    every earlier node's timing entry, leaving only the LAST node's
+    latency recorded by the time `ainvoke()` returns. `Annotated[dict[str,
+    int], _accumulate_node_latencies]` instead makes LangGraph build a
+    `BinaryOperatorAggregate` channel that calls this function as
+    `existing = reducer(existing, incoming)` after every superstep,
+    merging keys in rather than replacing the dict wholesale -- verified
+    against the installed `langgraph==1.2.11` package with a real
+    multi-node graph test (see `services/agent-orchestration/tests/
+    test_graph.py`'s `test_node_latencies_ms_accumulates_across_nodes_via_
+    langgraph_reducer`), not assumed from documentation alone.
+
+    Defensive against `None` on either side: the channel's own first-ever
+    update (or a node that legitimately returns no `node_latencies_ms` key
+    at all, which is fine -- `dict.get()` on a partial-update dict without
+    the key never calls this reducer for that key in the first place, but
+    a node that explicitly returns `{"node_latencies_ms": None}` would) must
+    not raise.
+    """
+    merged = dict(existing) if existing else {}
+    if update:
+        merged.update(update)
+    return merged
 
 
 class RetrievedChunk(TypedDict):
@@ -177,3 +214,17 @@ class AgentState(TypedDict):
     # cost of one more (optional, `None`-by-default) key on this shared
     # TypedDict.
     tool_invocation_result: dict | None
+    # Phase 11 Task 2: real, per-node measured wall-clock duration (ms),
+    # keyed by node name (e.g. "classify_intent", "retrieve",
+    # "compose_response", "verify_citations", "finalize") -- replaces the
+    # `apps/api` `routers/chat.py` "split evenly across 4 stages"
+    # placeholder that used to be this data's only source. Each node
+    # factory in `graph.py` wraps its own real work in `time.monotonic()`
+    # and appends exactly its own entry to this dict as part of its
+    # returned partial-state update; see `_accumulate_node_latencies`
+    # above for why `Annotated` with a custom reducer is required for
+    # those per-node entries to ACCUMULATE across the run instead of each
+    # node's return overwriting the whole dict. Plain `dict[str, int]`
+    # (JSON-safe), like every other field here -- this is checkpointed to
+    # Postgres after every superstep same as the rest of `AgentState`.
+    node_latencies_ms: Annotated[dict[str, int], _accumulate_node_latencies]
