@@ -108,7 +108,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         # gets per-request DB/authz behavior without a live Session ever
         # crossing into checkpointed graph state.
         app.state.agent_graph = build_graph(
-            checkpointer, classify_complete_fn, compose_complete_fn, retrieve_for_agent
+            checkpointer,
+            classify_complete_fn=classify_complete_fn,
+            compose_complete_fn=compose_complete_fn,
+            retrieve_fn=retrieve_for_agent,
         )
         # Phase 9 Task 7a: a second, separate compiled graph
         # (`request_approval -> execute_mutation`) sharing this SAME

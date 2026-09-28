@@ -173,7 +173,10 @@ async def _run_instance_a_to_completion(thread_id: str) -> dict:
         # this fake depends on).
         instance_a_complete_fn = _instance_a_complete_fn()
         graph_a = build_graph(
-            checkpointer_a, instance_a_complete_fn, instance_a_complete_fn, _instance_a_retrieve_fn
+            checkpointer_a,
+            classify_complete_fn=instance_a_complete_fn,
+            compose_complete_fn=instance_a_complete_fn,
+            retrieve_fn=_instance_a_retrieve_fn,
         )
         result = await graph_a.ainvoke(
             _initial_state(thread_id),
@@ -194,7 +197,10 @@ async def _read_state_via_instance_b(thread_id: str) -> dict:
         # exactly what a real fresh-process restart would also do (connect
         # and read, not re-run migrations).
         graph_b = build_graph(
-            checkpointer_b, _instance_b_complete_fn, _instance_b_complete_fn, _instance_b_retrieve_fn
+            checkpointer_b,
+            classify_complete_fn=_instance_b_complete_fn,
+            compose_complete_fn=_instance_b_complete_fn,
+            retrieve_fn=_instance_b_retrieve_fn,
         )
         snapshot = await graph_b.aget_state({"configurable": {"thread_id": thread_id}})
         return snapshot.values

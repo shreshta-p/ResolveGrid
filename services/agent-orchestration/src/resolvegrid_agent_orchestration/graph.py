@@ -854,6 +854,7 @@ def build_tool_invocation_graph(
 
 def build_graph(
     checkpointer,
+    *,
     classify_complete_fn: CompleteFn,
     compose_complete_fn: CompleteFn,
     retrieve_fn: RetrieveFn,
@@ -886,6 +887,15 @@ def build_graph(
     `services/agent-orchestration/tests/test_graph.py`) can still pass the
     SAME plain callable for both arguments, since nothing here requires
     them to be different objects.
+
+    Code-review fix: `classify_complete_fn`/`compose_complete_fn`/
+    `retrieve_fn` are keyword-only (the `*` above) -- two adjacent,
+    identically-typed positional `Callable[[str], str]` params would let a
+    future call site silently swap them (misattributing classify's
+    completion under compose_response's `purpose` and vice versa, a silent
+    correctness bug, not a loud failure). Keyword-only closes that hole at
+    zero real cost: every real call site already builds these as
+    descriptively-named local variables anyway.
 
     Phase 8 Task 7 adds `verify_citations` between `compose_response` and
     `finalize` -- see `verify_citations_node`'s docstring for what it

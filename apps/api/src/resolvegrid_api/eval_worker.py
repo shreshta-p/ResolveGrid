@@ -787,7 +787,12 @@ async def _execute_graph_dimension_cases(
     async with AsyncPostgresSaver.from_conn_string(_CHECKPOINTER_DATABASE_URL) as checkpointer:
         await checkpointer.setup()
         chat_graph = (
-            build_graph(checkpointer, classify_complete_fn, compose_complete_fn, retrieve_for_agent)
+            build_graph(
+                checkpointer,
+                classify_complete_fn=classify_complete_fn,
+                compose_complete_fn=compose_complete_fn,
+                retrieve_fn=retrieve_for_agent,
+            )
             if chat_cases
             else None
         )

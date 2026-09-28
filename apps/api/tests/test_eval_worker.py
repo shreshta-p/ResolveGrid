@@ -217,9 +217,14 @@ def test_run_eval_suite_creates_completed_eval_run_with_real_case_coverage(monke
         new_model_calls = raw_db_session.scalars(
             select(ModelCall).where(ModelCall.id > before_max_model_call_id).order_by(ModelCall.id)
         ).all()
-        eval_chat_purposes = [c.purpose for c in new_model_calls if c.purpose.startswith("eval.chat.")]
+        eval_chat_calls = [c for c in new_model_calls if c.purpose.startswith("eval.chat.")]
+        eval_chat_purposes = [c.purpose for c in eval_chat_calls]
         assert "eval.chat.classify_intent" in eval_chat_purposes
         assert "eval.chat.compose_response" in eval_chat_purposes
+        # Code-review fix: also confirm these rows are success-shaped, not
+        # just present -- an error-shaped row (e.g. a real Ollama timeout)
+        # would still satisfy the membership checks above alone.
+        assert all(c.status == "success" for c in eval_chat_calls)
     finally:
         _cleanup_side_effects(raw_db_session, before)
 

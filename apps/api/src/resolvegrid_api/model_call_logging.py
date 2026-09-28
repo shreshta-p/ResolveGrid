@@ -27,6 +27,17 @@ since that's the exception this module actually raises -- and any
 `HTTPException` a caller (e.g. `summarize_ticket`) wraps it in afterward is
 raised outside any span entirely. No test depends on either shape; this is
 a deliberate outcome of the extraction, not an oversight.
+
+`purpose` string convention (breadcrumb added per code review, before a 7th
+purpose string gets added ad hoc): `<domain>.<action>`, with an `eval.`
+prefix reserved for eval-harness-driven traffic so it's never confused with
+real user/production traffic sharing the same underlying code path. Every
+real value in use as of Phase 11 Task 3: `"ticket.summarize"` (Task 1,
+`routers/tickets.py`), `"chat.classify_intent"` / `"chat.compose_response"`
+(`main.py`'s real chat-graph closures), `"eval.chat.classify_intent"` /
+`"eval.chat.compose_response"` (`eval_worker.py`'s own, separately-built
+chat-graph closures), and `"eval.judge"` (`eval_judge.py`'s real judge
+closure).
 """
 
 from typing import Callable
@@ -217,15 +228,26 @@ def make_logging_complete_fn(
     def complete_fn(prompt: str) -> str:
         with session_factory_fn() as session:
             # Mirrors routers/tickets.py's summarize_ticket commit-on-both
-            # -paths precedent exactly (see that module's comment): on
-            # `LLMGatewayError`, log_completion() has already session.add()'d
-            # an error-shaped ModelCall row and re-raises -- that row must
-            # still be committed here before the exception propagates, or
-            # `Session.__exit__`'s implicit rollback-on-uncommitted-work
-            # would silently discard it, leaving no trace of a real failure.
+            # -paths precedent exactly (code-review fix: narrowed to the
+            # SAME exception type that precedent actually catches, not a
+            # bare `except Exception` -- the broader catch previously here
+            # overclaimed "exact" parity it didn't have). On
+            # `LLMGatewayError` specifically, log_completion() has already
+            # session.add()'d an error-shaped ModelCall row and re-raises --
+            # that row must still be committed here before the exception
+            # propagates, or `Session.__exit__`'s implicit
+            # rollback-on-uncommitted-work would silently discard it,
+            # leaving no trace of a real failure. No other exception
+            # log_completion can raise (a non-LLMGatewayError failure
+            # inside `llm_gateway.complete()`, or inside
+            # `current_pricing_version`) reaches session.add() first --
+            # verified by reading log_completion's body -- so there is
+            # nothing pending to lose on any other exception path; letting
+            # those propagate through this `with` block's ordinary
+            # rollback-on-close is correct, not a gap.
             try:
                 result = log_completion(session, tracer, purpose=purpose, prompt=prompt, model=model)
-            except Exception:
+            except llm_gateway.LLMGatewayError:
                 session.commit()
                 raise
             session.commit()
