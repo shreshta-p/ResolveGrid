@@ -76,7 +76,7 @@ services:
       - "4318:4318"
     depends_on:
       langfuse-web:
-        condition: service_started
+        condition: service_healthy
 
   litellm:
     image: ghcr.io/berriai/litellm:main-stable
@@ -223,6 +223,11 @@ services:
       langfuse-redis:
         condition: service_healthy
     ports:
+      # Loopback-only, for local debugging (e.g. hitting the worker's own
+      # /api/health or queue-status endpoints directly) -- matches Langfuse's
+      # own reference compose, which also publishes this port. Nothing in
+      # this stack calls the worker from the host; it's reached only via the
+      # container network (Redis-backed queues, not HTTP, from langfuse-web).
       - "127.0.0.1:3031:3030"
     environment: &langfuse-env
       NEXTAUTH_URL: http://localhost:3050
@@ -257,6 +262,20 @@ services:
       REDIS_HOST: langfuse-redis
       REDIS_PORT: "6379"
       REDIS_AUTH: ${LANGFUSE_REDIS_AUTH:?LANGFUSE_REDIS_AUTH must be set in .env}
+    healthcheck:
+      # Real endpoint, confirmed against the actual pinned :4 image (not
+      # guessed): `GET /api/health` on the worker's own port, verified via
+      # `docker exec ... wget -qO- http://<container-ip>:3030/api/health` ->
+      # `{"status":"ok"}`. Must target the container's OWN IP, not
+      # localhost/127.0.0.1 -- this image's server only binds to the
+      # container's actual network interface (confirmed via /proc/net/tcp),
+      # not loopback, so `wget http://localhost:...` from inside the same
+      # container gets a real connection-refused, not a false negative.
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://$(hostname -i):3030/api/health || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 15s
 
   langfuse-web:
     <<: *langfuse-worker
@@ -264,6 +283,15 @@ services:
     container_name: resolvegrid-langfuse-web
     ports:
       - "3050:3000"
+    healthcheck:
+      # Same "target the container's own IP, not localhost" reasoning as
+      # langfuse-worker's healthcheck above. Real endpoint confirmed the same
+      # way: `GET /api/public/health` -> `{"status":"OK","version":"4.46.0"}`.
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://$(hostname -i):3000/api/public/health || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 15s
     environment:
       <<: *langfuse-env
       NEXTAUTH_SECRET: ${LANGFUSE_NEXTAUTH_SECRET:?LANGFUSE_NEXTAUTH_SECRET must be set in .env}
@@ -283,15 +311,12 @@ services:
       LANGFUSE_INIT_USER_EMAIL: ${LANGFUSE_INIT_USER_EMAIL:?LANGFUSE_INIT_USER_EMAIL must be set in .env}
       LANGFUSE_INIT_USER_NAME: ${LANGFUSE_INIT_USER_NAME:-ResolveGrid-Admin}
       LANGFUSE_INIT_USER_PASSWORD: ${LANGFUSE_INIT_USER_PASSWORD:?LANGFUSE_INIT_USER_PASSWORD must be set in .env}
-    depends_on:
-      postgres:
-        condition: service_healthy
-      langfuse-clickhouse:
-        condition: service_healthy
-      langfuse-minio:
-        condition: service_healthy
-      langfuse-redis:
-        condition: service_healthy
+    # No explicit depends_on here -- inherited verbatim from `<<: *langfuse-worker`
+    # above (postgres/langfuse-clickhouse/langfuse-minio/langfuse-redis, all
+    # service_healthy). Deliberately NOT also depending on langfuse-worker:
+    # Langfuse's own reference compose treats web/worker as peers that both
+    # depend on the same shared infra, not on each other -- there's no real
+    # startup-ordering requirement between them to encode.
 
 volumes:
   postgres_data:

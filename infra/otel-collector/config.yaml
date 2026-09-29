@@ -14,7 +14,8 @@ processors:
 # OTLP ingestion endpoint (real since self-hosted OSS >= 3.22.0; confirmed
 # against the actual v4 image pinned in docker-compose.yml) is HTTP-only --
 # "OTLP over HTTP (JSON/protobuf); gRPC is not supported" -- so this uses the
-# `otlphttp` exporter, not `otlp` (gRPC), pointed at
+# `otlp_http` exporter (component id `otlp_http/langfuse` below), not `otlp`
+# (gRPC), pointed at
 # http://langfuse-web:3000/api/public/otel. Auth is HTTP Basic
 # (base64(public_key:secret_key)); the `basicauth` extension below builds
 # that from plain username/password so no pre-computed base64 secret has to
@@ -49,7 +50,7 @@ service:
       receivers: [otlp]
       processors: [batch]
       # Both exporters run: `debug` keeps the existing container-log
-      # visibility, `otlphttp/langfuse` is the real, newly-added export to
+      # visibility, `otlp_http/langfuse` is the real, newly-added export to
       # Langfuse -- not a replacement, per the plan's "alongside (or
       # replacing)" wording.
       exporters: [debug, otlp_http/langfuse]
