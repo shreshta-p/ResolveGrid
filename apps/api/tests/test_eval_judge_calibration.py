@@ -77,11 +77,55 @@ def test_run_real_calibration_end_to_end_against_real_ollama(raw_db_session):
         .order_by(ModelCall.id)
     ).all()
     assert len(judge_model_calls) > 0, "expected at least one real ModelCall row for purpose='eval.judge'"
+    # Every REAL attempt -- success or error-shaped -- must carry a real,
+    # well-formed trace_id: `log_completion` sets this unconditionally
+    # before either outcome is known (see model_call_logging.py), so this
+    # holds regardless of whether the underlying completion succeeded.
     for call in judge_model_calls:
-        assert call.status == "success"
         assert call.trace_id is not None
         assert len(call.trace_id) == 32
         assert call.trace_id != "0" * 32
+
+    # NOT `assert call.status == "success"` for every row (this test's
+    # original assertion, which a real CI run genuinely failed on
+    # 2026-09-29 -- see docs/DECISION_LOG.md's entry for that date for the
+    # full investigation). `_attempt_judge_call` (services/evaluation's
+    # judge.py) is explicitly, deliberately designed to tolerate a real
+    # completion failure: it catches ANY exception from `complete_fn`,
+    # returns None, and `judge_response` retries once with an identical
+    # prompt before giving up -- and `log_completion` (Task 1) writes a
+    # real, honest error-shaped `ModelCall` row for that first failed
+    # attempt BEFORE re-raising, exactly matching this project's own
+    # already-established precedent for a genuine cold-start/timeout
+    # failure (see `summarize_ticket`'s identical "first cold attempt
+    # times out at 60s, records a real status='error' ModelCall row, not a
+    # bug" behavior, documented in docs/PROGRESS.md's Phase 4 row). A
+    # transient real failure on ONE attempt, gracefully retried by the
+    # judge module's own by-design resilience, is therefore expected,
+    # correct behavior under real hardware variance (confirmed root cause:
+    # `qwen3:14b` generation on GitHub's CPU-only hosted runners is far
+    # slower/more variable than local GPU hardware -- the same
+    # already-documented characteristic `docs/DECISION_LOG.md`'s
+    # 2026-09-11 entry found for `test_eval_worker.py`), not a code
+    # regression -- requiring zero-ever-errors here would make this test
+    # flaky against real, honest hardware variance for no real safety
+    # benefit, the same reasoning this test's own module docstring already
+    # applies to NOT hard-gating on a specific agreement percentage.
+    #
+    # What's still required, to keep this a REAL, meaningful check and not
+    # a rubber stamp: at least one real success (a total wipeout -- every
+    # single attempt failing -- would indicate a genuine systemic problem,
+    # e.g. a broken gateway wiring, not hardware variance) and a real
+    # majority success rate (a systemic bug would fail most/every call,
+    # not just an occasional cold-start outlier).
+    success_calls = [c for c in judge_model_calls if c.status == "success"]
+    error_calls = [c for c in judge_model_calls if c.status != "success"]
+    assert len(success_calls) > 0, "expected at least one real successful eval.judge ModelCall row"
+    assert len(success_calls) >= len(error_calls), (
+        f"expected a real majority of eval.judge completions to succeed, got "
+        f"{len(success_calls)} success / {len(error_calls)} error "
+        f"(error rows: {[(c.id, c.error_message) for c in error_calls]})"
+    )
 
     # The calibration file (eval/golden/judge_calibration_v1.jsonl) covers
     # all three judge dimensions defined in
