@@ -45,6 +45,32 @@ exporters:
 
 service:
   extensions: [basicauth/langfuse]
+  # Phase 11 Task 6: real Prometheus + Grafana. This exposes the collector's
+  # OWN internal self-telemetry (e.g. otelcol_receiver_accepted_spans_total,
+  # otelcol_exporter_sent_spans_total, otelcol_exporter_queue_size) as a real
+  # Prometheus-scrapeable endpoint -- confirmed present in this exact pinned
+  # image (otel/opentelemetry-collector-contrib:0.159.0) via `otelcol-contrib
+  # components`, which lists `prometheus` as a Stable exporter.
+  #
+  # Deliberately NOT building a full application-metrics pipeline here:
+  # apps/api currently emits OTLP TRACES only (no OTel Metrics SDK/MeterProvider
+  # anywhere in the codebase -- confirmed via grep). Adding a metrics receiver
+  # with nothing real feeding it would mean a pipeline with no genuine data
+  # source, which is exactly the kind of "looks configured but isn't real"
+  # gap this phase's "nothing mocked" directive rules out. The collector's
+  # own internal pipeline-health metrics ARE real and already flowing (every
+  # trace this stack sends through it increments these counters), so scraping
+  # those is a clean, genuinely real addition within this task's actual scope
+  # (infra, not new app instrumentation) -- instrumenting apps/api with the
+  # OTel Metrics SDK is a separate, larger change, out of scope for Task 6.
+  telemetry:
+    metrics:
+      readers:
+        - pull:
+            exporter:
+              prometheus:
+                host: 0.0.0.0
+                port: 8888
   pipelines:
     traces:
       receivers: [otlp]

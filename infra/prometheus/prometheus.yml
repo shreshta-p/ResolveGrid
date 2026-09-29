@@ -1,0 +1,40 @@
+# Phase 11 Task 6: real Prometheus scrape configuration.
+#
+# Scrape targets, both verified against the actual live running services
+# before this file was written (not assumed from memory/docs):
+#
+#  - litellm:4000/metrics -- LiteLLM's real Prometheus endpoint. Only mounted
+#    when `litellm_settings.success_callback` includes "prometheus" (see
+#    infra/litellm/config.yaml); confirmed via a real completion call that
+#    real counters/histograms (litellm_proxy_total_requests_metric_total,
+#    litellm_request_total_latency_metric, litellm_llm_api_latency_metric,
+#    litellm_spend_metric_total, etc.) appear labeled by requested_model,
+#    status_code, api_provider.
+#  - otel-collector:8888/metrics -- the OTel Collector's own internal
+#    self-telemetry (otelcol_receiver_accepted_spans_total,
+#    otelcol_exporter_sent_spans_total, etc.), enabled via this project's
+#    infra/otel-collector/config.yaml `service.telemetry.metrics.readers`
+#    block. Real pipeline-health data, not application metrics (apps/api
+#    does not yet emit OTel metrics -- see that config file's comment for
+#    the full reasoning on why this is the right scope for this task).
+#
+# Prometheus scrapes over the docker-compose network, using service names
+# (not container_name) as DNS -- both services already run on this network.
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: litellm
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["litellm:4000"]
+
+  - job_name: otel-collector
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["otel-collector:8888"]
+
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]

@@ -1,0 +1,13 @@
+# Phase 11 Task 6: provisioned Grafana datasource (survives a fresh
+# container -- not manual UI clicking). Points at this compose network's real
+# Prometheus service.
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    uid: prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    editable: false

@@ -1,0 +1,209 @@
+{
+  "uid": "litellm-overview",
+  "title": "LiteLLM Overview",
+  "description": "Phase 11 Task 6: real request rate/count, latency, spend and status-code breakdown from LiteLLM's real /metrics endpoint, plus OTel Collector pipeline health. Provisioned via infra/grafana -- not built by hand in the UI.",
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "10s",
+  "time": { "from": "now-30m", "to": "now" },
+  "tags": ["resolvegrid", "litellm", "phase11"],
+  "panels": [
+    {
+      "id": 1,
+      "type": "stat",
+      "title": "Total Requests (all time)",
+      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "sum(litellm_proxy_total_requests_metric_total)",
+          "legendFormat": "requests",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "short", "color": { "mode": "thresholds" } },
+        "overrides": []
+      }
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "Total Spend (USD, all time)",
+      "gridPos": { "h": 4, "w": 6, "x": 6, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "sum(litellm_spend_metric_total)",
+          "legendFormat": "spend",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "currencyUSD", "decimals": 4, "color": { "mode": "thresholds" } },
+        "overrides": []
+      }
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "Requests In-Flight",
+      "gridPos": { "h": 4, "w": 6, "x": 12, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "sum(litellm_in_flight_requests)",
+          "legendFormat": "in-flight",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "short", "color": { "mode": "thresholds" } },
+        "overrides": []
+      }
+    },
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "Avg Request Latency (last 5m)",
+      "gridPos": { "h": 4, "w": 6, "x": 18, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "sum(rate(litellm_request_total_latency_metric_sum[5m])) / sum(rate(litellm_request_total_latency_metric_count[5m]))",
+          "legendFormat": "avg latency (s)",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "s", "decimals": 3, "color": { "mode": "thresholds" } },
+        "overrides": []
+      }
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "Request Rate by Model",
+      "description": "sum(rate(litellm_proxy_total_requests_metric_total[$__rate_interval])) by (requested_model) -- real per-model request throughput from LiteLLM's own proxy request counter.",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 4 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "sum(rate(litellm_proxy_total_requests_metric_total[$__rate_interval])) by (requested_model)",
+          "legendFormat": "{{requested_model}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "reqps", "custom": { "drawStyle": "line", "fillOpacity": 10 } },
+        "overrides": []
+      }
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "Requests by Status Code",
+      "description": "sum(rate(litellm_proxy_total_requests_metric_total[$__rate_interval])) by (status_code) -- real success/error split.",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 4 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "sum(rate(litellm_proxy_total_requests_metric_total[$__rate_interval])) by (status_code)",
+          "legendFormat": "status {{status_code}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "reqps", "custom": { "drawStyle": "line", "fillOpacity": 10 } },
+        "overrides": []
+      }
+    },
+    {
+      "id": 7,
+      "type": "timeseries",
+      "title": "p50 / p95 / p99 Request Latency",
+      "description": "histogram_quantile over litellm_request_total_latency_metric_bucket -- real end-to-end latency distribution, not a fabricated/split value.",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 12 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, sum(rate(litellm_request_total_latency_metric_bucket[$__rate_interval])) by (le))",
+          "legendFormat": "p50",
+          "refId": "A"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(litellm_request_total_latency_metric_bucket[$__rate_interval])) by (le))",
+          "legendFormat": "p95",
+          "refId": "B"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum(rate(litellm_request_total_latency_metric_bucket[$__rate_interval])) by (le))",
+          "legendFormat": "p99",
+          "refId": "C"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "s", "custom": { "drawStyle": "line", "fillOpacity": 5 } },
+        "overrides": []
+      }
+    },
+    {
+      "id": 8,
+      "type": "timeseries",
+      "title": "LLM API Latency by Provider",
+      "description": "sum(rate(litellm_llm_api_latency_metric_sum[$__rate_interval])) / sum(rate(litellm_llm_api_latency_metric_count[$__rate_interval])) by (api_provider) -- real upstream-call latency (ollama/anthropic/openai), excluding LiteLLM's own overhead.",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 12 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "sum(rate(litellm_llm_api_latency_metric_sum[$__rate_interval])) by (api_provider) / sum(rate(litellm_llm_api_latency_metric_count[$__rate_interval])) by (api_provider)",
+          "legendFormat": "{{api_provider}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "s", "custom": { "drawStyle": "line", "fillOpacity": 10 } },
+        "overrides": []
+      }
+    },
+    {
+      "id": 9,
+      "type": "timeseries",
+      "title": "OTel Collector: Accepted Spans Rate",
+      "description": "rate(otelcol_receiver_accepted_spans[$__rate_interval]) -- real pipeline-health self-telemetry from the collector, confirming real traces are actually flowing through it (Phase 11 Task 5). Note: this collector's own Prometheus exporter does not append a _total suffix to counters (confirmed against the real scraped output), unlike the client-library convention used by litellm_*_total metrics above.",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 20 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "sum(rate(otelcol_receiver_accepted_spans[$__rate_interval])) by (receiver)",
+          "legendFormat": "{{receiver}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "ops", "custom": { "drawStyle": "line", "fillOpacity": 10 } },
+        "overrides": []
+      }
+    },
+    {
+      "id": 10,
+      "type": "timeseries",
+      "title": "Spend Rate by Model (USD)",
+      "description": "sum(rate(litellm_spend_metric_total[$__rate_interval])) by (requested_model) -- real per-model cost accrual.",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 20 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "sum(rate(litellm_spend_metric_total[$__rate_interval])) by (requested_model)",
+          "legendFormat": "{{requested_model}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "currencyUSD", "custom": { "drawStyle": "line", "fillOpacity": 10 } },
+        "overrides": []
+      }
+    }
+  ]
+}

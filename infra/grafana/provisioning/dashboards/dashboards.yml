@@ -1,0 +1,18 @@
+# Phase 11 Task 6: dashboard provisioning provider. Loads every dashboard
+# JSON file under infra/grafana/dashboards/ (mounted read-only at
+# /var/lib/grafana/dashboards in the grafana container) on every container
+# start -- real provisioning, not manual UI clicking that wouldn't survive a
+# fresh container.
+apiVersion: 1
+
+providers:
+  - name: resolvegrid
+    orgId: 1
+    folder: ResolveGrid
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 30
+    allowUiUpdates: false
+    options:
+      path: /var/lib/grafana/dashboards
+      foldersFromFilesStructure: false

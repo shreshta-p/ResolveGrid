@@ -74,6 +74,12 @@ services:
     ports:
       - "4317:4317"
       - "4318:4318"
+      # Phase 11 Task 6: the collector's own real internal self-telemetry
+      # (otelcol_receiver_accepted_spans_total etc.), enabled via this
+      # config's `service.telemetry.metrics.readers` block -- scraped by the
+      # prometheus service below over the compose network, exposed to the
+      # host here too for direct verification (`curl localhost:8888/metrics`).
+      - "8888:8888"
     depends_on:
       langfuse-web:
         condition: service_healthy
@@ -318,6 +324,54 @@ services:
     # depend on the same shared infra, not on each other -- there's no real
     # startup-ordering requirement between them to encode.
 
+  # --- Prometheus + Grafana (Phase 11 Task 6: real metrics observability) ---
+  prometheus:
+    image: prom/prometheus:v3.15.0
+    container_name: resolvegrid-prometheus
+    restart: unless-stopped
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    ports:
+      - "9090:9090"
+    depends_on:
+      litellm:
+        condition: service_healthy
+      otel-collector:
+        condition: service_started
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:9090/-/healthy || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
+
+  grafana:
+    image: grafana/grafana:13.2.2
+    container_name: resolvegrid-grafana
+    restart: unless-stopped
+    environment:
+      # Real values live only in .env, never here/never printed. No
+      # anonymous access, no default `admin`/`admin` left in place.
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:?GRAFANA_ADMIN_USER must be set in .env}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?GRAFANA_ADMIN_PASSWORD must be set in .env}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana_data:/var/lib/grafana
+    ports:
+      - "3051:3000"
+    depends_on:
+      prometheus:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:3000/api/health || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
 volumes:
   postgres_data:
   ollama_data:
@@ -325,3 +379,5 @@ volumes:
   langfuse_clickhouse_logs:
   langfuse_minio_data:
   langfuse_redis_data:
+  prometheus_data:
+  grafana_data:

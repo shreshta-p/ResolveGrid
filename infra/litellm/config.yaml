@@ -20,6 +20,21 @@ model_list:
 
 litellm_settings:
   drop_params: true
+  # Phase 11 Task 6: real Prometheus + Grafana observability. LiteLLM only
+  # mounts its /metrics endpoint when "prometheus" is a registered success
+  # callback (confirmed by reading the installed proxy_server.py's config
+  # loader -- ghcr.io/berriai/litellm:main-stable, `if "prometheus" in
+  # callback: ... PrometheusLogger._mount_metrics_endpoint()`); without this,
+  # /metrics 404s even with valid auth.
+  success_callback: ["prometheus"]
+  # /metrics defaults to requiring the same Bearer auth as every other proxy
+  # route (confirmed: unauthenticated request returns a real 401 naming this
+  # exact setting). Prometheus's scrape config has no clean way to inject a
+  # secret from .env into a committed prometheus.yml, and this endpoint only
+  # exposes counters/histograms (no prompts, no key material), so auth is
+  # disabled for it specifically -- a real, deliberate LiteLLM-supported
+  # setting, not an app-level workaround.
+  require_auth_for_metrics_endpoint: false
 
 router_settings:
   fallbacks:
