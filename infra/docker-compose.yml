@@ -155,7 +155,16 @@ services:
       start_period: 5s
 
   langfuse-minio:
-    image: cgr.dev/chainguard/minio
+    # Pinned by digest, not tag: Chainguard's free tier for this image only
+    # ever publishes a rolling `latest`/`latest-dev` plus per-build
+    # `.sig`/`.att` signature/attestation tags (confirmed via the real
+    # registry API -- `GET /v2/chainguard/minio/tags/list` -- no semantic
+    # version tag exists to pin to; that's an Enterprise-tier-only feature).
+    # A content-addressed digest is the strongest available pin -- immutable
+    # by construction, unlike a tag -- and is what `latest` resolved to at
+    # the time this was verified (`docker buildx imagetools inspect
+    # cgr.dev/chainguard/minio:latest`).
+    image: cgr.dev/chainguard/minio@sha256:6a1d0b45c8669726bba580ced0bfa4cb9fdeed1ed636dfabd81d1577beb6937b
     container_name: resolvegrid-langfuse-minio
     restart: unless-stopped
     entrypoint: sh
