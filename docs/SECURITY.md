@@ -337,3 +337,68 @@ generated). Well under the "a few cents" the user authorized for this verificati
 cloud round trip would fail there by design, not prove anything. Everything above (the real Anthropic
 calls, the real LiteLLM budget rejection) is the separate, real, local verification the plan doc
 requires instead — it is not, and cannot be, a pytest file in the automated suite.
+
+## Phase 11 Task 7 (closing task): security incident log, key rotation, budget regeneration
+
+### Incident log
+
+Two real key-value exposures happened during this phase's development, both self-caught, both
+disclosed here rather than hidden, and both confirmed via an exhaustive `git log -p`/`git grep`
+sweep of the entire commit history to have **never reached any committed file** — the exposure in
+both cases was limited to that task's own live tool-call transcript, not persisted anywhere in the
+repository.
+
+1. **Task 4 — real `ANTHROPIC_API_KEY` printed in cleartext.** While diagnosing a stale-shell-env
+   variable shadowing `.env`'s real key (see this doc's Task 4 section above), a `docker compose
+   config` diagnostic command printed the real, full `ANTHROPIC_API_KEY` value into that subagent's
+   own tool-output transcript. **Higher severity**: this is a real, currently-live Anthropic API
+   credential with real spendable credit. **Recommendation, restated explicitly here**: the
+   `ANTHROPIC_API_KEY` value that was live in `.env` at the time of Task 4 should be rotated
+   (generate a new key in the Anthropic Console, revoke the old one, update `.env`) as a
+   precaution — this was already flagged in Task 4's own section above, and is repeated here as
+   part of this closing task's mandatory disclosure, and again in this task's final report to the
+   coordinator. This rotation is an action for the human operator (requires Anthropic Console
+   access this agent does not have) — not something this closing task can perform itself.
+2. **Task 5 — the `Read` tool briefly used directly on `.env`.** While generating Langfuse's
+   first-boot secrets, `.env` was read directly with the `Read` tool (rather than via
+   shell/`grep`), briefly exposing Langfuse's freshly-generated local-dev-only secrets
+   (`LANGFUSE_SALT`/`ENCRYPTION_KEY`/etc., plus the already-present `ANTHROPIC_API_KEY`/
+   `OPENAI_API_KEY`/`LITELLM_MASTER_KEY` values) in that subagent's own transcript — caught and
+   corrected before any further action. **Lower severity**: no rotation is recommended for the
+   Langfuse-specific secrets (self-hosted, local-only, no external financial exposure — a leaked
+   `LANGFUSE_SALT` has no value outside this exact local container), but this incident is recorded
+   as a repeat, less severe instance of the same class of mistake as (1), and this project's
+   standing constraint (never use `Read` directly on `.env`; use shell/`grep`/env expansion only)
+   is restated here as the concrete lesson.
+
+Both incidents happened before this closing task began and are recorded here (not newly discovered
+by this task) per this task's explicit instruction to consolidate the phase's security disclosures
+in one place. No new raw-key exposure occurred during this closing task itself — every `.env`
+inspection this task performed used `awk`/`grep` against variable NAMES and lengths only, never
+values (see this task's own commands), and the freshly-regenerated `cloud-primary` virtual key
+below was written to `.env` via shell redirection from LiteLLM's API response, never echoed to any
+tool-output transcript.
+
+### `cloud-primary` virtual key regenerated with a real production-sized budget
+
+Task 4's own tiny-test-budget verification left the `cloud-primary` virtual key deliberately
+exhausted (`spend=$0.000068` against `max_budget=$0.00004`) — every real high-risk-routed chat
+request would 429 until a human regenerated it, exactly as that task's own docs said. As part of
+this closing task, a fresh `cloud-primary` virtual key was generated via LiteLLM's real
+`/key/generate` admin API against the freshly-rebuilt proxy (see this doc's Task 4 section for the
+endpoint/version details, unchanged), with `max_budget=$5.00` — a real, reasonable dev-environment
+cap: large enough that ordinary verification/demo traffic at Haiku 4.5's real rate ($1/$5 per
+million tokens) won't exhaust it for a very long time (thousands of typical chat turns), while
+still bounding worst-case runaway spend to a small, acceptable dollar figure rather than leaving the
+key uncapped. Stored as `LITELLM_CLOUD_PRIMARY_KEY` in the gitignored `.env`, never printed. A real,
+cheap high-risk-routed call was made against the fresh key immediately after to confirm it succeeds
+(not a 429) — see `docs/PROGRESS.md`'s Phase 11 row for the cited `ModelCall` row.
+
+### `PricingVersion` gap closed
+
+See `docs/TELEMETRY_COST.md`'s "The `PricingVersion` gap" section — migration `0016` seeds a real
+`provider="anthropic", model="cloud-primary"` pricing row so `ModelCall.estimated_cost_usd` no
+longer under-reports real cloud spend for future calls (rows written before this migration, e.g.
+Task 4's ids 491-493, are not backfilled — historical cost figures for those rows remain `$0.00` by
+this system's own "never retroactively reprice a historical row" design principle, and LiteLLM's own
+`/key/info` `spend` figure remains the authoritative historical number for that window).
