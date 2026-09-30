@@ -24,10 +24,15 @@ factories/prompts are internal wiring, not part of the intended public
 surface. Phase 11 Task 4 adds `ComposeCompleteFn` (a `Protocol` taking `prompt` and a
 keyword-only `risk_level`) specifically for `compose_response`'s real
 routing-aware completion function -- see `graph.py`'s `ComposeCompleteFn`
-docstring.
+docstring. Phase 12 Task 3 adds one more: `PROMPT_TEMPLATE_VERSION`, a
+plain string `apps/api`'s new `/chat` response cache folds into its cache
+key so a future compose-prompt wording change organically busts every
+previously-cached answer -- see `graph.py`'s own comment beside that
+constant for the full rationale.
 """
 
 from resolvegrid_agent_orchestration.graph import (
+    PROMPT_TEMPLATE_VERSION,
     ApprovalOutcome,
     CompleteFn,
     ComposeCompleteFn,
@@ -41,6 +46,7 @@ from resolvegrid_agent_orchestration.graph import (
 from resolvegrid_agent_orchestration.state import AgentState, RetrievedChunk
 
 __all__ = [
+    "PROMPT_TEMPLATE_VERSION",
     "AgentState",
     "ApprovalOutcome",
     "CompleteFn",

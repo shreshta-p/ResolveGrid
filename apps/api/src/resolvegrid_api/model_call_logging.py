@@ -188,6 +188,76 @@ def log_completion(
     return result
 
 
+def log_cache_hit_model_call(
+    session: Session,
+    tracer: Tracer,
+    *,
+    purpose: str,
+    risk_level: str,
+) -> None:
+    """Write a real, honestly `$0`-cost `ModelCall` row for a `/chat` cache
+    hit (Phase 12 Task 3, `resolvegrid_api.response_cache`) -- no real
+    completion runs on a cache hit, so this is the "construct a ModelCall
+    row directly, outside a real completion" path this task's own brief
+    flagged as needing a check-first: no existing helper covered this
+    (`log_completion` above always calls `llm_gateway.complete()` for
+    real), so this is a new, small, sibling function, not a repurposing of
+    `log_completion` itself.
+
+    `model`/`provider` are derived via the SAME real policy functions a
+    genuine call would have used (`routing.select_model_for_risk_level`,
+    `llm_gateway.provider_for_model`) -- not a fixed placeholder like
+    `"cache"` -- so a cost/telemetry dashboard grouping by `model`/
+    `provider` sees which real tier this cache hit stood in for, not an
+    unrecognized third category. `routing_reason` mirrors `make_compose_
+    routing_complete_fn`'s exact `f"risk_level={risk_level}"` format for
+    the identical reason that closure sets it: it's the same real policy
+    input, genuinely driving the same derived `model` value, just not
+    actually sent anywhere this time.
+
+    `purpose` is expected to be `"chat.cache_hit"` (this module's own
+    `<domain>.<action>` convention, see this module's docstring) -- passed
+    in rather than hardcoded so a future second cache-hit-logging call site
+    (if one is ever added) isn't forced to share this exact string.
+
+    Zero tokens, zero latency (no real completion latency exists to
+    record -- the real, near-zero cache-LOOKUP latency is recorded
+    separately, on this call's `Span` row, by `routers/chat.py`), `$0`
+    cost, `pricing_version_id=None` (no real pricing lookup applies to a
+    call that never happened), `status="success"` (a cache hit serving a
+    real, valid, previously-computed answer is a genuine success, not an
+    error). Does NOT call `session.commit()` -- same caller-owns-the
+    -transaction-boundary convention as `log_completion`/`record_audit_
+    event`.
+    """
+    model = select_model_for_risk_level(risk_level)
+    provider = llm_gateway.provider_for_model(model)
+    routing_reason = f"risk_level={risk_level}"
+
+    with tracer.start_as_current_span(f"llm.{purpose}") as span:
+        span.set_attribute("gen_ai.system", provider)
+        span.set_attribute("gen_ai.request.model", model)
+        span.set_attribute("resolvegrid.cache_hit", True)
+        span_context = otel_trace.get_current_span().get_span_context()
+        trace_id = otel_trace.format_trace_id(span_context.trace_id)
+
+    session.add(
+        ModelCall(
+            purpose=purpose,
+            provider=provider,
+            model=model,
+            pricing_version_id=None,
+            input_tokens=0,
+            output_tokens=0,
+            latency_ms=0,
+            estimated_cost_usd=0.0,
+            status="success",
+            trace_id=trace_id,
+            routing_reason=routing_reason,
+        )
+    )
+
+
 def make_logging_complete_fn(
     session_factory_fn: Callable[[], Session],
     tracer: Tracer,

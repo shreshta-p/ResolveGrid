@@ -303,6 +303,23 @@ User message:
 {input_text}
 """
 
+# Phase 12 Task 3: a plain, public string constant `apps/api`'s new
+# response-cache module (`resolvegrid_api.response_cache`) folds into its
+# cache key (`cache:response:{kb_version}:{scope_sig}:
+# {prompt_template_version}:{sha256(message_text)}`) so a future edit to
+# either compose-prompt template below organically busts every previously
+# -cached answer instead of silently continuing to serve one worded against
+# a template that no longer exists. Deliberately public (no leading
+# underscore), unlike this module's other internal constants/helpers (see
+# the package `__init__.py`'s module docstring for why this package's
+# public surface is otherwise limited to `build_graph`/`AgentState`/the
+# injected-callable types) -- `apps/api` already depends on this workspace
+# package (see this module's own docstring's "Dependency-direction note"),
+# so exporting one more plain string here is the correct direction for this
+# value to flow (this package -> apps/api), never the reverse. Bump this
+# any time either `_COMPOSE_PROMPT_*_TEMPLATE` constant's wording changes.
+PROMPT_TEMPLATE_VERSION = "1"
+
 _COMPOSE_PROMPT_NO_CONTEXT_TEMPLATE = """You are a helpful internal IT service-desk assistant. \
 Answer the user's message clearly and concisely. No relevant company-specific knowledge-base \
 article was found for this question -- answer from general knowledge only, and say so if the \

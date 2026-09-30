@@ -35,6 +35,19 @@ class AgentRun(Base):
     error_message: Mapped[str | None] = mapped_column(default=None)
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())
     completed_at: Mapped[datetime | None] = mapped_column(default=None)
+    # Phase 12 Task 3: True iff this run was served entirely from
+    # `resolvegrid_api.response_cache`'s exact-response cache -- the real
+    # graph (classify_intent/retrieve/compose_response/verify_citations)
+    # never executed for this row. `status` stays "completed" either way
+    # (a cache hit is a genuinely successful run, not a distinct status),
+    # so this is a real, dedicated column rather than overloading `status`
+    # with a third meaning or burying the signal in `Span.detail_json`
+    # (see migration 0017's docstring for the full "why a column, and why
+    # here, not there" reasoning). Never True for any row written before
+    # this column existed -- `server_default=false` backfills every
+    # pre-existing row to the honest value, since none of them could have
+    # been a cache hit (this cache didn't exist yet).
+    cache_hit: Mapped[bool] = mapped_column(default=False)
 
 
 class Span(Base):

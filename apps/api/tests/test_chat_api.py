@@ -3,9 +3,11 @@ import time
 from unittest.mock import patch
 
 import pytest
+import redis
 from fastapi.testclient import TestClient
 from sqlalchemy import delete, func, select
 
+from resolvegrid_api.cache import REDIS_URL
 from resolvegrid_api.ingestion_worker import run_seed_corpus_ingestion
 from resolvegrid_api.llm_gateway import CompletionResult
 from resolvegrid_api.main import app
@@ -16,6 +18,8 @@ from resolvegrid_api.seed_corpus import load_seed_corpus
 _SEED_EMAIL = "chat.requester@example.test"
 _SEED_DEPARTMENT_NAME = "Chat Test Dept"
 _SEED_LOCATION_NAME = "Chat Test HQ"
+_OTHER_SCOPE_SEED_EMAIL = "chat.cache.other@example.test"
+_OTHER_SCOPE_DEPARTMENT_NAME = "Chat Cache Other Dept"
 
 # `/chat`'s `complete_fn` is injected as a lambda built ONCE inside main.py's
 # lifespan (`complete_fn = lambda prompt: llm_gateway.complete(prompt).text`),
@@ -53,6 +57,33 @@ def client():
 
 
 @pytest.fixture(autouse=True)
+def _clear_response_cache_namespace():
+    """Phase 12 Task 3: this file's own tests re-use fixed, literal message
+    strings (e.g. "What is a VPN?") across MULTIPLE tests, deliberately, so
+    a human reader can see exactly which turn a given assertion is about
+    (same reasoning `test_retrieval_cache.py`'s own namespace-clearing
+    fixture documents for the same pattern). Without clearing
+    `cache:response:*` before AND after every test in this file, the real
+    exact-response cache Task 3 adds would turn the SECOND test in this
+    file to reuse a given (scope, message) pair into an unintended real
+    cache HIT -- silently skipping the real graph run (and the mocked
+    `complete_fn` call-count assertions, injected-latency-timing
+    assertions, etc.) those tests are actually about. This is a real
+    correctness requirement for this test file specifically, not
+    defensive boilerplate: `test_chat_cache_hit_*` tests below are the
+    only ones in this file that WANT a real cache hit, and they populate
+    their own entry explicitly within the test body.
+    """
+    client = redis.Redis.from_url(REDIS_URL)
+    client.ping()  # fail fast (real connection check) if Redis isn't up
+    for key in client.scan_iter(match="cache:response:*"):
+        client.delete(key)
+    yield
+    for key in client.scan_iter(match="cache:response:*"):
+        client.delete(key)
+
+
+@pytest.fixture(autouse=True)
 def _cleanup_agent_runs(raw_db_session):
     # Every test in this file creates a real AgentRun row with a real FK to
     # the get-or-create "chat.requester@example.test" Employee row (see
@@ -70,16 +101,21 @@ def _cleanup_agent_runs(raw_db_session):
     # fixture deletes the Span/AgentRun rows this file creates after each
     # test, keeping the whole blast radius inside this file.
     yield
-    requester = raw_db_session.scalar(select(Employee).where(Employee.email == _SEED_EMAIL))
-    if requester is None:
-        return
-    run_ids = raw_db_session.scalars(
-        select(AgentRun.id).where(AgentRun.principal_employee_id == requester.id)
-    ).all()
-    if run_ids:
-        raw_db_session.execute(delete(Span).where(Span.agent_run_id.in_(run_ids)))
-        raw_db_session.execute(delete(AgentRun).where(AgentRun.id.in_(run_ids)))
-        raw_db_session.commit()
+    # Phase 12 Task 3 added a second fixture requester (`_OTHER_SCOPE_SEED_
+    # EMAIL`, a different department -- see `other_scope_chat_fixtures`
+    # below) for the cross-scope cache-isolation test; both are cleaned up
+    # here for the identical reason the original requester already was.
+    for email in (_SEED_EMAIL, _OTHER_SCOPE_SEED_EMAIL):
+        requester = raw_db_session.scalar(select(Employee).where(Employee.email == email))
+        if requester is None:
+            continue
+        run_ids = raw_db_session.scalars(
+            select(AgentRun.id).where(AgentRun.principal_employee_id == requester.id)
+        ).all()
+        if run_ids:
+            raw_db_session.execute(delete(Span).where(Span.agent_run_id.in_(run_ids)))
+            raw_db_session.execute(delete(AgentRun).where(AgentRun.id.in_(run_ids)))
+            raw_db_session.commit()
 
 
 @pytest.fixture
@@ -104,6 +140,38 @@ def chat_fixtures(raw_db_session):
     if requester is None:
         requester = Employee(
             display_name="Chat Requester", email=_SEED_EMAIL, title="Engineer",
+            hire_date="2024-01-01T00:00:00", timezone=loc.timezone, location_id=loc.id, department_id=dept.id,
+        )
+        raw_db_session.add(requester)
+        raw_db_session.flush()
+    raw_db_session.commit()
+    return requester
+
+
+@pytest.fixture
+def other_scope_chat_fixtures(raw_db_session):
+    """A second requester in a genuinely DIFFERENT department from `chat_
+    fixtures`'s requester -- gives a real, differently-resolved `AuthzFilter`
+    / `scope_sig` (Phase 12 Task 2's `compute_scope_sig`), needed by the
+    cross-scope response-cache-isolation test below. Mirrors `chat_
+    fixtures`'s own get-or-create-by-natural-key pattern exactly.
+    """
+    loc = raw_db_session.scalar(select(Location).where(Location.name == _SEED_LOCATION_NAME))
+    if loc is None:
+        loc = Location(name=_SEED_LOCATION_NAME, region="US", timezone="America/Chicago")
+        raw_db_session.add(loc)
+        raw_db_session.flush()
+
+    dept = raw_db_session.scalar(select(Department).where(Department.name == _OTHER_SCOPE_DEPARTMENT_NAME))
+    if dept is None:
+        dept = Department(name=_OTHER_SCOPE_DEPARTMENT_NAME)
+        raw_db_session.add(dept)
+        raw_db_session.flush()
+
+    requester = raw_db_session.scalar(select(Employee).where(Employee.email == _OTHER_SCOPE_SEED_EMAIL))
+    if requester is None:
+        requester = Employee(
+            display_name="Chat Cache Other Requester", email=_OTHER_SCOPE_SEED_EMAIL, title="Engineer",
             hire_date="2024-01-01T00:00:00", timezone=loc.timezone, location_id=loc.id, department_id=dept.id,
         )
         raw_db_session.add(requester)
@@ -615,3 +683,245 @@ def test_chat_authz_filters_out_department_scoped_seed_corpus_chunk(
     titles = {c["document_title"] for c in body["citations"]}
     assert "Kestrel Platform Engineering On-Call Escalation Policy" not in titles
     assert body["answer"] == "I don't have that information."
+
+
+# ---------------------------------------------------------------------------
+# Exact-response cache tests (Phase 12 Task 3)
+# ---------------------------------------------------------------------------
+
+
+def test_chat_second_identical_call_is_a_real_cache_hit_and_skips_the_graph(
+    chat_fixtures, raw_db_session, client
+):
+    """The real point of Task 3: an identical (scope, kb_version,
+    prompt_template_version, message) turn must only ever run the real
+    graph ONCE. Proven with a real call-counting spy on the SECOND call
+    that raises if it's ever invoked -- not just "should work" reasoning
+    -- plus real DB row assertions distinguishing the two AgentRun/Span
+    row sets and the real $0 ModelCall row the cache hit must still write.
+    """
+    requester = chat_fixtures
+    message = "What does the cache-hit test ask about VPNs?"
+
+    before_model_call_id = raw_db_session.scalar(select(func.max(ModelCall.id))) or 0
+
+    with patch(
+        _COMPLETE_PATCH_TARGET,
+        side_effect=[_classification_result(), _answer_result("A VPN is a Virtual Private Network.")],
+    ) as mock_complete_1:
+        response_1 = client.post(
+            "/chat",
+            json={"message": message},
+            headers={"X-Debug-Employee-Id": str(requester.id)},
+        )
+    assert response_1.status_code == 200
+    assert mock_complete_1.call_count == 2
+    body_1 = response_1.json()
+
+    # The SECOND call must never reach the real completion function at
+    # all -- a real hit skips classify_intent/retrieve/compose_response/
+    # verify_citations entirely, so `llm_gateway.complete` must never be
+    # called. `side_effect` here raises loudly if it ever is.
+    with patch(
+        _COMPLETE_PATCH_TARGET,
+        side_effect=AssertionError("cache hit must never call the real completion function"),
+    ) as mock_complete_2:
+        response_2 = client.post(
+            "/chat",
+            json={"message": message},
+            headers={"X-Debug-Employee-Id": str(requester.id)},
+        )
+    assert response_2.status_code == 200
+    mock_complete_2.assert_not_called()
+    body_2 = response_2.json()
+
+    # Identical response SHAPE/content, but a genuinely fresh thread_id
+    # (per this task's own explicit contract: thread_id identifies THIS
+    # call's AgentRun, never the cached content).
+    assert body_2["answer"] == body_1["answer"]
+    assert body_2["citations"] == body_1["citations"]
+    assert body_2["caption"] == body_1["caption"]
+    assert body_2["thread_id"] != body_1["thread_id"]
+
+    # Two genuinely distinct AgentRun/Span row sets -- the cache hit is its
+    # own real row, not silently merged/skipped.
+    run_1 = raw_db_session.scalar(select(AgentRun).where(AgentRun.thread_id == body_1["thread_id"]))
+    run_2 = raw_db_session.scalar(select(AgentRun).where(AgentRun.thread_id == body_2["thread_id"]))
+    assert run_1 is not None and run_2 is not None
+    assert run_1.id != run_2.id
+    assert run_1.status == "completed"
+    assert run_2.status == "completed"
+    assert run_1.cache_hit is False
+    assert run_2.cache_hit is True
+    assert run_2.output_text == run_1.output_text
+
+    spans_1 = raw_db_session.scalars(
+        select(Span).where(Span.agent_run_id == run_1.id).order_by(Span.id)
+    ).all()
+    spans_2 = raw_db_session.scalars(
+        select(Span).where(Span.agent_run_id == run_2.id).order_by(Span.id)
+    ).all()
+    assert [s.stage_name for s in spans_1] == ["classify_intent", "retrieve", "compose_response", "finalize"]
+    assert [s.stage_name for s in spans_2] == ["classify_intent", "retrieve", "compose_response", "finalize"]
+    assert all(s.status == "success" for s in spans_2)
+
+    # Real, dramatic latency drop: the cache-hit run's total real measured
+    # latency must be a small fraction of the real graph run's.
+    total_latency_1 = sum(s.latency_ms for s in spans_1)
+    total_latency_2 = sum(s.latency_ms for s in spans_2)
+    assert total_latency_2 < total_latency_1
+
+    # Real $0 ModelCall row for the cache hit -- cost/telemetry dashboards
+    # must not silently under-count this real traffic.
+    new_model_calls = raw_db_session.scalars(
+        select(ModelCall).where(ModelCall.id > before_model_call_id).order_by(ModelCall.id)
+    ).all()
+    cache_hit_calls = [c for c in new_model_calls if c.purpose == "chat.cache_hit"]
+    assert len(cache_hit_calls) == 1
+    cache_hit_call = cache_hit_calls[0]
+    assert cache_hit_call.estimated_cost_usd == 0.0
+    assert cache_hit_call.input_tokens == 0
+    assert cache_hit_call.output_tokens == 0
+    assert cache_hit_call.status == "success"
+    assert cache_hit_call.trace_id is not None and len(cache_hit_call.trace_id) == 32
+
+    # The second call must have added EXACTLY the one cache-hit ModelCall
+    # row -- no additional "chat.classify_intent"/"chat.compose_response"
+    # rows, proving no real completion happened for this turn. Every row
+    # ID strictly greater than the cache-hit row's own id-minus-nothing
+    # (i.e. everything at or after it) must be that one row alone.
+    rows_at_or_after_cache_hit = [c for c in new_model_calls if c.id >= cache_hit_call.id]
+    assert {c.purpose for c in rows_at_or_after_cache_hit} == {"chat.cache_hit"}
+    assert "chat.classify_intent" in {c.purpose for c in new_model_calls}  # from the FIRST call only
+
+
+def test_chat_cache_miss_then_hit_returns_identical_citations_for_seeded_corpus(
+    chat_fixtures, seed_corpus_ingested, client
+):
+    """A cache hit must return the exact SAME citations/caption a real
+    grounded answer produced, not just the same answer text -- proves the
+    cached VALUE genuinely carries the full response payload, not just
+    `answer`.
+    """
+    requester = chat_fixtures
+    message = "What is a VPN, per the cache test?"
+
+    _call_count = {"n": 0}
+
+    def _complete_side_effect(prompt: str, *, model: str = "local-qwen3") -> CompletionResult:
+        _call_count["n"] += 1
+        if _call_count["n"] == 1:
+            return _classification_result()
+        context_match = re.search(r"<retrieved_context>(.*)</retrieved_context>", prompt, re.DOTALL)
+        assert context_match
+        match = re.search(r"\[chunk:(\d+)\]", context_match.group(1))
+        assert match
+        real_chunk_id = match.group(1)
+        return _answer_result(f"Answer with a real citation [chunk:{real_chunk_id}].")
+
+    with patch(_COMPLETE_PATCH_TARGET, side_effect=_complete_side_effect):
+        response_1 = client.post(
+            "/chat",
+            json={"message": message},
+            headers={"X-Debug-Employee-Id": str(requester.id)},
+        )
+    assert response_1.status_code == 200
+    body_1 = response_1.json()
+    assert body_1["citations"], "expected a real citation from the ingested seed corpus"
+
+    with patch(
+        _COMPLETE_PATCH_TARGET,
+        side_effect=AssertionError("cache hit must never call the real completion function"),
+    ) as mock_complete_2:
+        response_2 = client.post(
+            "/chat",
+            json={"message": message},
+            headers={"X-Debug-Employee-Id": str(requester.id)},
+        )
+    assert response_2.status_code == 200
+    mock_complete_2.assert_not_called()
+    body_2 = response_2.json()
+
+    assert body_2["citations"] == body_1["citations"]
+    assert body_2["caption"] == body_1["caption"]
+    assert body_2["answer"] == body_1["answer"]
+
+
+def test_chat_response_cache_never_shares_entries_across_different_scopes(
+    chat_fixtures, other_scope_chat_fixtures, client
+):
+    """Cross-user-leakage guard for the response cache, mirroring Task 2's
+    mandatory retrieval-cache leakage test: two employees with genuinely
+    DIFFERENT resolved `AuthzFilter`s (different departments -- neither is
+    the seed corpus's own department, so both resolve to a real, distinct,
+    empty-tag scope_sig computed from their own department name) asking
+    the IDENTICAL message text must NOT share a cache entry -- the second
+    employee's call must still reach the real completion function.
+    """
+    requester_a = chat_fixtures
+    requester_b = other_scope_chat_fixtures
+    message = "What is a VPN, per the cross-scope cache test?"
+
+    with patch(
+        _COMPLETE_PATCH_TARGET,
+        side_effect=[_classification_result(), _answer_result("Answer for requester A.")],
+    ) as mock_complete_a:
+        response_a = client.post(
+            "/chat",
+            json={"message": message},
+            headers={"X-Debug-Employee-Id": str(requester_a.id)},
+        )
+    assert response_a.status_code == 200
+    assert mock_complete_a.call_count == 2
+
+    # A genuinely different department -> a genuinely different resolved
+    # AuthzFilter/scope_sig (see other_scope_chat_fixtures) -> this MUST be
+    # a real cache miss, reaching the real completion function again, even
+    # though the message text and kb_version are identical to requester A's
+    # call above.
+    with patch(
+        _COMPLETE_PATCH_TARGET,
+        side_effect=[_classification_result(), _answer_result("Answer for requester B.")],
+    ) as mock_complete_b:
+        response_b = client.post(
+            "/chat",
+            json={"message": message},
+            headers={"X-Debug-Employee-Id": str(requester_b.id)},
+        )
+    assert response_b.status_code == 200
+    assert mock_complete_b.call_count == 2
+
+    assert response_a.json()["answer"] == "Answer for requester A."
+    assert response_b.json()["answer"] == "Answer for requester B."
+
+
+def test_chat_response_cache_degrades_to_real_graph_on_redis_outage(chat_fixtures, client):
+    """A real, genuinely unreachable Redis endpoint (not a mock) must never
+    break `/chat` -- the cache lookup/store degrade to "run the real
+    graph" instead of raising, mirroring Task 1/2's identical outage
+    -degrade proof (`test_cache.py`'s
+    `test_redis_outage_degrades_to_direct_embed_fn_instead_of_raising`).
+
+    `resolvegrid_api.cache.get_redis` returns the shared, real, reachable
+    dev Redis client via FastAPI's `Depends(get_redis)` -- there is no
+    per-request override plumbing for this in `main.py` today, so this
+    test instead proves the outage-degrade behavior directly at the
+    `response_cache` function level (real unreachable client, same as
+    `test_response_cache.py`), which is the actual unit `chat.py` calls
+    into and the only place a real Redis outage could ever surface.
+    """
+    import redis as redis_module
+
+    from resolvegrid_api.response_cache import lookup_cached_response
+
+    unreachable_client = redis_module.Redis(
+        host="localhost", port=1, socket_connect_timeout=1, socket_timeout=1
+    )
+    result = lookup_cached_response(
+        message_text="does this even matter",
+        kb_version=0,
+        scope_sig="unrestricted",
+        prompt_template_version="1",
+        redis_client=unreachable_client,
+    )
+    assert result is None
