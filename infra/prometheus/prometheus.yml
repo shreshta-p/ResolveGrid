@@ -35,6 +35,21 @@ scrape_configs:
     static_configs:
       - targets: ["otel-collector:8888"]
 
+  # Phase 12 Task 1: apps/api's own real OTel-Meter-backed counters
+  # (currently just cache_lookups_total{cache,result} -- see
+  # resolvegrid_telemetry.metrics.init_metrics and main.py's `/metrics`
+  # ASGI mount). apps/api runs on the HOST (uv run uvicorn, per Makefile),
+  # not as a container on this compose network, unlike litellm/otel
+  # -collector above -- `host.docker.internal` is how a container reaches
+  # the host's own ports. Works out of the box on Docker Desktop
+  # (Windows/Mac, this dev machine included); the prometheus service below
+  # gets an explicit `host-gateway` extra_hosts entry so the same config
+  # also resolves on Linux Docker Engine.
+  - job_name: resolvegrid-api
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["host.docker.internal:8000"]
+
   - job_name: prometheus
     static_configs:
       - targets: ["localhost:9090"]

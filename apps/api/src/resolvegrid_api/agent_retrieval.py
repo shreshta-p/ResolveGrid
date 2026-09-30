@@ -82,13 +82,14 @@ order:
 
 from sqlalchemy import select
 
+from resolvegrid_api.cache import get_or_compute_embeddings, get_redis_client
 from resolvegrid_api.db import session_factory
 from resolvegrid_api.models.knowledge import Chunk, Document, DocumentVersion
 from resolvegrid_api.retrieval import assess_sufficiency, fuse_rrf, lexical_search, vector_search
 from resolvegrid_api.retrieval_authz import AuthzFilter
 from resolvegrid_retrieval.context_budget import assemble_context
 from resolvegrid_retrieval.dedup import dedup
-from resolvegrid_retrieval.embedder import EmbeddingError, embed_texts
+from resolvegrid_retrieval.embedder import DEFAULT_EMBEDDING_MODEL, EmbeddingError, embed_texts
 from resolvegrid_retrieval.reranker import RerankError, rerank
 from resolvegrid_retrieval.status_adjustment import apply_status_adjustment
 
@@ -166,7 +167,16 @@ def retrieve_for_agent(query_text: str, scope: dict | None) -> dict:
 
     with session_factory() as session:
         try:
-            query_vector = embed_texts([query_text])[0]
+            # Phase 12 Task 1: Redis-backed embedding cache
+            # (`resolvegrid_api.cache`) wraps the real `embed_texts` call
+            # here rather than inside `services/retrieval` itself -- see
+            # that module's docstring for the dependency-direction reason.
+            query_vector = get_or_compute_embeddings(
+                [query_text],
+                model=DEFAULT_EMBEDDING_MODEL,
+                redis_client=get_redis_client(),
+                embed_fn=embed_texts,
+            )[0]
         except EmbeddingError:
             query_vector = None
 

@@ -22,6 +22,8 @@ dependencies = [
     "pgvector>=0.3",
     "arq>=0.26",
     "jsonschema>=4.26.0",
+    "redis>=5.0",
+    "prometheus-client>=0.20",
 ]
 
 [tool.uv.sources]

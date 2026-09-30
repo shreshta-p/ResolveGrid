@@ -7,8 +7,9 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from opentelemetry import trace
+from prometheus_client import make_asgi_app
 from resolvegrid_agent_orchestration import build_graph, build_tool_invocation_graph
-from resolvegrid_telemetry import init_tracing
+from resolvegrid_telemetry import init_metrics, init_tracing
 
 from resolvegrid_api.agent_mutation_execution import execute_mutation_for_agent
 from resolvegrid_api.agent_retrieval import retrieve_for_agent
@@ -64,6 +65,13 @@ _DEV_ORIGINS = ["http://localhost:3000", "http://localhost:3001"]
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     tracer = init_tracing("resolvegrid-api")
+    # Phase 12 Task 1: real OTel Meter-based counters (currently just
+    # `cache_lookups_total`, `resolvegrid_api.cache`), exposed via the
+    # `/metrics` ASGI app mounted below -- see
+    # `resolvegrid_telemetry.metrics.init_metrics`'s docstring for why this
+    # is a direct-scrape Prometheus reader rather than routed through
+    # `otel-collector`.
+    init_metrics("resolvegrid-api")
     with tracer.start_as_current_span("api.startup"):
         # Placeholder span proving the OTel pipe works end-to-end; real
         # startup instrumentation lands as later phases add real startup work.
@@ -156,6 +164,13 @@ app.include_router(chat.router)
 app.include_router(tools.router)
 app.include_router(approvals.router)
 app.include_router(evals.router)
+# Phase 12 Task 1: real Prometheus scrape endpoint for this process's own
+# OTel-Meter-backed counters (see `init_metrics` call in `lifespan` above).
+# `make_asgi_app()` serves whatever `prometheus_client`'s default registry
+# holds -- the same registry `PrometheusMetricReader` writes into -- mirrors
+# how LiteLLM/otel-collector each expose their own `/metrics` for direct
+# Prometheus scraping (`infra/prometheus/prometheus.yml`).
+app.mount("/metrics", make_asgi_app())
 
 
 @app.get("/health")

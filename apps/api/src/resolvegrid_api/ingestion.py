@@ -73,6 +73,7 @@ from datetime import datetime
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from resolvegrid_api.cache import get_or_compute_embeddings, get_redis_client
 from resolvegrid_api.knowledge_store import store_chunks_with_embeddings
 from resolvegrid_api.models.knowledge import Document, DocumentVersion
 from resolvegrid_retrieval.chunker import chunk_markdown
@@ -230,7 +231,16 @@ def ingest_document(
 
     chunk_records = chunk_markdown(raw_markdown, parser_version, chunking_version)
     texts = [record.text for record in chunk_records]
-    vectors = embed_texts(texts, model=embedding_model)
+    # Phase 12 Task 1: same Redis-backed embedding cache as the query-time
+    # path (`agent_retrieval.py`) -- re-ingesting an unchanged chunk's text
+    # (e.g. a corpus re-edit that only touches a few documents) skips the
+    # real Ollama embed call for every chunk whose text hasn't changed.
+    vectors = get_or_compute_embeddings(
+        texts,
+        model=embedding_model,
+        redis_client=get_redis_client(),
+        embed_fn=lambda batch: embed_texts(batch, model=embedding_model),
+    )
     store_chunks_with_embeddings(
         session,
         document_version_id=version.id,

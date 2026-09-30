@@ -334,6 +334,12 @@ services:
       - prometheus_data:/prometheus
     ports:
       - "9090:9090"
+    # Phase 12 Task 1: lets the resolvegrid-api scrape target
+    # (host.docker.internal:8000, prometheus.yml) resolve on Linux Docker
+    # Engine too -- a no-op on Docker Desktop (Windows/Mac), where
+    # host.docker.internal already resolves without this.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     depends_on:
       litellm:
         condition: service_healthy
