@@ -109,6 +109,30 @@ def get_kb_version(session: Session) -> int:
     perfectly valid, stable version stamp for "nothing has ever been
     ingested", and keeps this function's return type a plain `int` rather
     than forcing every caller to separately handle `int | None`.
+
+    Known invalidation gap (documented, not yet closed -- flagging for
+    Task 6's invalidation-wiring confirmation so it isn't rediscovered
+    independently): this version stamp only advances when a real
+    `IngestionRun` row is created/completed, which today happens for
+    every PRODUCTION ingestion path (`ingestion_worker.py`'s
+    `run_seed_corpus_ingestion`/Arq job, the only real caller of
+    `ingestion.py`'s `ingest_document` in this codebase as of Phase 12
+    Task 2). A future caller that persists new/changed `Chunk`/`Embedding`
+    rows WITHOUT going through that path -- i.e. that calls
+    `ingest_document`/`knowledge_store.store_chunks_with_embeddings`
+    directly and never creates a matching `IngestionRun` row -- would
+    silently never bump `kb_version`, so any retrieval-cache entry keyed
+    off the old version would keep being served (correctly authorized,
+    just stale) until its 2-hour TTL naturally expires, not immediately.
+    The one caller that does this today
+    (`apps/api/tests/test_adversarial_suite.py`'s
+    `injected_document_ingested` fixture) is deliberately isolated from
+    the real seed-corpus path for a different, unrelated reason (its
+    content is a live prompt-injection payload that must never reach
+    `run_seed_corpus_ingestion`'s normal manifest) and is test-only, so it
+    poses no real production risk today -- but the NEXT such bypass might
+    not be as deliberately contained, so this gap is recorded here rather
+    than assumed away.
     """
     return session.scalar(
         select(func.max(IngestionRun.id)).where(IngestionRun.status == "completed")
@@ -162,6 +186,18 @@ def get_or_compute_retrieval(
         already-correctly-computed real result is still returned; the
         "miss" telemetry already recorded remains accurate since it
         genuinely was a miss).
+
+    Accepted tradeoff, deliberately not addressed here: no single-flight
+    lock on concurrent population. If two requests for the identical
+    `(kb_version, scope_sig, query_text)` key race (e.g. two employees in
+    the same department asking the same question within milliseconds of
+    each other), BOTH will observe a miss and BOTH will run the real,
+    expensive `compute_fn()` (last `SET` wins) -- a real thundering-herd
+    cost under concurrent load, not a correctness or authz problem (both
+    computations are independently, identically authorized-correct, so
+    the eventual cached value is valid regardless of which write wins).
+    Adding a real lock (e.g. Redis `SETNX`-based) is left for a future
+    task if this cost is ever measured to matter in practice.
     """
     key = _retrieval_cache_key(kb_version, scope_sig, query_text)
     counter = get_cache_lookups_counter()
