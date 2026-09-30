@@ -31,6 +31,7 @@ parameter, rather than threading a new cache parameter through
 import hashlib
 import json
 import os
+import threading
 from collections.abc import Callable, Iterator
 
 import redis
@@ -60,6 +61,18 @@ REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6380/0")
 EMBEDDING_CACHE_TTL_SECONDS = 7 * 24 * 60 * 60  # 7 days
 
 _redis_client: redis.Redis | None = None
+# Guards the check-then-set below against a real race: two threads (e.g. two
+# concurrent first requests in the same process, since apps/api serves
+# requests off a threadpool -- FastAPI's default sync-endpoint behavior)
+# both observing `_redis_client is None` before either assigns it. Without
+# this lock that race is real but low-impact (each thread would construct
+# its own independently-valid `redis.Redis` instance -- `redis-py` clients
+# are just connection-pool handles, not global state -- so the only actual
+# cost would be one harmless extra client object, immediately discarded by
+# whichever thread loses); the lock is added anyway since it's a one-line
+# fix that removes the ambiguity entirely rather than leaving it as an
+# accepted-but-unaddressed race.
+_redis_client_lock = threading.Lock()
 
 
 def get_redis_client() -> redis.Redis:
@@ -73,7 +86,10 @@ def get_redis_client() -> redis.Redis:
     """
     global _redis_client
     if _redis_client is None:
-        _redis_client = redis.Redis.from_url(REDIS_URL)
+        with _redis_client_lock:
+            if _redis_client is None:  # re-check: another thread may have
+                # already built it while this thread was waiting on the lock.
+                _redis_client = redis.Redis.from_url(REDIS_URL)
     return _redis_client
 
 
@@ -137,12 +153,36 @@ def get_or_compute_embeddings(
     unchanged -- callers keep whatever degrade-on-failure behavior they
     already had around the raw `embed_texts` call (e.g. `agent_retrieval.
     py`'s degrade-to-lexical-only-search on `EmbeddingError`).
+
+    Redis outage handling: this is a cache, not a hard dependency -- a real
+    Redis outage must never take down retrieval/ingestion, which have zero
+    other reason to depend on Redis being up. If the initial `MGET` read
+    fails (`redis.exceptions.RedisError` -- covers `ConnectionError`,
+    `TimeoutError`, etc.), there is no way to know which entries were
+    actually cached, so this degrades to computing every input via
+    `embed_fn` directly (recording one `result="error"` lookup per text --
+    an outage must stay visible in the same telemetry a hit/miss would be,
+    not silently vanish from the metric) and returns those, skipping the
+    cache read AND write entirely for this call. If the read succeeds but
+    the later pipelined write-back fails (e.g. Redis dies mid-call), the
+    already-correctly-computed `embed_fn` results for this call are still
+    returned as-is (nothing is lost) -- only the write-back is skipped, so
+    a future call simply won't get this entry's benefit yet; the "miss"
+    telemetry already recorded above for those entries remains accurate
+    (they genuinely were misses), so no separate telemetry is needed for a
+    write-back failure specifically.
     """
     if not texts:
         return []
 
     keys = [_embedding_cache_key(model, text) for text in texts]
-    cached_raw = redis_client.mget(keys)
+
+    try:
+        cached_raw = redis_client.mget(keys)
+    except redis.exceptions.RedisError:
+        for _ in texts:
+            _cache_lookups_counter.add(1, {"cache": "embedding", "result": "error"})
+        return embed_fn(texts)
 
     results: list[list[float] | None] = [None] * len(texts)
     miss_indices: list[int] = []
@@ -161,6 +201,12 @@ def get_or_compute_embeddings(
         for index, vector in zip(miss_indices, computed):
             results[index] = vector
             pipe.set(keys[index], json.dumps(vector), ex=EMBEDDING_CACHE_TTL_SECONDS)
-        pipe.execute()
+        try:
+            pipe.execute()
+        except redis.exceptions.RedisError:
+            # Write-back failed -- see docstring above: `results` is already
+            # fully populated from `computed` by the loop above, so this is
+            # a no-op other than not persisting to Redis for next time.
+            pass
 
     return results  # type: ignore[return-value]  # every index is now filled
