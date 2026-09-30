@@ -114,6 +114,23 @@ _cache_lookups_counter = _meter.create_counter(
 )
 
 
+def get_cache_lookups_counter() -> metrics.Counter:
+    """Return the one process-wide `cache_lookups_total` OTel counter.
+
+    Every cache-kind module this phase adds (Task 2's `retrieval_cache.py`,
+    later Tasks 3/5) must record its `cache="..."` label onto this SAME
+    counter instance, not a second, disconnected one created via its own
+    `metrics.get_meter(...).create_counter(...)` call -- two counters with
+    the same name registered against the same Meter would be an OTel
+    instrument-collision error, and even if it weren't, a second counter
+    object would fragment one logical metric across two Python objects for
+    no reason. Exposed as a function (rather than importing the
+    underscore-prefixed `_cache_lookups_counter` directly) so this module's
+    encapsulation of "there is exactly one of these" stays enforceable.
+    """
+    return _cache_lookups_counter
+
+
 def _embedding_cache_key(model: str, text: str) -> str:
     """`cache:embedding:{model}:{sha256(text)}` -- the exact key shape the
     plan doc's cross-cutting design section specifies.

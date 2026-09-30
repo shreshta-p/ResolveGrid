@@ -87,6 +87,7 @@ from resolvegrid_api.db import session_factory
 from resolvegrid_api.models.knowledge import Chunk, Document, DocumentVersion
 from resolvegrid_api.retrieval import assess_sufficiency, fuse_rrf, lexical_search, vector_search
 from resolvegrid_api.retrieval_authz import AuthzFilter
+from resolvegrid_api.retrieval_cache import compute_scope_sig, get_kb_version, get_or_compute_retrieval
 from resolvegrid_retrieval.context_budget import assemble_context
 from resolvegrid_retrieval.dedup import dedup
 from resolvegrid_retrieval.embedder import DEFAULT_EMBEDDING_MODEL, EmbeddingError, embed_texts
@@ -162,82 +163,110 @@ def retrieve_for_agent(query_text: str, scope: dict | None) -> dict:
     dependency is unavailable (see `_rerank_or_degrade`). Other failures
     (DB unreachable, etc.) propagate; the graph's `retrieve` node is what
     degrades softly on those (see its docstring).
+
+    Phase 12 Task 2: the full pipeline below (everything from the query
+    embedding through token-budget assembly) is wrapped in
+    `resolvegrid_api.retrieval_cache.get_or_compute_retrieval` -- a cache
+    hit returns the exact same dict shape without running vector_search,
+    lexical_search, rerank, status-adjustment, dedup, or budget assembly at
+    all. `kb_version` and `scope_sig` (see that module's docstring for the
+    security rationale of the latter) are computed from THIS call's own
+    real, resolved `authz_filter` and a real DB query every time -- never
+    cached themselves -- so the cache key always reflects the real current
+    authorization scope and corpus version.
     """
     authz_filter = _authz_filter_from_scope(scope)
 
     with session_factory() as session:
-        try:
-            # Phase 12 Task 1: Redis-backed embedding cache
-            # (`resolvegrid_api.cache`) wraps the real `embed_texts` call
-            # here rather than inside `services/retrieval` itself -- see
-            # that module's docstring for the dependency-direction reason.
-            query_vector = get_or_compute_embeddings(
-                [query_text],
-                model=DEFAULT_EMBEDDING_MODEL,
-                redis_client=get_redis_client(),
-                embed_fn=embed_texts,
-            )[0]
-        except EmbeddingError:
-            query_vector = None
+        kb_version = get_kb_version(session)
+        scope_sig = compute_scope_sig(authz_filter)
 
-        vector_results = (
-            vector_search(session, query_vector, limit=_SEARCH_LIMIT, authz_filter=authz_filter)
-            if query_vector is not None
-            else []
-        )
-        lexical_results = lexical_search(
-            session, query_text, limit=_SEARCH_LIMIT, authz_filter=authz_filter
-        )
-        fused = fuse_rrf(vector_results, lexical_results)
-        sufficiency = assess_sufficiency(fused)
+        def _compute_retrieval() -> dict:
+            try:
+                # Phase 12 Task 1: Redis-backed embedding cache
+                # (`resolvegrid_api.cache`) wraps the real `embed_texts`
+                # call here rather than inside `services/retrieval` itself
+                # -- see that module's docstring for the dependency
+                # -direction reason.
+                query_vector = get_or_compute_embeddings(
+                    [query_text],
+                    model=DEFAULT_EMBEDDING_MODEL,
+                    redis_client=get_redis_client(),
+                    embed_fn=embed_texts,
+                )[0]
+            except EmbeddingError:
+                query_vector = None
 
-        fused_ids = [chunk_id for chunk_id, _score in fused]
+            vector_results = (
+                vector_search(session, query_vector, limit=_SEARCH_LIMIT, authz_filter=authz_filter)
+                if query_vector is not None
+                else []
+            )
+            lexical_results = lexical_search(
+                session, query_text, limit=_SEARCH_LIMIT, authz_filter=authz_filter
+            )
+            fused = fuse_rrf(vector_results, lexical_results)
+            sufficiency = assess_sufficiency(fused)
 
-        rows = (
-            session.execute(
-                select(Chunk.id, Chunk.text, Document.title, Document.status)
-                .join(DocumentVersion, DocumentVersion.id == Chunk.document_version_id)
-                .join(Document, Document.id == DocumentVersion.document_id)
-                .where(Chunk.id.in_(fused_ids))
-            ).all()
-            if fused_ids
-            else []
-        )
-        row_by_id = {row.id: row for row in rows}
+            fused_ids = [chunk_id for chunk_id, _score in fused]
 
-        # Only candidates that actually resolved to a real row survive
-        # (matches the old code's "if chunk_id in row_by_id" guard) --
-        # rerank() below is given exactly this authorized, resolvable set,
-        # never the raw fused id list.
-        candidates = [
-            (chunk_id, row_by_id[chunk_id].text) for chunk_id in fused_ids if chunk_id in row_by_id
-        ]
-        superseded_chunk_ids = frozenset(
-            chunk_id for chunk_id in fused_ids if chunk_id in row_by_id and row_by_id[chunk_id].status == "superseded"
-        )
+            rows = (
+                session.execute(
+                    select(Chunk.id, Chunk.text, Document.title, Document.status)
+                    .join(DocumentVersion, DocumentVersion.id == Chunk.document_version_id)
+                    .join(Document, Document.id == DocumentVersion.document_id)
+                    .where(Chunk.id.in_(fused_ids))
+                ).all()
+                if fused_ids
+                else []
+            )
+            row_by_id = {row.id: row for row in rows}
 
-        reranked = _rerank_or_degrade(query_text, candidates)
-        adjusted = apply_status_adjustment(reranked, superseded_chunk_ids=superseded_chunk_ids)
-        deduped = dedup(adjusted)
+            # Only candidates that actually resolved to a real row survive
+            # (matches the old code's "if chunk_id in row_by_id" guard) --
+            # rerank() below is given exactly this authorized, resolvable
+            # set, never the raw fused id list.
+            candidates = [
+                (chunk_id, row_by_id[chunk_id].text)
+                for chunk_id in fused_ids
+                if chunk_id in row_by_id
+            ]
+            superseded_chunk_ids = frozenset(
+                chunk_id
+                for chunk_id in fused_ids
+                if chunk_id in row_by_id and row_by_id[chunk_id].status == "superseded"
+            )
 
-        assembly_input = [
-            (chunk_id, row_by_id[chunk_id].title, text) for chunk_id, text, _score in deduped
-        ]
-        context = assemble_context(assembly_input)
+            reranked = _rerank_or_degrade(query_text, candidates)
+            adjusted = apply_status_adjustment(reranked, superseded_chunk_ids=superseded_chunk_ids)
+            deduped = dedup(adjusted)
 
-        score_by_id = {chunk_id: score for chunk_id, _text, score in deduped}
-        chunks = [
-            {
-                "chunk_id": chunk_id,
-                "document_title": row_by_id[chunk_id].title,
-                "text": row_by_id[chunk_id].text,
-                "score": score_by_id[chunk_id],
+            assembly_input = [
+                (chunk_id, row_by_id[chunk_id].title, text) for chunk_id, text, _score in deduped
+            ]
+            context = assemble_context(assembly_input)
+
+            score_by_id = {chunk_id: score for chunk_id, _text, score in deduped}
+            chunks = [
+                {
+                    "chunk_id": chunk_id,
+                    "document_title": row_by_id[chunk_id].title,
+                    "text": row_by_id[chunk_id].text,
+                    "score": score_by_id[chunk_id],
+                }
+                for chunk_id in context.chunk_ids
+            ]
+
+            return {
+                "chunks": chunks,
+                "sufficient": sufficiency.sufficient,
+                "context_block": context.text,
             }
-            for chunk_id in context.chunk_ids
-        ]
 
-        return {
-            "chunks": chunks,
-            "sufficient": sufficiency.sufficient,
-            "context_block": context.text,
-        }
+        return get_or_compute_retrieval(
+            query_text=query_text,
+            kb_version=kb_version,
+            scope_sig=scope_sig,
+            redis_client=get_redis_client(),
+            compute_fn=_compute_retrieval,
+        )
