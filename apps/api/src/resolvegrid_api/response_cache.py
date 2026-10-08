@@ -56,6 +56,38 @@ error telemetry and Redis-outage-degrade CONVENTIONS are still followed
 exactly (see each function's docstring below) -- only the single-call
 shape differs.
 
+Accepted tradeoff, deliberately not addressed here (matching `retrieval_
+cache.get_or_compute_retrieval`'s identical documented sign-off, lines
+190-200 of that module): no single-flight lock on concurrent population.
+If two identical `/chat` calls (same `kb_version`/`scope_sig`/
+`prompt_template_version`/`message_text`) race, BOTH observe a miss and
+BOTH run the full real graph -- a real completion call, real DB writes,
+the works -- with the last `SET` wins. This cache's version of that
+tradeoff costs strictly MORE per collision than Task 2's: a duplicated
+full graph run (classify_intent + compose_response LLM calls, not just a
+duplicated retrieval pipeline), so a real thundering herd here is more
+expensive per occurrence, even though neither correctness nor authz is
+at risk (both racing computations are independently, identically
+authorized-correct). Still not addressed for the identical reason Task 2
+left it unaddressed: no measurement yet shows this cost actually matters
+in practice for `/chat`'s real traffic pattern. A real lock (e.g. Redis
+`SETNX`-based) is left for a future task if that changes.
+
+Known inherited staleness gap (not new to this cache, cross-referenced
+here so a future reader doesn't have to rediscover it from scratch):
+`retrieval_cache.py`'s module docstring (lines 56-76) already documents
+that a rerank/dedup/status-adjustment code change, or a `Document.status`
+flip to "superseded", does NOT bump `kb_version` -- so a retrieval-cache
+hit can still serve a stale *ranking* within its own 2-hour TTL. This
+response cache inherits that exact same risk one layer up: it caches the
+full COMPOSED ANSWER (not just the ranking), so a stale ranking served
+underneath a response-cache hit means a stale answer can be served here
+too, bounded by THIS cache's own tighter 15-minute TTL rather than
+retrieval's 2-hour one. The entitlement-staleness rationale below is why
+this cache's TTL is as short as it is; this ranking-staleness risk is a
+second, independent reason the same short TTL is doing real work, not
+just the first one.
+
 TTL: 15 minutes (900s) -- the SHORT end of the plan doc's stated 15-30
 minute range, chosen deliberately, not split down the middle. This is the
 one cache in this phase where the cross-cutting design section's

@@ -81,6 +81,23 @@ def current_pricing_version(session: Session, provider: str, model: str) -> Pric
     )
 
 
+def _current_trace_id() -> str:
+    """Real OTel trace-id capture, factored out of `log_completion`/`log_
+    cache_hit_model_call` (both previously duplicated this exact snippet
+    verbatim, flagged on code review): read the actual current trace id
+    from the active span context, formatted as the standard 32-hex-char
+    lowercase string via the OTel API's own formatter (verified against
+    the installed `opentelemetry-api==1.44.0`: `trace.format_trace_id`
+    returns exactly this format). Must be called from inside a live
+    `tracer.start_as_current_span(...)` block -- both call sites capture
+    it immediately on span entry, before any other work, so every
+    `ModelCall` row either function writes (success, error, or cache-hit
+    shaped) can carry it.
+    """
+    span_context = otel_trace.get_current_span().get_span_context()
+    return otel_trace.format_trace_id(span_context.trace_id)
+
+
 def log_completion(
     session: Session,
     tracer: Tracer,
@@ -117,15 +134,9 @@ def log_completion(
     session itself, or the `ModelCall` row this just added is silently lost.
     """
     with tracer.start_as_current_span(f"llm.{purpose}") as span:
-        # Real OTel trace-id capture: read the actual current trace id from
-        # the active span context, formatted as the standard 32-hex-char
-        # lowercase string via the OTel API's own formatter (verified
-        # against the installed opentelemetry-api==1.44.0:
-        # `trace.format_trace_id` returns exactly this format). Captured
-        # up front so both the success and error `ModelCall` rows below can
-        # carry it.
-        span_context = otel_trace.get_current_span().get_span_context()
-        trace_id = otel_trace.format_trace_id(span_context.trace_id)
+        # Captured up front (see `_current_trace_id`'s own docstring) so
+        # both the success and error `ModelCall` rows below can carry it.
+        trace_id = _current_trace_id()
 
         # Phase 11 Task 4 fix (flagged by name in the comment this replaces):
         # gen_ai.system/the error-row's `provider` used to be hardcoded
@@ -229,6 +240,20 @@ def log_cache_hit_model_call(
     error). Does NOT call `session.commit()` -- same caller-owns-the
     -transaction-boundary convention as `log_completion`/`record_audit_
     event`.
+
+    Shares `log_completion`'s span-open + trace-id-capture shape (both
+    open a `tracer.start_as_current_span(f"llm.{purpose}")` block and
+    immediately capture the real trace id via the same `_current_trace_
+    id()` helper) but is NOT merged into `log_completion` itself: that
+    function's body is built entirely around a real `llm_gateway.
+    complete()` call (try/except around it, usage-token span attributes
+    read off its result, fallback-aware `gen_ai.response.model`) that
+    simply does not exist on this path -- forcing both shapes through one
+    function would mean a `complete_fn: Callable[..] | None` parameter and
+    an `if cache_hit: ... else: ...` branch splitting most of that
+    function's body, which is less readable than two small, honestly
+    -named functions sharing just the one real duplicated primitive
+    (trace-id capture, now factored out above).
     """
     model = select_model_for_risk_level(risk_level)
     provider = llm_gateway.provider_for_model(model)
@@ -238,8 +263,7 @@ def log_cache_hit_model_call(
         span.set_attribute("gen_ai.system", provider)
         span.set_attribute("gen_ai.request.model", model)
         span.set_attribute("resolvegrid.cache_hit", True)
-        span_context = otel_trace.get_current_span().get_span_context()
-        trace_id = otel_trace.format_trace_id(span_context.trace_id)
+        trace_id = _current_trace_id()
 
     session.add(
         ModelCall(

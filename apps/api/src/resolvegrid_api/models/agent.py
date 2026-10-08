@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from sqlalchemy import ForeignKey, Index, func
+from sqlalchemy import ForeignKey, Index, false, func
 from sqlalchemy.orm import Mapped, mapped_column
 
 from resolvegrid_api.models.base import Base
@@ -44,10 +44,16 @@ class AgentRun(Base):
     # with a third meaning or burying the signal in `Span.detail_json`
     # (see migration 0017's docstring for the full "why a column, and why
     # here, not there" reasoning). Never True for any row written before
-    # this column existed -- `server_default=false` backfills every
+    # this column existed -- `server_default=false()` backfills every
     # pre-existing row to the honest value, since none of them could have
-    # been a cache hit (this cache didn't exist yet).
-    cache_hit: Mapped[bool] = mapped_column(default=False)
+    # been a cache hit (this cache didn't exist yet). Declared at BOTH
+    # layers (`default=False` for ORM-side inserts, `server_default=
+    # false()` for the real DB-level default migration 0017 already
+    # applies) -- matching `created_at`'s existing precedent just above of
+    # declaring the DB-level default explicitly here too, not just in the
+    # migration, so a future `alembic revision --autogenerate` sees the
+    # model and the schema agree and proposes no spurious drift fix.
+    cache_hit: Mapped[bool] = mapped_column(default=False, server_default=false())
 
 
 class Span(Base):
