@@ -8,6 +8,7 @@ from resolvegrid_api.models.knowledge import (
     DocumentVersion,
     Embedding,
     IngestionRun,
+    SemanticResponseCache,
 )
 from resolvegrid_api.models.org import (
     AccessGroup,
@@ -47,6 +48,7 @@ __all__ = [
     "PricingVersion",
     "Queue",
     "RoleAssignment",
+    "SemanticResponseCache",
     "Span",
     "Team",
     "Ticket",

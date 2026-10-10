@@ -9,7 +9,7 @@ from pydantic import BaseModel
 from resolvegrid_agent_orchestration import PROMPT_TEMPLATE_VERSION
 from sqlalchemy.orm import Session
 
-from resolvegrid_api.cache import get_redis
+from resolvegrid_api.cache import get_or_compute_embeddings, get_redis
 from resolvegrid_api.db import get_db
 from resolvegrid_api.deps import get_principal
 from resolvegrid_api.model_call_logging import log_cache_hit_model_call
@@ -17,7 +17,9 @@ from resolvegrid_api.models import AgentRun, Span
 from resolvegrid_api.response_cache import lookup_cached_response, store_cached_response
 from resolvegrid_api.retrieval_authz import build_authz_filter
 from resolvegrid_api.retrieval_cache import compute_scope_sig, get_kb_version
+from resolvegrid_api.semantic_cache import lookup_semantic_cache, store_semantic_cache_entry
 from resolvegrid_authz import Principal
+from resolvegrid_retrieval.embedder import DEFAULT_EMBEDDING_MODEL, EmbeddingError, embed_texts
 
 router = APIRouter(prefix="/chat", tags=["chat"])
 
@@ -142,6 +144,25 @@ async def chat(
     this handler falls through to the exact pre-existing real-graph flow
     below, then stores the freshly computed response into the cache right
     before returning it.
+
+    Semantic-response cache note (Phase 12 Task 5, `resolvegrid_api.
+    semantic_cache`): if the exact-response cache above misses, this
+    handler computes a real embedding of `payload.message` (via Task 1's
+    `get_or_compute_embeddings`) and checks `resolvegrid_api.semantic_cache`
+    for a semantically-similar PRIOR question within the same `(kb_version,
+    scope_sig)` -- a real pgvector cosine-distance match, not an exact text
+    match, so a differently-worded-but-equivalent question (e.g. "What is a
+    VPN?" vs. "Could you explain what a VPN is?") can still hit. A real hit
+    here follows the IDENTICAL real-row contract as an exact-cache hit
+    (`AgentRun`/4-row `Span` set/`$0` `ModelCall`), distinguished by
+    `cache_hit_kind="semantic"` (vs. `"exact"`) and `purpose="chat.
+    semantic_cache_hit"` (vs. `"chat.cache_hit"`). On a full miss (both
+    caches missed, or the embedding call itself degraded via a real
+    `EmbeddingError`), this falls through to the real graph exactly as
+    before, then -- after a successful real graph run -- populates BOTH the
+    exact cache (for a future byte-identical repeat) AND this semantic
+    cache (for a future similar-but-different repeat), reusing the SAME
+    query embedding computed above rather than re-embedding.
     """
     thread_id = uuid4().hex
 
@@ -189,6 +210,7 @@ async def chat(
         # real, queryable AgentRun/Span/ModelCall row set.
         agent_run.status = "completed"
         agent_run.cache_hit = True
+        agent_run.cache_hit_kind = "exact"
         agent_run.output_text = cached_response.get("answer") or ""
         agent_run.completed_at = datetime.now(timezone.utc)
 
@@ -228,6 +250,81 @@ async def chat(
             "thread_id": thread_id,
             "citations": cached_response.get("citations") or [],
             "caption": cached_response.get("caption") or "",
+        }
+
+    # Phase 12 Task 5: the exact-match cache missed -- before falling
+    # through to the real graph, check the semantic (embedding-similarity)
+    # cache. A real query embedding is computed via Task 1's
+    # `get_or_compute_embeddings` (so this benefits from that cache too,
+    # and a repeat of the SAME query text here is itself a Redis hit, not a
+    # fresh Ollama call) -- kept in `query_embedding` so a FULL miss below
+    # can reuse it to populate this semantic cache without re-embedding.
+    # `EmbeddingError` (Ollama down/model not pulled) degrades to skipping
+    # the semantic cache entirely for this call -- same "a cache must never
+    # break /chat" contract every other cache in this phase follows; the
+    # real graph still runs and still answers the question.
+    query_embedding: list[float] | None = None
+    semantic_cached_response: dict | None = None
+    with tracer.start_as_current_span("chat.semantic_cache_lookup") as semantic_cache_span:
+        semantic_cache_span.set_attribute("resolvegrid.thread_id", thread_id)
+        semantic_lookup_start = time.monotonic()
+        try:
+            query_embedding = get_or_compute_embeddings(
+                [payload.message],
+                model=DEFAULT_EMBEDDING_MODEL,
+                redis_client=redis_client,
+                embed_fn=embed_texts,
+            )[0]
+        except EmbeddingError:
+            query_embedding = None
+
+        if query_embedding is not None:
+            semantic_cached_response = lookup_semantic_cache(
+                session,
+                query_embedding=query_embedding,
+                scope_sig=scope_sig,
+                kb_version=kb_version,
+            )
+        semantic_lookup_latency_ms = int((time.monotonic() - semantic_lookup_start) * 1000)
+        semantic_cache_span.set_attribute(
+            "resolvegrid.cache_hit", semantic_cached_response is not None
+        )
+
+    if semantic_cached_response is not None:
+        # SEMANTIC CACHE HIT: same real-row contract as the exact-cache-hit
+        # branch above (see that branch's comment), distinguished only by
+        # `cache_hit_kind="semantic"` and the `chat.semantic_cache_hit`
+        # ModelCall purpose, so telemetry/dashboards can tell the two cache
+        # mechanisms apart without guessing.
+        agent_run.status = "completed"
+        agent_run.cache_hit = True
+        agent_run.cache_hit_kind = "semantic"
+        agent_run.output_text = semantic_cached_response.get("answer") or ""
+        agent_run.completed_at = datetime.now(timezone.utc)
+
+        for index, stage_name in enumerate(_STAGE_NAMES):
+            session.add(
+                Span(
+                    agent_run_id=agent_run.id,
+                    stage_name=stage_name,
+                    status="success",
+                    latency_ms=semantic_lookup_latency_ms if index == 0 else 0,
+                )
+            )
+
+        log_cache_hit_model_call(
+            session,
+            tracer,
+            purpose="chat.semantic_cache_hit",
+            risk_level=semantic_cached_response.get("risk_level") or "low",
+        )
+        session.commit()
+
+        return {
+            "answer": agent_run.output_text,
+            "thread_id": thread_id,
+            "citations": semantic_cached_response.get("citations") or [],
+            "caption": semantic_cached_response.get("caption") or "",
         }
 
     initial_state = {
@@ -370,6 +467,28 @@ async def chat(
             "risk_level": final_state.get("risk_level") or "low",
         },
     )
+
+    # Phase 12 Task 5: also populate the semantic cache for a future
+    # semantically-similar (not necessarily byte-identical) question within
+    # this same (kb_version, scope_sig). Reuses the SAME `query_embedding`
+    # computed during the semantic-cache lookup above -- never re-embeds.
+    # Skipped (not an error) if that earlier embedding call degraded to
+    # `None` (a real EmbeddingError) -- there is nothing to index without a
+    # real query embedding.
+    if query_embedding is not None:
+        store_semantic_cache_entry(
+            session,
+            query_embedding=query_embedding,
+            scope_sig=scope_sig,
+            kb_version=kb_version,
+            value={
+                "answer": output_text,
+                "citations": citations,
+                "caption": caption,
+                "intent": final_state.get("intent") or "unclear",
+                "risk_level": final_state.get("risk_level") or "low",
+            },
+        )
 
     return {
         "answer": output_text,

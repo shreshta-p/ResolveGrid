@@ -12,7 +12,14 @@ from resolvegrid_api.ingestion_worker import run_seed_corpus_ingestion
 from resolvegrid_api.llm_gateway import CompletionResult
 from resolvegrid_api.main import app
 from resolvegrid_api.models import AgentRun, Department, Employee, Location, ModelCall, Span
-from resolvegrid_api.models.knowledge import Chunk, Document, DocumentVersion, Embedding, IngestionRun
+from resolvegrid_api.models.knowledge import (
+    Chunk,
+    Document,
+    DocumentVersion,
+    Embedding,
+    IngestionRun,
+    SemanticResponseCache,
+)
 from resolvegrid_api.seed_corpus import load_seed_corpus
 
 _SEED_EMAIL = "chat.requester@example.test"
@@ -81,6 +88,23 @@ def _clear_response_cache_namespace():
     yield
     for key in client.scan_iter(match="cache:response:*"):
         client.delete(key)
+
+
+@pytest.fixture(autouse=True)
+def _cleanup_semantic_cache_rows(raw_db_session):
+    """Phase 12 Task 5: `semantic_response_cache` is a real Postgres table,
+    not Redis, so the exact-cache namespace fixture above doesn't touch it.
+    Watermark-based cleanup (mirrors `seed_corpus_ingested`'s own id
+    -watermark convention elsewhere in this file) rather than a fixed-key
+    sweep, since there's no natural "namespace" string to scan like Redis's
+    `cache:response:*` -- every row with an id greater than the watermark
+    taken before a given test ran was created BY that test, regardless of
+    which scope_sig it landed under.
+    """
+    before_max_id = raw_db_session.scalar(select(func.max(SemanticResponseCache.id))) or 0
+    yield
+    raw_db_session.execute(delete(SemanticResponseCache).where(SemanticResponseCache.id > before_max_id))
+    raw_db_session.commit()
 
 
 @pytest.fixture(autouse=True)
@@ -940,3 +964,192 @@ def test_chat_response_cache_degrades_to_real_graph_on_redis_outage(chat_fixture
         redis_client=unreachable_client,
     )
     assert result is None
+
+
+# ---------------------------------------------------------------------------
+# Semantic-response cache tests (Phase 12 Task 5)
+# ---------------------------------------------------------------------------
+
+
+def test_chat_differently_worded_but_similar_question_hits_semantic_cache(
+    chat_fixtures, raw_db_session, client
+):
+    """The real point of Task 5: a SECOND question, differently worded but
+    semantically equivalent to the first (a real near-duplicate pair,
+    empirically measured at cosine distance 0.0356 -- see `semantic_cache.
+    py`'s module docstring -- well under `SEMANTIC_CACHE_SIMILARITY_
+    THRESHOLD`'s 0.15), must hit the SEMANTIC cache even though it is a
+    guaranteed MISS on Task 3's exact (byte-identical) cache. Proven with a
+    real call-counting spy on the second call that raises if ever invoked,
+    plus real AgentRun row assertions distinguishing this from an exact hit.
+    """
+    requester = chat_fixtures
+    message_1 = "What is a VPN?"
+    message_2 = "Could you explain what a VPN is?"  # different text, same meaning
+
+    with patch(
+        _COMPLETE_PATCH_TARGET,
+        side_effect=[_classification_result(), _answer_result("A VPN is a Virtual Private Network.")],
+    ) as mock_complete_1:
+        response_1 = client.post(
+            "/chat",
+            json={"message": message_1},
+            headers={"X-Debug-Employee-Id": str(requester.id)},
+        )
+    assert response_1.status_code == 200
+    assert mock_complete_1.call_count == 2
+    body_1 = response_1.json()
+
+    # The real completion function must NEVER be reached for this second,
+    # differently-worded call -- a real semantic-cache hit skips the whole
+    # graph exactly like a real exact-cache hit does.
+    with patch(
+        _COMPLETE_PATCH_TARGET,
+        side_effect=AssertionError("semantic cache hit must never call the real completion function"),
+    ) as mock_complete_2:
+        response_2 = client.post(
+            "/chat",
+            json={"message": message_2},
+            headers={"X-Debug-Employee-Id": str(requester.id)},
+        )
+    assert response_2.status_code == 200
+    mock_complete_2.assert_not_called()
+    body_2 = response_2.json()
+
+    assert body_2["answer"] == body_1["answer"] == "A VPN is a Virtual Private Network."
+    assert body_2["thread_id"] != body_1["thread_id"]
+
+    run_1 = raw_db_session.scalar(select(AgentRun).where(AgentRun.thread_id == body_1["thread_id"]))
+    run_2 = raw_db_session.scalar(select(AgentRun).where(AgentRun.thread_id == body_2["thread_id"]))
+    assert run_1 is not None and run_2 is not None
+    assert run_1.cache_hit is False
+    assert run_1.cache_hit_kind is None
+    assert run_2.cache_hit is True
+    assert run_2.cache_hit_kind == "semantic"  # distinguished from an "exact" hit
+
+    spans_2 = raw_db_session.scalars(
+        select(Span).where(Span.agent_run_id == run_2.id).order_by(Span.id)
+    ).all()
+    assert [s.stage_name for s in spans_2] == ["classify_intent", "retrieve", "compose_response", "finalize"]
+    assert all(s.status == "success" for s in spans_2)
+
+    new_model_calls = raw_db_session.scalars(
+        select(ModelCall).where(ModelCall.purpose == "chat.semantic_cache_hit").order_by(ModelCall.id)
+    ).all()
+    assert len(new_model_calls) >= 1
+    semantic_hit_call = new_model_calls[-1]
+    assert semantic_hit_call.estimated_cost_usd == 0.0
+    assert semantic_hit_call.input_tokens == 0
+    assert semantic_hit_call.output_tokens == 0
+    assert semantic_hit_call.status == "success"
+
+
+def test_chat_semantically_different_question_does_not_hit_semantic_cache(
+    chat_fixtures, raw_db_session, client
+):
+    """A genuinely different-topic second question (real measured cosine
+    distance 0.5374 against the first, per `semantic_cache.py`'s module
+    docstring -- far above the 0.15 threshold) must NOT hit the semantic
+    cache -- the real graph must run again, reaching the real completion
+    function.
+    """
+    requester = chat_fixtures
+    message_1 = "What is a firewall?"
+    message_2 = "How do I request VPN access?"  # different topic entirely
+
+    with patch(
+        _COMPLETE_PATCH_TARGET,
+        side_effect=[_classification_result(), _answer_result("A firewall is a network security device.")],
+    ):
+        response_1 = client.post(
+            "/chat", json={"message": message_1}, headers={"X-Debug-Employee-Id": str(requester.id)},
+        )
+    assert response_1.status_code == 200
+
+    with patch(
+        _COMPLETE_PATCH_TARGET,
+        side_effect=[_classification_result(), _answer_result("Submit a VPN access request via the portal.")],
+    ) as mock_complete_2:
+        response_2 = client.post(
+            "/chat", json={"message": message_2}, headers={"X-Debug-Employee-Id": str(requester.id)},
+        )
+    assert response_2.status_code == 200
+    assert mock_complete_2.call_count == 2  # real graph ran again -- no false hit
+    body_2 = response_2.json()
+    assert body_2["answer"] == "Submit a VPN access request via the portal."
+
+    run_2 = raw_db_session.scalar(select(AgentRun).where(AgentRun.thread_id == body_2["thread_id"]))
+    assert run_2 is not None
+    assert run_2.cache_hit is False
+    assert run_2.cache_hit_kind is None
+
+
+def test_chat_semantic_cache_never_shares_entries_across_different_scopes(
+    chat_fixtures, other_scope_chat_fixtures, client
+):
+    """Cross-user-leakage guard for the semantic cache, mirroring Task 2/3's
+    mandatory leakage tests: two employees with genuinely DIFFERENT
+    resolved scopes asking NEAR-DUPLICATE (not even identical) questions
+    must NOT share a semantic cache entry -- the second employee's call
+    must still reach the real completion function.
+    """
+    requester_a = chat_fixtures
+    requester_b = other_scope_chat_fixtures
+    message_a = "What is a firewall?"
+    message_b = "Can you explain what a firewall is?"  # near-duplicate of message_a
+
+    with patch(
+        _COMPLETE_PATCH_TARGET,
+        side_effect=[_classification_result(), _answer_result("Answer for requester A.")],
+    ) as mock_complete_a:
+        response_a = client.post(
+            "/chat", json={"message": message_a}, headers={"X-Debug-Employee-Id": str(requester_a.id)},
+        )
+    assert response_a.status_code == 200
+    assert mock_complete_a.call_count == 2
+
+    # Requester B is in a genuinely different department (-> different
+    # scope_sig) and asks a near-duplicate question -- this MUST be a real
+    # miss on both caches, reaching the real completion function, even
+    # though the embedding is nearly identical to requester A's.
+    with patch(
+        _COMPLETE_PATCH_TARGET,
+        side_effect=[_classification_result(), _answer_result("Answer for requester B.")],
+    ) as mock_complete_b:
+        response_b = client.post(
+            "/chat", json={"message": message_b}, headers={"X-Debug-Employee-Id": str(requester_b.id)},
+        )
+    assert response_b.status_code == 200
+    assert mock_complete_b.call_count == 2
+
+    assert response_a.json()["answer"] == "Answer for requester A."
+    assert response_b.json()["answer"] == "Answer for requester B."
+
+
+def test_chat_semantic_cache_degrades_to_real_graph_on_postgres_outage():
+    """A real, genuinely unreachable Postgres endpoint (not a mock) must
+    never break `/chat` -- mirrors `test_chat_response_cache_degrades_to_
+    real_graph_on_redis_outage`'s identical reasoning/shape for this cache's
+    own real failure mode (Postgres, not Redis). Proven directly at the
+    `semantic_cache` function level, the actual unit `chat.py` calls into.
+    """
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import Session
+
+    from resolvegrid_api.semantic_cache import lookup_semantic_cache
+
+    unreachable_engine = create_engine(
+        "postgresql+psycopg://user:pass@localhost:1/db", connect_args={"connect_timeout": 1}
+    )
+    unreachable_session = Session(unreachable_engine)
+    try:
+        result = lookup_semantic_cache(
+            unreachable_session,
+            query_embedding=[0.1] * 768,
+            scope_sig="unrestricted",
+            kb_version=0,
+        )
+        assert result is None
+    finally:
+        unreachable_session.close()
+        unreachable_engine.dispose()

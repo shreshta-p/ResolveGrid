@@ -134,6 +134,89 @@ class Embedding(Base):
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())
 
 
+class SemanticResponseCache(Base):
+    """One semantic (embedding-similarity) response-cache entry (Phase 12
+    Task 5, `resolvegrid_api.semantic_cache`) -- the sibling of Task 3's
+    Redis-backed EXACT-match response cache (`resolvegrid_api.response_
+    cache`), but keyed by cosine-similarity against a real `nomic-embed
+    -text` query embedding rather than a SHA-256 hash of the exact message
+    text, so a differently-worded-but-semantically-equivalent question can
+    still hit.
+
+    Stored in Postgres (not Redis): pgvector is this codebase's established
+    vector-search mechanism (`Embedding` above, `retrieval.py`'s `vector_
+    search`), and a real `<=>` cosine-distance ORDER BY against a handful of
+    rows per `(scope_sig, kb_version)` is simple and fast at this phase's
+    real traffic scale -- introducing vector search inside Redis as well
+    would be a second, parallel mechanism for no real benefit (see the plan
+    doc's Task 5 section, which explicitly prefers extending pgvector over
+    that alternative).
+
+    Cached VALUE shape mirrors `response_cache.py`'s Redis value exactly
+    (`answer`/`citations`/`caption`/`intent`/`risk_level`) -- stored inline
+    as real columns here (`citations` JSON-serialized into `citations_json`,
+    following `Chunk.metadata_json`'s established "_json"-suffixed opaque
+    -blob convention for a small structured extra) rather than a separate
+    FK'd "response" table, since there is no other real row this entry
+    would ever need to join against -- an entire independent response table
+    would just be this same handful of columns one join away for no benefit.
+
+    `(scope_sig, kb_version)` -- the SAME two real values Task 2's retrieval
+    cache and Task 3's response cache key on, reused unchanged (via `compute_
+    scope_sig`/`get_kb_version`, never reimplemented) -- are real, queryable
+    columns (not folded into an opaque composite string) with a real
+    composite index (`ix_semantic_response_cache_scope_kb`) so a lookup's
+    `WHERE scope_sig = :scope_sig AND kb_version = :kb_version` is index
+    -backed, and so a similarity search's candidate ROWS are restricted to
+    the same authz scope and KB version before any distance is ever
+    computed -- this is the security-critical boundary (see `semantic_
+    cache.py`'s module docstring): two different `scope_sig` values must
+    NEVER semantically match each other's cached answers, no matter how
+    similar the query text, exactly mirroring Task 2's `scope_sig` boundary.
+
+    No TTL column: unlike Task 1-3's Redis caches (where `EX` is a native
+    Redis mechanism), a Postgres row has no built-in expiry -- `semantic_
+    cache.py`'s lookup query instead filters `created_at > :cutoff` using
+    the same entitlement-staleness-bound reasoning Task 3's `RESPONSE_CACHE_
+    TTL_SECONDS` documents (this cache carries the identical content
+    -staleness and entitlement-staleness risk one layer up), so an old row
+    is simply never looked up again past that bound -- it is not deleted (a
+    future cleanup pass could prune `created_at`-expired rows; out of scope
+    here, matching the Redis caches' own "stale keys expire via TTL, no
+    explicit delete pass" documented strategy).
+
+    Deliberately no ANN (HNSW) index on `query_embedding`: this table's real
+    candidate set per `(scope_sig, kb_version)` is small (one organization's
+    worth of distinct recent questions within one scope), so a plain
+    sequential scan over the already-filtered candidate rows, exactly
+    ordered by real `<=>` cosine distance, is both fast enough and exactly
+    correct -- an ANN index trades a small, real chance of missing the true
+    nearest neighbor for speed at a scale this table doesn't operate at, and
+    this is a security/correctness-adjacent lookup (the whole point is a
+    precise, honest threshold decision), so exact ordering is the right
+    tradeoff here, unlike `Embedding.vector`'s HNSW index (Phase 7), whose
+    multi-chunk corpus-wide search genuinely benefits from ANN speed and
+    whose stakes are "which chunk ranks higher", not "does this query match
+    at all".
+    """
+
+    __tablename__ = "semantic_response_cache"
+    __table_args__ = (
+        Index("ix_semantic_response_cache_scope_kb", "scope_sig", "kb_version"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    scope_sig: Mapped[str]
+    kb_version: Mapped[int]
+    query_embedding: Mapped[list[float]] = mapped_column(Vector(EMBEDDING_DIM))
+    answer: Mapped[str]
+    citations_json: Mapped[str]
+    caption: Mapped[str]
+    intent: Mapped[str]
+    risk_level: Mapped[str]
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+
+
 class IngestionRun(Base):
     """One ingestion pipeline execution -- records parser/chunk/embed versions and stats.
 

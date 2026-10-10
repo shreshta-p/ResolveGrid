@@ -54,6 +54,24 @@ class AgentRun(Base):
     # migration, so a future `alembic revision --autogenerate` sees the
     # model and the schema agree and proposes no spurious drift fix.
     cache_hit: Mapped[bool] = mapped_column(default=False, server_default=false())
+    # Phase 12 Task 5: which cache mechanism (if any) served this run --
+    # "exact" (resolvegrid_api.response_cache, Task 3's byte-identical
+    # SHA-256 match) | "semantic" (resolvegrid_api.semantic_cache, Task 5's
+    # embedding-similarity match) | None (a genuine real-graph run; also
+    # None for every row written before this column existed). Deliberately
+    # a second, nullable column rather than widening `cache_hit` itself into
+    # a 3-valued string: `cache_hit` already has an established boolean
+    # contract (`test_chat_api.py`'s `run_2.cache_hit is True` assertion,
+    # Task 3) that every existing caller/test/dashboard query keys off --
+    # changing its type would be a breaking change to that contract for no
+    # real benefit, since "was this a cache hit at all" (the boolean) and
+    # "which cache kind" (this column) are two genuinely different
+    # questions a reader may want answered independently (e.g. a dashboard
+    # computing an overall cache-hit-rate only ever needs the boolean).
+    # `cache_hit` stays True for BOTH "exact" and "semantic" rows -- this
+    # column adds the finer-grained distinction on top, it never contradicts
+    # the boolean.
+    cache_hit_kind: Mapped[str | None] = mapped_column(default=None)
 
 
 class Span(Base):
