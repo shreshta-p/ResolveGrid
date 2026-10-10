@@ -96,7 +96,9 @@ def test_classify_intent_degrades_unknown_intent_value_independently_of_risk_lev
 
 
 def test_compose_response_sets_output_text_from_completion():
-    node = make_compose_response_node(lambda prompt, risk_level: "Here is your answer.")
+    node = make_compose_response_node(
+        lambda prompt, risk_level, cacheable_prefix=None: "Here is your answer."
+    )
     result = node(
         _state(input_text="what is a ticket?", intent="general_question", risk_level="low")
     )
@@ -107,7 +109,7 @@ def test_compose_response_sets_output_text_from_completion():
 def test_compose_response_includes_intent_context_in_prompt():
     captured_prompts = []
 
-    def fake_complete(prompt: str, risk_level: str) -> str:
+    def fake_complete(prompt: str, risk_level: str, cacheable_prefix: str | None = None) -> str:
         captured_prompts.append(prompt)
         return "answer"
 
@@ -117,7 +119,7 @@ def test_compose_response_includes_intent_context_in_prompt():
 
 
 def test_compose_response_records_error_on_completion_failure_instead_of_raising():
-    def failing_complete(prompt: str, risk_level: str) -> str:
+    def failing_complete(prompt: str, risk_level: str, cacheable_prefix: str | None = None) -> str:
         raise RuntimeError("gateway unreachable")
 
     node = make_compose_response_node(failing_complete)
@@ -135,7 +137,7 @@ def test_compose_response_uses_general_knowledge_prompt_when_retrieval_insuffici
     # answer is attempted at all.
     captured_prompts = []
 
-    def fake_complete(prompt: str, risk_level: str) -> str:
+    def fake_complete(prompt: str, risk_level: str, cacheable_prefix: str | None = None) -> str:
         captured_prompts.append(prompt)
         return "answer"
 
@@ -154,10 +156,10 @@ def test_compose_response_uses_general_knowledge_prompt_when_retrieval_insuffici
 
 
 def test_compose_response_uses_citation_context_prompt_when_retrieval_sufficient():
-    captured_prompts = []
+    captured_calls = []
 
-    def fake_complete(prompt: str, risk_level: str) -> str:
-        captured_prompts.append(prompt)
+    def fake_complete(prompt: str, risk_level: str, cacheable_prefix: str | None = None) -> str:
+        captured_calls.append((prompt, cacheable_prefix))
         return "answer"
 
     node = make_compose_response_node(fake_complete)
@@ -177,17 +179,88 @@ def test_compose_response_uses_citation_context_prompt_when_retrieval_sufficient
             "A VPN is required for remote access.",
         )
     )
-    prompt = captured_prompts[0]
+    prompt, cacheable_prefix = captured_calls[0]
+    # The VARIABLE suffix (`prompt`) carries the classified intent/context/
+    # question -- the per-call content that differs every time.
     assert "[chunk:42]" in prompt
     assert "Kestrel VPN Access Policy (v2)" in prompt
     assert "A VPN is required for remote access." in prompt
-    assert "cite it inline" in prompt
     # Phase 8 Task 7: the context block is delimited and framed as
-    # untrusted data, not instructions -- see graph.py's
-    # `_COMPOSE_PROMPT_WITH_CONTEXT_TEMPLATE`.
+    # untrusted data, not instructions.
     assert "<retrieved_context>" in prompt
     assert "</retrieved_context>" in prompt
-    assert "never" in prompt.lower() and "instructions" in prompt.lower()
+    # Phase 12 Task 4: the STABLE instructional/prompt-injection-defense
+    # preamble is now handed over separately, as `cacheable_prefix`, NOT
+    # concatenated into `prompt` -- this is exactly what makes it a valid
+    # candidate for a real Anthropic cache-control breakpoint (see
+    # `ComposeCompleteFn`'s docstring).
+    assert cacheable_prefix is not None
+    assert "cite it inline" in cacheable_prefix
+    assert "never" in cacheable_prefix.lower() and "instructions" in cacheable_prefix.lower()
+    # And the two pieces concatenate back to EXACTLY what the old
+    # single-flat-prompt behavior would have sent -- the real invariant
+    # that keeps non-Anthropic callers (Ollama/OpenAI) byte-identical.
+    from resolvegrid_agent_orchestration.graph import _COMPOSE_PROMPT_WITH_CONTEXT_TEMPLATE
+
+    expected_full_prompt = _COMPOSE_PROMPT_WITH_CONTEXT_TEMPLATE.format(
+        intent="unclear",
+        risk_level="low",
+        context_block='[chunk:42] (from "Kestrel VPN Access Policy (v2)"):\n'
+        "A VPN is required for remote access.",
+        input_text="what is a VPN?",
+    )
+    assert cacheable_prefix + prompt == expected_full_prompt
+
+
+def test_compose_response_stable_prefix_and_variable_suffix_always_reconstruct_the_original_template():
+    """Regression guard for the split itself (not just one call's output):
+    `_COMPOSE_STABLE_PREFIX_WITH_CONTEXT` + `_COMPOSE_VARIABLE_SUFFIX_WITH_
+    CONTEXT_TEMPLATE.format(...)` must equal `_COMPOSE_PROMPT_WITH_CONTEXT_
+    TEMPLATE.format(...)` for ANY real field values, not just the one
+    example the test above happens to use -- this is the actual invariant
+    `llm_gateway.complete()`'s non-Anthropic reconstruction path depends on.
+    """
+    from resolvegrid_agent_orchestration.graph import (
+        _COMPOSE_PROMPT_WITH_CONTEXT_TEMPLATE,
+        _COMPOSE_STABLE_PREFIX_WITH_CONTEXT,
+        _COMPOSE_VARIABLE_SUFFIX_WITH_CONTEXT_TEMPLATE,
+    )
+
+    fields = {
+        "intent": "general_question",
+        "risk_level": "high",
+        "context_block": '[chunk:99] (from "Some Other Doc"):\nSome other real text.',
+        "input_text": "a completely different question",
+    }
+    reconstructed = (
+        _COMPOSE_STABLE_PREFIX_WITH_CONTEXT + _COMPOSE_VARIABLE_SUFFIX_WITH_CONTEXT_TEMPLATE.format(**fields)
+    )
+    assert reconstructed == _COMPOSE_PROMPT_WITH_CONTEXT_TEMPLATE.format(**fields)
+
+
+def test_compose_response_passes_cacheable_prefix_none_when_not_using_citation_context():
+    """The no-context/insufficient-retrieval branch's own preamble is short
+    (see graph.py's definition comment for why it isn't split) -- it must
+    never be marked as a cacheable prefix.
+    """
+    captured_calls = []
+
+    def fake_complete(prompt: str, risk_level: str, cacheable_prefix: str | None = None) -> str:
+        captured_calls.append((prompt, cacheable_prefix))
+        return "answer"
+
+    node = make_compose_response_node(fake_complete)
+    node(
+        _state(
+            input_text="what is a VPN?",
+            retrieved_chunks=[
+                {"chunk_id": 1, "document_title": "Some Doc", "text": "irrelevant", "score": 0.001}
+            ],
+            retrieval_sufficient=False,
+        )
+    )
+    _, cacheable_prefix = captured_calls[0]
+    assert cacheable_prefix is None
 
 
 def test_compose_response_falls_back_to_general_knowledge_when_chunks_present_but_no_context_block():
@@ -197,7 +270,7 @@ def test_compose_response_falls_back_to_general_knowledge_when_chunks_present_bu
     # nothing to substitute into it.
     captured_prompts = []
 
-    def fake_complete(prompt: str, risk_level: str) -> str:
+    def fake_complete(prompt: str, risk_level: str, cacheable_prefix: str | None = None) -> str:
         captured_prompts.append(prompt)
         return "answer"
 
@@ -218,7 +291,7 @@ def test_compose_response_falls_back_to_general_knowledge_when_chunks_present_bu
 def test_compose_response_falls_back_to_general_knowledge_when_no_chunks():
     captured_prompts = []
 
-    def fake_complete(prompt: str, risk_level: str) -> str:
+    def fake_complete(prompt: str, risk_level: str, cacheable_prefix: str | None = None) -> str:
         captured_prompts.append(prompt)
         return "answer"
 
@@ -305,7 +378,9 @@ def test_finalize_falls_back_when_no_output_and_no_error():
 def test_build_graph_runs_end_to_end_with_mocked_completion_and_memory_checkpointer():
     calls = []
 
-    def fake_complete(prompt: str, risk_level: str | None = None) -> str:
+    def fake_complete(
+        prompt: str, risk_level: str | None = None, cacheable_prefix: str | None = None
+    ) -> str:
         calls.append(prompt)
         if len(calls) == 1:
             # First call is classify_intent's prompt (called with just the
@@ -364,7 +439,9 @@ def test_build_graph_runs_end_to_end_with_mocked_completion_and_memory_checkpoin
 def test_build_graph_runs_end_to_end_with_sufficient_retrieval_produces_citation_prompt():
     calls = []
 
-    def fake_complete(prompt: str, risk_level: str | None = None) -> str:
+    def fake_complete(
+        prompt: str, risk_level: str | None = None, cacheable_prefix: str | None = None
+    ) -> str:
         calls.append(prompt)
         if len(calls) == 1:
             return json.dumps({"intent": "general_question", "risk_level": "low"})
@@ -415,7 +492,9 @@ def test_build_graph_runs_end_to_end_with_sufficient_retrieval_produces_citation
 def test_build_graph_strips_a_fabricated_citation_before_finalize():
     calls = []
 
-    def fake_complete(prompt: str, risk_level: str | None = None) -> str:
+    def fake_complete(
+        prompt: str, risk_level: str | None = None, cacheable_prefix: str | None = None
+    ) -> str:
         calls.append(prompt)
         if len(calls) == 1:
             return json.dumps({"intent": "general_question", "risk_level": "low"})

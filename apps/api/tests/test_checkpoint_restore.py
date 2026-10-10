@@ -122,7 +122,9 @@ def _instance_a_complete_fn():
     compose_response) gets the answer text."""
     calls: list[str] = []
 
-    def complete_fn(prompt: str, risk_level: str | None = None) -> str:
+    def complete_fn(
+        prompt: str, risk_level: str | None = None, cacheable_prefix: str | None = None
+    ) -> str:
         calls.append(prompt)
         if len(calls) == 1:
             return _CLASSIFICATION_RESPONSE
@@ -139,7 +141,9 @@ def _instance_a_retrieve_fn(query_text: str, scope: dict | None) -> dict:
     return {"chunks": [], "sufficient": False}
 
 
-def _instance_b_complete_fn(prompt: str, risk_level: str | None = None) -> str:
+def _instance_b_complete_fn(
+    prompt: str, risk_level: str | None = None, cacheable_prefix: str | None = None
+) -> str:
     # Instance B must never call the LLM at all -- it only reads back what
     # instance A already persisted to Postgres. If this is ever called, the
     # test is accidentally re-running the graph instead of proving

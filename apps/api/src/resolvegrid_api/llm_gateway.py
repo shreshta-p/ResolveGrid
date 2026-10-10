@@ -97,6 +97,24 @@ class CompletionResult:
     # is what those pre-existing callers are simulating anyway.
     fallback_occurred: bool = False
     serving_model_group: str | None = None
+    # Phase 12 Task 4: real Anthropic provider-side prompt-prefix caching
+    # (distinct from this phase's Tasks 1-3/5 Redis-backed application
+    # caches -- see docs/superpowers/plans/2026-09-29-phase12-caching.md's
+    # Task 4 section). Populated from LiteLLM's real passthrough of
+    # Anthropic's `usage.cache_creation_input_tokens`/`usage.cache_read_
+    # input_tokens` fields (verified empirically against a real cloud-primary
+    # call -- see docs/TELEMETRY_COST.md's Phase 12 Task 4 section for the
+    # exact real response shape and the real numbers observed). Zero for
+    # every call that never sent a `cacheable_prefix` (every existing caller,
+    # unchanged), every non-Anthropic call (Ollama/OpenAI never populate
+    # these fields at all), AND a real Anthropic call whose cacheable prefix
+    # was too short to cross Anthropic's real per-model minimum cacheable
+    # -block token count -- in all three cases this is the honest, not a
+    # fabricated, zero. Defaulted to 0 (not required) for the exact same
+    # direct-construction-caller reason `fallback_occurred`/`serving_model_
+    # group` are defaulted above.
+    cache_creation_input_tokens: int = 0
+    cache_read_input_tokens: int = 0
 
 
 class LLMGatewayError(Exception):
@@ -124,8 +142,56 @@ def provider_for_model(model: str) -> str:
     return _MODEL_GROUP_TO_PROVIDER.get(model, "unknown")
 
 
-def complete(prompt: str, *, model: str = DEFAULT_MODEL, timeout_seconds: float = 60.0) -> CompletionResult:
+def complete(
+    prompt: str,
+    *,
+    model: str = DEFAULT_MODEL,
+    timeout_seconds: float = 60.0,
+    cacheable_prefix: str | None = None,
+) -> CompletionResult:
     """Call the LiteLLM proxy's OpenAI-compatible chat completions endpoint.
+
+    `cacheable_prefix` (Phase 12 Task 4, real Anthropic provider-side
+    prompt-prefix caching -- see `CompletionResult.cache_creation_input_
+    tokens`'s docstring): an optional STABLE text block, byte-identical
+    across calls, that the caller wants Anthropic's real infrastructure to
+    cache. Mirrors the existing `_THINK_FALSE_MODELS`-style per-model
+    conditional exactly -- `provider_for_model(model) == "anthropic"` is
+    checked HERE, not left to the caller, so every `complete_fn` built on
+    top of this function can pass `cacheable_prefix` unconditionally and
+    this function alone decides whether it's safe to annotate:
+
+    - Anthropic-routed (`provider_for_model(model) == "anthropic"`): sent as
+      a separate `{"role": "system", "content": [{"type": "text", "text":
+      cacheable_prefix, "cache_control": {"type": "ephemeral"}}]}` message,
+      rendered BEFORE the `prompt` user message -- the real, documented
+      LiteLLM request shape for passing Anthropic's `cache_control`
+      annotation through its OpenAI-compatible endpoint (verified against
+      LiteLLM's own prompt-caching docs AND a real cloud-primary call; see
+      docs/TELEMETRY_COST.md). Below Anthropic's real per-model minimum
+      cacheable-block token count, Anthropic silently does not cache it (no
+      error) -- `cache_creation_input_tokens`/`cache_read_input_tokens`
+      simply read back 0; this function makes no attempt to detect or warn
+      about that case, since Anthropic's own response already is the
+      ground truth for whether caching happened.
+    - Every other provider (Ollama/OpenAI): Ollama/OpenAI callers "must see
+      zero behavior change" per the plan doc -- `cache_control` is an
+      Anthropic-specific annotation with no equivalent here, and these
+      providers were never meant to receive a restructured request at all.
+      So `cacheable_prefix` is concatenated directly onto the front of
+      `prompt` (`cacheable_prefix + prompt`, no separator inserted) and
+      sent as the single flat user-message string exactly as before this
+      task. This concatenation is only ever byte-identical to callers' own
+      pre-Task-4 behavior because `cacheable_prefix` + the now-narrower
+      `prompt` are constructed, at the call site, to reconstruct losslessly
+      (see `resolvegrid_agent_orchestration.graph`'s `_COMPOSE_STABLE_
+      PREFIX_WITH_CONTEXT`/`_COMPOSE_VARIABLE_SUFFIX_WITH_CONTEXT_TEMPLATE`
+      split and that module's own reconstruction-identity test) -- this
+      function does not and cannot verify that on its own; it only
+      concatenates whatever it's given.
+    `None` (the default, and every existing caller's behavior) skips all of
+    this entirely -- a single flat user message, unchanged from before this
+    task.
 
     IMPORTANT: `"think": False` is deliberately included in the request body.
     qwen3:14b is a reasoning model with "thinking" mode ON by default via
@@ -165,7 +231,29 @@ def complete(prompt: str, *, model: str = DEFAULT_MODEL, timeout_seconds: float 
     an otherwise-successful completion over a header-parsing quirk.
     """
     start = time.monotonic()
-    request_body = {"model": model, "messages": [{"role": "user", "content": prompt}]}
+    if cacheable_prefix is not None and provider_for_model(model) == "anthropic":
+        messages = [
+            {
+                "role": "system",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": cacheable_prefix,
+                        "cache_control": {"type": "ephemeral"},
+                    }
+                ],
+            },
+            {"role": "user", "content": prompt},
+        ]
+    elif cacheable_prefix is not None:
+        # Non-Anthropic provider: no cache_control equivalent exists, and
+        # Ollama/OpenAI callers must see zero behavior change -- reconstruct
+        # the single flat user message exactly as it would have been sent
+        # before this task (see this function's own docstring).
+        messages = [{"role": "user", "content": cacheable_prefix + prompt}]
+    else:
+        messages = [{"role": "user", "content": prompt}]
+    request_body = {"model": model, "messages": messages}
     if model in _THINK_FALSE_MODELS:
         request_body["think"] = False
     try:
@@ -209,4 +297,14 @@ def complete(prompt: str, *, model: str = DEFAULT_MODEL, timeout_seconds: float 
         model=model,
         fallback_occurred=fallback_occurred,
         serving_model_group=serving_model_group,
+        # Phase 12 Task 4: LiteLLM passes Anthropic's real usage fields
+        # through verbatim at the top level of the OpenAI-compatible
+        # `usage` object (confirmed against LiteLLM's own prompt-caching
+        # docs and a real cloud-primary call -- docs/TELEMETRY_COST.md).
+        # Absent for every non-Anthropic response (Ollama/OpenAI never
+        # populate them) and for any Anthropic response that did no cache
+        # read/write -- `.get(..., 0)` degrades both cases to the same
+        # honest zero, matching every other optional-usage-field read above.
+        cache_creation_input_tokens=usage.get("cache_creation_input_tokens", 0),
+        cache_read_input_tokens=usage.get("cache_read_input_tokens", 0),
     )

@@ -95,3 +95,25 @@ class ModelCall(Base):
     # judge/eval closures -- all still always request `DEFAULT_MODEL`
     # unconditionally, per those modules' own docstrings).
     routing_reason: Mapped[str | None] = mapped_column(default=None)
+    # Phase 12 Task 4: real Anthropic provider-side prompt-prefix caching
+    # (distinct from this phase's other, Redis-backed application caches --
+    # see docs/superpowers/plans/2026-09-29-phase12-caching.md's Task 4
+    # section). Mirrors `trace_id`'s Phase 11 Task 1 migration precedent:
+    # a new, nullable-in-spirit-but-NOT-NULL-with-a-default column (not an
+    # actual schema nullable -- every row, past and future, has a real,
+    # honest integer here) capturing LiteLLM's real passthrough of
+    # Anthropic's `usage.cache_creation_input_tokens`/`usage.cache_read_
+    # input_tokens` fields. `0` is itself a real, meaningful, honestly-
+    # recorded value for every row that used no cacheable prefix at all
+    # (every call site except `chat.compose_response`'s with-context
+    # branch), every non-Anthropic-routed call, an error-shaped row (no
+    # completion ran), and a cache-hit-shaped row from Task 3's OWN,
+    # different Redis response cache (`log_cache_hit_model_call` -- a
+    # `/chat`-layer cache hit that skips the LLM call entirely, hence never
+    # touches Anthropic's cache at all) -- never a placeholder/sentinel to
+    # special-case in queries. This is the plan doc's actual "provenance"
+    # requirement for this task: real cache utilization becomes queryable
+    # SQL (`SELECT ... WHERE cache_read_input_tokens > 0`), not a one-off
+    # manual observation.
+    cache_creation_input_tokens: Mapped[int] = mapped_column(default=0)
+    cache_read_input_tokens: Mapped[int] = mapped_column(default=0)

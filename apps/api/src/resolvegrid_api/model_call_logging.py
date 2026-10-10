@@ -106,6 +106,7 @@ def log_completion(
     prompt: str,
     model: str = llm_gateway.DEFAULT_MODEL,
     routing_reason: str | None = None,
+    cacheable_prefix: str | None = None,
 ) -> llm_gateway.CompletionResult:
     """Run a real LLM completion under a real tracer span, log a `ModelCall`
     row (success or error shaped), and return the `CompletionResult`.
@@ -132,6 +133,21 @@ def log_completion(
     the caller owns the transaction boundary (same convention as `audit.py`'s
     `record_audit_event`) and MUST commit (or otherwise flush/persist) the
     session itself, or the `ModelCall` row this just added is silently lost.
+
+    `cacheable_prefix` (Phase 12 Task 4): passed straight through to
+    `llm_gateway.complete()` unchanged -- this function has no opinion on
+    whether a given `purpose`/`model` should use it; that decision is made
+    by the caller (`make_compose_routing_complete_fn` below, the one real
+    call site with a cacheable prefix to offer). The real `usage.cache_
+    creation_input_tokens`/`usage.cache_read_input_tokens` LiteLLM returns
+    (zero for every call that sent no prefix, every non-Anthropic call, or
+    an Anthropic call whose prefix was too short to cross the real
+    per-model minimum -- see `CompletionResult`'s docstring) are persisted
+    onto the success-path `ModelCall` row below, and also set as span
+    attributes (`resolvegrid.cache_creation_input_tokens`/`resolvegrid.
+    cache_read_input_tokens`) so they're visible on the real trace too, not
+    just in the DB. The error path writes 0 for both -- no real completion
+    happened, so there is nothing to have been cached or read.
     """
     with tracer.start_as_current_span(f"llm.{purpose}") as span:
         # Captured up front (see `_current_trace_id`'s own docstring) so
@@ -150,7 +166,7 @@ def log_completion(
         span.set_attribute("gen_ai.system", requested_provider)
         span.set_attribute("gen_ai.request.model", model)
         try:
-            result = llm_gateway.complete(prompt, model=model)
+            result = llm_gateway.complete(prompt, model=model, cacheable_prefix=cacheable_prefix)
         except llm_gateway.LLMGatewayError as exc:
             span.set_attribute("error.type", type(exc).__name__)
             session.add(
@@ -176,6 +192,12 @@ def log_completion(
         # a non-fallback call already has the request model on this span.
         if result.serving_model_group:
             span.set_attribute("gen_ai.response.model", result.serving_model_group)
+        # Phase 12 Task 4: real provider-side cache token accounting, set
+        # unconditionally (0 is still a real, honest value to record, not a
+        # placeholder to omit) so a trace can be inspected without first
+        # needing to know whether this particular call used caching at all.
+        span.set_attribute("resolvegrid.cache_creation_input_tokens", result.cache_creation_input_tokens)
+        span.set_attribute("resolvegrid.cache_read_input_tokens", result.cache_read_input_tokens)
 
     pricing = current_pricing_version(session, result.provider, result.model)
     if pricing is not None:
@@ -194,6 +216,8 @@ def log_completion(
             latency_ms=result.latency_ms, estimated_cost_usd=estimated_cost_usd, status="success",
             fallback_occurred=result.fallback_occurred, serving_model_group=result.serving_model_group,
             trace_id=trace_id, routing_reason=routing_reason,
+            cache_creation_input_tokens=result.cache_creation_input_tokens,
+            cache_read_input_tokens=result.cache_read_input_tokens,
         )
     )
     return result
@@ -385,9 +409,18 @@ def make_compose_routing_complete_fn(
     local model regardless of a case's classified risk_level, rather than
     incurring real per-run cloud spend on every automated eval suite
     execution).
+
+    Phase 12 Task 4: `complete_fn` now also accepts (and passes straight
+    through to `log_completion`) an optional `cacheable_prefix` --
+    `graph.py`'s `compose_response` node passes the real stable
+    instructional preamble here on its with-context branch. This closure
+    has no opinion on it: `log_completion`/`llm_gateway.complete()` are
+    where the actual Anthropic-only `cache_control` decision is made (see
+    those functions' docstrings) -- this closure only forwards whatever it
+    receives, exactly like it already does for `prompt`/`risk_level`.
     """
 
-    def complete_fn(prompt: str, risk_level: str) -> str:
+    def complete_fn(prompt: str, risk_level: str, cacheable_prefix: str | None = None) -> str:
         model = select_model_for_risk_level(risk_level)
         routing_reason = f"risk_level={risk_level}"
         with session_factory_fn() as session:
@@ -399,7 +432,7 @@ def make_compose_routing_complete_fn(
             try:
                 result = log_completion(
                     session, tracer, purpose=purpose, prompt=prompt, model=model,
-                    routing_reason=routing_reason,
+                    routing_reason=routing_reason, cacheable_prefix=cacheable_prefix,
                 )
             except llm_gateway.LLMGatewayError:
                 session.commit()

@@ -301,6 +301,127 @@ def test_complete_respects_an_explicitly_empty_virtual_key_rather_than_swapping_
     assert kwargs["headers"]["Authorization"] == "Bearer "
 
 
+# --- Phase 12 Task 4: real Anthropic prompt-prefix caching ------------------
+#
+# Real, CI-safe unit tests (mocked httpx.post, no network/credentials) of
+# the per-provider conditional and the request-shape it builds -- NOT the
+# real cache-hit proof (that requires a real cloud-primary call and is a
+# separate, local, evidence-cited verification step; see docs/
+# TELEMETRY_COST.md's Phase 12 Task 4 section).
+
+
+def test_complete_sends_cache_control_annotated_system_block_for_anthropic_models():
+    mock_response = _mock_response(
+        200,
+        {
+            "choices": [{"message": {"content": "ok"}}],
+            "usage": {
+                "prompt_tokens": 50,
+                "completion_tokens": 5,
+                "cache_creation_input_tokens": 40,
+                "cache_read_input_tokens": 0,
+            },
+        },
+        headers={"x-litellm-model-group": "cloud-primary"},
+    )
+
+    with patch("resolvegrid_api.llm_gateway.httpx.post", return_value=mock_response) as mock_post:
+        result = complete(
+            "What is the VPN policy?", model="cloud-primary", cacheable_prefix="You are a helpful assistant."
+        )
+
+    _, kwargs = mock_post.call_args
+    messages = kwargs["json"]["messages"]
+    assert messages == [
+        {
+            "role": "system",
+            "content": [
+                {
+                    "type": "text",
+                    "text": "You are a helpful assistant.",
+                    "cache_control": {"type": "ephemeral"},
+                }
+            ],
+        },
+        {"role": "user", "content": "What is the VPN policy?"},
+    ]
+    assert result.cache_creation_input_tokens == 40
+    assert result.cache_read_input_tokens == 0
+
+
+def test_complete_reconstructs_single_flat_message_for_non_anthropic_models():
+    # Ollama/OpenAI callers "must see zero behavior change" per the plan
+    # doc -- a cacheable_prefix passed for a non-Anthropic model must be
+    # concatenated back onto the front of the prompt (no cache_control, no
+    # system message), reproducing exactly what the caller would have sent
+    # as one flat string before this task existed.
+    mock_response = _mock_response(
+        200,
+        {
+            "choices": [{"message": {"content": "ok"}}],
+            "usage": {"prompt_tokens": 3, "completion_tokens": 1},
+        },
+    )
+
+    with patch("resolvegrid_api.llm_gateway.httpx.post", return_value=mock_response) as mock_post:
+        complete("What is the VPN policy?", model="local-qwen3", cacheable_prefix="You are helpful. ")
+
+    _, kwargs = mock_post.call_args
+    assert kwargs["json"]["messages"] == [
+        {"role": "user", "content": "You are helpful. What is the VPN policy?"}
+    ]
+    # Ollama's "think": false quirk must still apply unchanged alongside
+    # this -- the two conditionals are independent.
+    assert kwargs["json"]["think"] is False
+
+
+def test_complete_defaults_cache_tokens_to_zero_when_no_cacheable_prefix_given():
+    # Every existing caller (cacheable_prefix never passed) must see
+    # CompletionResult.cache_creation_input_tokens/cache_read_input_tokens
+    # default to 0, not KeyError/AttributeError -- this is the real
+    # backward-compatibility guarantee for the 20+ pre-existing complete()
+    # callers this task must not break.
+    mock_response = _mock_response(
+        200,
+        {
+            "choices": [{"message": {"content": "ok"}}],
+            "usage": {"prompt_tokens": 3, "completion_tokens": 1},
+        },
+    )
+
+    with patch("resolvegrid_api.llm_gateway.httpx.post", return_value=mock_response) as mock_post:
+        result = complete("Summarize this ticket.")
+
+    _, kwargs = mock_post.call_args
+    # No cacheable_prefix passed -> the original single flat user message,
+    # byte-identical to this module's pre-Task-4 behavior.
+    assert kwargs["json"]["messages"] == [{"role": "user", "content": "Summarize this ticket."}]
+    assert result.cache_creation_input_tokens == 0
+    assert result.cache_read_input_tokens == 0
+
+
+def test_complete_parses_real_cache_read_tokens_on_a_cache_hit():
+    mock_response = _mock_response(
+        200,
+        {
+            "choices": [{"message": {"content": "ok"}}],
+            "usage": {
+                "prompt_tokens": 12,
+                "completion_tokens": 5,
+                "cache_creation_input_tokens": 0,
+                "cache_read_input_tokens": 4100,
+            },
+        },
+        headers={"x-litellm-model-group": "cloud-primary"},
+    )
+
+    with patch("resolvegrid_api.llm_gateway.httpx.post", return_value=mock_response):
+        result = complete("A different question.", model="cloud-primary", cacheable_prefix="Stable text.")
+
+    assert result.cache_read_input_tokens == 4100
+    assert result.cache_creation_input_tokens == 0
+
+
 def test_every_non_default_model_group_has_a_virtual_key_mapping_entry():
     """Important, code-review-flagged drift guard: `_MODEL_TO_VIRTUAL_KEY`
     and `_MODEL_GROUP_TO_PROVIDER` are legitimately different mappings

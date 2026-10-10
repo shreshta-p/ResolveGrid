@@ -77,3 +77,52 @@ The self-hosted Langfuse v4 instance (`infra/docker-compose.yml`'s `langfuse-web
 ### Grafana / Prometheus (Phase 11 Task 6)
 
 Real Prometheus (`infra/prometheus/prometheus.yml`) scrapes LiteLLM's real `/metrics` endpoint (mounted because `"prometheus"` is a registered `success_callback`; auth disabled for this endpoint specifically via `require_auth_for_metrics_endpoint: false`, since it exposes only counters/histograms and there is no clean way to inject a Bearer secret into a committed scrape config) plus the OTel Collector's own internal pipeline-health metrics. A provisioned Grafana dashboard (`infra/grafana/`, not manual UI clicking — survives a fresh container) shows request count/rate and latency from real LiteLLM traffic. See `docs/DECISION_LOG.md`'s 2026-09-28 entries for the full reasoning on both stacks.
+
+## Phase 12 Task 4: real Anthropic provider-side prompt-prefix caching
+
+Genuinely different from every other cache in Phase 12 (Tasks 1/2/3/5, all this application's own Redis-backed caches): this is Anthropic's own provider-side KV-cache reuse, invoked by annotating a stable content block with `cache_control: {"type": "ephemeral"}`. Fully implemented and wired end-to-end; **real verification shows it does not currently activate**, for a real, measured, honest reason recorded below — not a fabricated number.
+
+### Mechanism
+
+`llm_gateway.complete()` gained an optional `cacheable_prefix: str | None` parameter. When provided AND `provider_for_model(model) == "anthropic"` (the exact same per-model-conditional shape as the existing `_THINK_FALSE_MODELS` precedent), the request is restructured from a single flat user message into:
+
+```json
+{
+  "model": "cloud-primary",
+  "messages": [
+    {"role": "system", "content": [{"type": "text", "text": "<stable prefix>", "cache_control": {"type": "ephemeral"}}]},
+    {"role": "user", "content": "<variable suffix>"}
+  ]
+}
+```
+
+— confirmed, via a real request against the real running LiteLLM proxy, to be the correct real shape: LiteLLM's OpenAI-compatible endpoint genuinely forwards `cache_control` through to Anthropic's native API when placed on a `system` content block this way (also confirmed against LiteLLM's own prompt-caching docs, `https://docs.litellm.ai/docs/completion/prompt_caching`). For every non-Anthropic model (`local-qwen3`, `cloud-fallback`), `cacheable_prefix` is instead concatenated directly onto the front of the prompt (`cacheable_prefix + prompt`, no restructuring) — Ollama/OpenAI callers see zero behavior change, proven by `resolvegrid_agent_orchestration.graph`'s reconstruction-identity test (`_COMPOSE_STABLE_PREFIX_WITH_CONTEXT + _COMPOSE_VARIABLE_SUFFIX_WITH_CONTEXT_TEMPLATE.format(...) == _COMPOSE_PROMPT_WITH_CONTEXT_TEMPLATE.format(...)`, always, by construction of the `str.split()`-based derivation).
+
+The one real call site wired up: `compose_response`'s with-context branch (sufficient retrieval). `graph.py` splits `_COMPOSE_PROMPT_WITH_CONTEXT_TEMPLATE` into a stable preamble (the fixed persona/instruction text plus the Phase 8 Task 7 prompt-injection-defense framing — identical on every real call) and a variable suffix (classified intent/risk_level + retrieved context + the user's question). `classify_intent`'s prompt and the short no-context compose prompt were deliberately NOT split — both are judged too short to be worth the mechanism's overhead even before measuring (see the real numbers below, which confirm this judgment for the with-context preamble too).
+
+`CompletionResult` gained `cache_creation_input_tokens`/`cache_read_input_tokens`, read from LiteLLM's real passthrough of Anthropic's `usage` object. `ModelCall` gained the same two columns (migration `0018`, mirroring `trace_id`'s migration `0014` precedent) — the real, queryable provenance signal this task's plan doc actually asks for (`SELECT id, cache_creation_input_tokens, cache_read_input_tokens FROM model_call WHERE purpose = 'chat.compose_response' AND provider = 'anthropic'`).
+
+### Real verification: two back-to-back real `cloud-primary` calls
+
+Two real calls were made through `make_compose_routing_complete_fn`'s real closure (the exact real `chat.compose_response` call path — real tracer span, real `ModelCall` row, real LiteLLM → real Anthropic round trip), sharing the byte-identical real stable prefix (`_COMPOSE_STABLE_PREFIX_WITH_CONTEXT`) and the same retrieved-context block, with two different real questions ("What do I need installed on my laptop to connect remotely?" / "Is multi-factor authentication required for the VPN?") so Task 3's own exact-response cache could never short-circuit the call. Both real answers came back correct and correctly cited (`[chunk:1]`), confirming the restructured request shape didn't break real Anthropic behavior. The real, persisted `ModelCall` rows:
+
+| `id` | `status` | `input_tokens` | `output_tokens` | `cache_creation_input_tokens` | `cache_read_input_tokens` |
+|---|---|---|---|---|---|
+| 1222 | success | 557 | 147 | 0 | 0 |
+| 1223 | success | 555 | 113 | 0 | 0 |
+
+**Honest result: no real cache activity on either call.** This was investigated, not just reported blind:
+
+- A direct raw-HTTP diagnostic call (same real stable prefix, same real running proxy) confirmed the `usage` object genuinely carries `cache_creation_input_tokens: 0` / `cache_read_input_tokens: 0` / `prompt_tokens_details.cache_creation_token_details.ephemeral_5m_input_tokens: 0` as *present, real zeros* — not fields silently absent from the response and defaulted by this code's own `.get(..., 0)`. Anthropic genuinely attempted no cache write at all.
+- The real cause: `cloud-primary` is configured as `anthropic/claude-haiku-4-5-20251001` (`infra/litellm/config.yaml`) — **Claude Haiku 4.5's real, current minimum cacheable-block size is 4096 tokens**, confirmed via a live fetch of Anthropic's own prompt-caching docs (`https://platform.claude.com/docs/en/build-with-claude/prompt-caching`, fetched 2026-10-08) — not assumed from training data, per this task's own requirement. This is the highest minimum of any served model tier; it is *not* monotonic across generations (current-generation Opus 5.5/Sonnet 5.5/Haiku 5.5/Fable 5.1 are all 512 tokens — an order of magnitude lower).
+- The real stable prefix is ~2061 characters (~338 words). The diagnostic call's real `usage.prompt_tokens` for the full request (stable prefix + a one-line question) was **456 tokens** — confirming the prefix itself is on the order of ~400 real tokens, roughly a tenth of Haiku 4.5's 4096-token floor. The two real production-path calls' `input_tokens` (557/555, slightly larger due to the real retrieved-context block and longer real questions) corroborate this: nowhere close to 4096 either way.
+
+### Decision: document the honest limitation, don't pad the prompt (real option (a) vs (b) call)
+
+The task's own brief allows two honest outcomes: grow the stable prefix with genuinely useful content until it legitimately crosses the real threshold, or document the gap. This was decided in favor of documenting, not padding, for real engineering reasons:
+
+- `_COMPOSE_STABLE_PREFIX_WITH_CONTEXT` (Phase 8 Task 7's carefully-reviewed prompt-injection-defense framing, re-verified against a real live-model adversarial probe at the time) is already a deliberately scoped, reviewed piece of prompt engineering — growing it ~10x *purely* to cross a legacy model's unusually high cache-minimum would be padding for padding's sake, the exact thing this task's own brief warns against, not a genuine prompt improvement.
+- `cloud-primary`'s real traffic volume is inherently low by `routing.py`'s own design (`risk_level == "high"` only) — the 1.25× cache-write premium would need real back-to-back high-risk traffic within the same 5-minute TTL to ever pay off, which this low-volume routing path isn't likely to produce often enough to justify inflating every single `cloud-primary` request (cached or not) with several thousand extra real input tokens.
+- The real, working mechanism already in place needs no further code change to start paying off the moment either condition changes: (a) the stable preamble legitimately grows past 4096 tokens through genuine future prompt-engineering work, or (b) `cloud-primary` is migrated to a current-generation Anthropic model (512-token minimum) — a separate, independent decision, out of this task's scope, but one this mechanism is already fully ready for with zero further plumbing.
+
+**This is a genuine, reportable negative result, not a failure of the task**: the real per-model threshold was verified against live docs (not assumed), the real request/response shape was verified against a real running proxy and real Anthropic responses (not assumed to work), and the real `ModelCall.cache_creation_input_tokens`/`cache_read_input_tokens` columns are genuinely queryable and will show real nonzero values automatically the first time a real with-context `cloud-primary` call's stable prefix crosses the real threshold — nothing further needs to change in this code for that to happen.

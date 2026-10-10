@@ -357,7 +357,9 @@ def _sleepy_complete_side_effect(classify_sleep_s: float, compose_sleep_s: float
     """
     calls = {"n": 0}
 
-    def _side_effect(prompt: str, *, model: str = "local-qwen3") -> CompletionResult:
+    def _side_effect(
+        prompt: str, *, model: str = "local-qwen3", cacheable_prefix: str | None = None
+    ) -> CompletionResult:
         # Phase 11 Task 3: real chat-graph closures now call
         # `llm_gateway.complete(prompt, model=model)` (via `log_completion`,
         # same as summarize_ticket already did) instead of the old bare
@@ -368,6 +370,14 @@ def _sleepy_complete_side_effect(classify_sleep_s: float, compose_sleep_s: float
         # `except (..., TypeError)` soft-degrade path would then silently
         # swallow -- exactly the failure mode this comment documents so a
         # future reader doesn't have to re-diagnose it.
+        #
+        # Phase 12 Task 4: `log_completion` now ALWAYS passes
+        # `cacheable_prefix=...` through to `llm_gateway.complete()` too
+        # (None for classify_intent/the no-context compose branch, real
+        # stable text for the with-context compose branch) -- this mock
+        # must accept that keyword for the identical reason, or it silently
+        # degrades every chat turn to the fallback message via the exact
+        # same swallowed-TypeError mechanism the comment above documents.
         calls["n"] += 1
         if calls["n"] == 1:
             time.sleep(classify_sleep_s)
@@ -600,10 +610,13 @@ def test_chat_retrieves_and_cites_public_seed_corpus_chunk(chat_fixtures, seed_c
     # the first real id it sees, rather than guessing one.
     _call_count = {"n": 0}
 
-    def _complete_side_effect(prompt: str, *, model: str = "local-qwen3") -> CompletionResult:
+    def _complete_side_effect(
+        prompt: str, *, model: str = "local-qwen3", cacheable_prefix: str | None = None
+    ) -> CompletionResult:
         # See `_sleepy_complete_side_effect`'s identical comment (Phase 11
-        # Task 3): real closures now call `llm_gateway.complete(prompt,
-        # model=model)`, so this side_effect must accept `model` too.
+        # Task 3 / Phase 12 Task 4): real closures now call
+        # `llm_gateway.complete(prompt, model=model, cacheable_prefix=...)`,
+        # so this side_effect must accept both keywords too.
         _call_count["n"] += 1
         if _call_count["n"] == 1:
             # 1st call: classify_intent's prompt.
@@ -808,7 +821,9 @@ def test_chat_cache_miss_then_hit_returns_identical_citations_for_seeded_corpus(
 
     _call_count = {"n": 0}
 
-    def _complete_side_effect(prompt: str, *, model: str = "local-qwen3") -> CompletionResult:
+    def _complete_side_effect(
+        prompt: str, *, model: str = "local-qwen3", cacheable_prefix: str | None = None
+    ) -> CompletionResult:
         _call_count["n"] += 1
         if _call_count["n"] == 1:
             return _classification_result()

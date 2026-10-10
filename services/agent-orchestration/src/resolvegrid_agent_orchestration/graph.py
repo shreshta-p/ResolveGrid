@@ -188,6 +188,22 @@ from the database, so they stay entirely inside `retrieve_fn`'s real
 implementation in `apps/api`, which already owns DB access; this module
 only ever receives their *output* (`context_block`, `retrieved_chunks`)
 through the existing `RetrieveFn`/`RetrievalOutcome` contract.
+
+Phase 12 Task 4 -- real Anthropic provider-side prompt-prefix caching
+--------------------------------------------------------------------------
+Genuinely different from Phase 12 Tasks 1-3/5's own Redis-backed
+application caches: this is Anthropic's own provider-side KV-cache reuse,
+invoked via a `cache_control` content-block annotation `apps/api`'s real
+`llm_gateway.complete()` sends only for Anthropic-routed calls. This
+package has zero knowledge of that mechanism (it never imports
+`llm_gateway`, per this module's dependency-direction rule above) -- its
+only job is handing `ComposeCompleteFn` the STABLE instructional preamble
+of the with-context compose prompt as a separate string
+(`cacheable_prefix`) from the VARIABLE suffix (classified intent/risk_level
++ retrieved context + the user's question), since a cache-control
+annotation is only useful on text that's byte-identical across calls. See
+`ComposeCompleteFn`'s own docstring and `_COMPOSE_STABLE_PREFIX_WITH_
+CONTEXT`'s definition comment for the split mechanics.
 """
 
 import json
@@ -244,8 +260,28 @@ CompleteFn = Callable[[str], str]
 # positional-or-keyword parameter, which satisfies a keyword-only caller
 # with zero changes needed on the implementer side -- only this type and
 # its one call site needed to change.
+#
+# Phase 12 Task 4: widened by one more keyword-only, DEFAULTED parameter,
+# `cacheable_prefix` -- the real Anthropic provider-side prompt-prefix
+# caching mechanism (distinct from Tasks 1-3/5's own Redis application
+# caches -- see docs/superpowers/plans/2026-09-29-phase12-caching.md's Task
+# 4 section) needs the STABLE instructional preamble of the with-context
+# compose prompt handed to `complete_fn` as a separate string from the
+# variable `prompt` (classified intent/risk_level + retrieved context + the
+# user's actual question), so `apps/api`'s real implementation can mark
+# ONLY the stable piece with Anthropic's `cache_control: {"type":
+# "ephemeral"}` content-block annotation. Defaulted to `None` (not a bare
+# positional-or-keyword addition) so every existing `ComposeCompleteFn`
+# implementation that doesn't yet accept it keeps working unless this
+# module's own real call site below actually passes a non-`None` value --
+# `make_compose_response_node` is the only caller, and it always passes the
+# keyword explicitly (`None` for the no-context branch, the real stable
+# prefix text for the with-context branch), so every real implementer
+# still had to be updated regardless -- the default exists for parity with
+# `risk_level`'s own calling convention and so a future second call site
+# (if one is ever added) isn't forced to always supply it.
 class ComposeCompleteFn(Protocol):
-    def __call__(self, prompt: str, *, risk_level: str) -> str: ...
+    def __call__(self, prompt: str, *, risk_level: str, cacheable_prefix: str | None = None) -> str: ...
 
 
 class RetrievalOutcome(TypedDict):
@@ -367,6 +403,42 @@ User message:
 {input_text}
 """
 
+# Phase 12 Task 4: the with-context template above is split, at import time,
+# into a STABLE preamble (everything before the "Classified intent:" line --
+# identical on every real call, regardless of question) and a VARIABLE
+# suffix template (classified intent/risk_level + the retrieved context +
+# the user's actual question -- different on every real call). This is the
+# one real candidate for Anthropic provider-side prompt-prefix caching in
+# this codebase (see module docstring): the stable preamble carries the
+# fixed instructional/persona text AND the prompt-injection-defense framing
+# (Phase 8 Task 7), substantial enough to plausibly be worth a cache
+# breakpoint, unlike `_CLASSIFY_PROMPT_TEMPLATE`'s few-line prompt (not
+# split -- see `make_classify_intent_node`, unchanged by this task) or the
+# short `_COMPOSE_PROMPT_NO_CONTEXT_TEMPLATE` preamble above (also not
+# split -- neither is judged worth the mechanism's overhead; see
+# docs/TELEMETRY_COST.md's Phase 12 Task 4 section for the real measured
+# token counts behind this judgment call).
+#
+# Deliberately DERIVED via `str.split(..., 1)` rather than hand-retyped as
+# two separate literal constants: `str.split` followed by reinserting the
+# exact separator it split on is lossless by construction
+# (`stable + variable == original`, always, for any string), which
+# guarantees -- without relying on a human to transcribe ~350 words of
+# prose twice without a single byte of drift -- that `apps/api`'s real
+# non-Anthropic reconstruction path (see `llm_gateway.complete()`'s
+# `cacheable_prefix` handling) produces BYTE-IDENTICAL text to what this
+# module sent as a single flat prompt before this task, for every caller
+# that isn't Anthropic-routed (Ollama/OpenAI callers "must see zero
+# behavior change" per the plan doc). `test_graph.py` asserts this
+# reconstruction identity directly, not just as an inline comment's claim.
+_COMPOSE_WITH_CONTEXT_SPLIT_MARKER = "\n\nClassified intent:"
+_COMPOSE_STABLE_PREFIX_WITH_CONTEXT, _compose_with_context_suffix_tail = (
+    _COMPOSE_PROMPT_WITH_CONTEXT_TEMPLATE.split(_COMPOSE_WITH_CONTEXT_SPLIT_MARKER, 1)
+)
+_COMPOSE_VARIABLE_SUFFIX_WITH_CONTEXT_TEMPLATE = (
+    _COMPOSE_WITH_CONTEXT_SPLIT_MARKER + _compose_with_context_suffix_tail
+)
+
 
 class IntentClassification(BaseModel):
     intent: str
@@ -459,6 +531,18 @@ def make_compose_response_node(complete_fn: ComposeCompleteFn):
     `state.get("risk_level") or "low"` fallback below (mirrors `routing.py`'s
     policy, which already treats any non-`"high"` value, including an
     unrecognized one, as the safe/cheap default).
+
+    Phase 12 Task 4: in the with-context (sufficient retrieval) branch,
+    `prompt` is now built from `_COMPOSE_VARIABLE_SUFFIX_WITH_CONTEXT_
+    TEMPLATE` alone (NOT the full `_COMPOSE_PROMPT_WITH_CONTEXT_TEMPLATE`)
+    and the real, unformatted stable preamble
+    (`_COMPOSE_STABLE_PREFIX_WITH_CONTEXT`) is passed as the new
+    `cacheable_prefix` keyword argument -- see `ComposeCompleteFn`'s
+    docstring for why this package hands the split pieces over separately
+    rather than pre-concatenating them itself. The no-context branch's
+    prompt is unaffected (its own preamble is short -- see the split
+    constants' definition comment above) and always passes
+    `cacheable_prefix=None`.
     """
 
     def compose_response(state: AgentState) -> dict:
@@ -471,20 +555,22 @@ def make_compose_response_node(complete_fn: ComposeCompleteFn):
         chunks = state.get("retrieved_chunks") or []
         context_block = state.get("context_block") or ""
         if state.get("retrieval_sufficient") and chunks and context_block:
-            prompt = _COMPOSE_PROMPT_WITH_CONTEXT_TEMPLATE.format(
+            prompt = _COMPOSE_VARIABLE_SUFFIX_WITH_CONTEXT_TEMPLATE.format(
                 intent=state.get("intent") or "unclear",
                 risk_level=risk_level,
                 context_block=context_block,
                 input_text=state["input_text"],
             )
+            cacheable_prefix = _COMPOSE_STABLE_PREFIX_WITH_CONTEXT
         else:
             prompt = _COMPOSE_PROMPT_NO_CONTEXT_TEMPLATE.format(
                 intent=state.get("intent") or "unclear",
                 risk_level=risk_level,
                 input_text=state["input_text"],
             )
+            cacheable_prefix = None
         try:
-            text = complete_fn(prompt, risk_level=risk_level)
+            text = complete_fn(prompt, risk_level=risk_level, cacheable_prefix=cacheable_prefix)
         except Exception as exc:  # noqa: BLE001 -- any completion failure, of
             # whatever concrete exception type `complete_fn` raises (this
             # package doesn't know or care -- see module docstring), should

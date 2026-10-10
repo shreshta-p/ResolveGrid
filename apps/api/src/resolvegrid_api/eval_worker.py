@@ -800,11 +800,22 @@ async def _execute_graph_dimension_cases(
         session_factory, tracer, purpose="eval.chat.compose_response"
     )
 
-    def compose_complete_fn(prompt: str, risk_level: str) -> str:
+    def compose_complete_fn(prompt: str, risk_level: str, cacheable_prefix: str | None = None) -> str:
         """Adapter satisfying `ComposeCompleteFn`'s shape while deliberately
         ignoring `risk_level` -- see the comment above for why real
         eval-suite traffic always stays on the zero-cost local model
-        regardless of a case's classified risk_level."""
+        regardless of a case's classified risk_level.
+
+        Phase 12 Task 4: also deliberately ignores `cacheable_prefix` for
+        the identical reason -- `_eval_compose_base_fn` always targets
+        `DEFAULT_MODEL` (Ollama), which has no real `cache_control`
+        equivalent to offer, so there is nothing for a stable prefix to do
+        here beyond what `llm_gateway.complete()` would already do with it
+        (silently reconstruct the original flat prompt) if this adapter
+        bothered to pass it through at all. Not passing it through keeps
+        this eval-only completion a plain, narrower `CompleteFn` call
+        exactly as before this task.
+        """
         return _eval_compose_base_fn(prompt)
 
     async with AsyncPostgresSaver.from_conn_string(_CHECKPOINTER_DATABASE_URL) as checkpointer:

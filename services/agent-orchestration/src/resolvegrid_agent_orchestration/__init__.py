@@ -28,7 +28,13 @@ docstring. Phase 12 Task 3 adds one more: `PROMPT_TEMPLATE_VERSION`, a
 plain string `apps/api`'s new `/chat` response cache folds into its cache
 key so a future compose-prompt wording change organically busts every
 previously-cached answer -- see `graph.py`'s own comment beside that
-constant for the full rationale.
+constant for the full rationale. Phase 12 Task 4 widens `ComposeCompleteFn`
+by one more keyword-only, defaulted parameter, `cacheable_prefix` -- the
+real stable instructional preamble of the with-context compose prompt,
+handed over separately so `apps/api`'s real implementation can mark it with
+Anthropic's provider-side `cache_control` annotation (never a Redis
+application cache the way this phase's other caches are) -- see `graph.py`'s
+`ComposeCompleteFn` docstring for the full rationale.
 """
 
 from resolvegrid_agent_orchestration.graph import (

@@ -162,16 +162,20 @@ def test_injected_chunk_text_flows_unmodified_into_the_real_prompt():
     literally see the injected text (inside the new delimiters) for the
     "does it get followed" question to mean anything.
     """
-    captured_prompts: list[str] = []
+    captured_calls: list[tuple[str, str | None]] = []
 
-    def fake_complete(prompt: str, risk_level: str) -> str:
-        captured_prompts.append(prompt)
+    def fake_complete(prompt: str, risk_level: str, cacheable_prefix: str | None = None) -> str:
+        captured_calls.append((prompt, cacheable_prefix))
         return "mocked answer"
 
     node = make_compose_response_node(fake_complete)
     node(_STATE)
 
-    prompt = captured_prompts[0]
+    # Phase 12 Task 4: the injected chunk's text lives in the VARIABLE
+    # suffix (`prompt`), not the stable preamble (`cacheable_prefix`) -- a
+    # per-call retrieved chunk can never be part of a cache-control
+    # -annotated stable prefix, so it must still show up here unchanged.
+    prompt, _cacheable_prefix = captured_calls[0]
     assert _SYSTEM_OVERRIDE_CHUNK_TEXT in prompt
     assert "[chunk:501]" in prompt
 
@@ -191,45 +195,58 @@ def test_fixed_prompt_template_delimits_retrieved_content_as_untrusted_data():
     revisited/replaced with one that checks the new delimiting scheme
     instead." This is that replacement.
     """
-    captured_prompts: list[str] = []
+    captured_calls: list[tuple[str, str | None]] = []
 
-    def fake_complete(prompt: str, risk_level: str) -> str:
-        captured_prompts.append(prompt)
+    def fake_complete(prompt: str, risk_level: str, cacheable_prefix: str | None = None) -> str:
+        captured_calls.append((prompt, cacheable_prefix))
         return "mocked answer"
 
     node = make_compose_response_node(fake_complete)
     node(_STATE)
-    prompt = captured_prompts[0]
+    prompt, cacheable_prefix = captured_calls[0]
 
-    assert "<retrieved_context>" in prompt
-    assert "</retrieved_context>" in prompt
-    assert "never" in prompt.lower()
-    assert "instructions" in prompt.lower()
+    # Phase 12 Task 4: the untrusted-data warning paragraph now lives in the
+    # STABLE `cacheable_prefix` (handed to the model as a separate,
+    # cache-control-annotated piece for real Anthropic calls), while the
+    # retrieved-context tags/content live in the VARIABLE `prompt`. The real
+    # model always sees them concatenated in this exact order (`llm_gateway.
+    # complete()`'s non-Anthropic reconstruction path does this literally;
+    # Anthropic calls render system-then-messages, the same effective
+    # order) -- so this test's structural "warning precedes the delimited
+    # region" assertion is run against that same real concatenation, not
+    # against `prompt` alone.
+    assert cacheable_prefix is not None
+    full_text = cacheable_prefix + prompt
+
+    assert "<retrieved_context>" in full_text
+    assert "</retrieved_context>" in full_text
+    assert "never" in cacheable_prefix.lower()
+    assert "instructions" in cacheable_prefix.lower()
     # The explicit warning names the exact injection phrasing style used
     # in the adversarial chunk, so a real model reading it has a concrete
     # anchor for "this specific kind of text is not real."
-    assert "system override" in prompt.lower()
+    assert "system override" in cacheable_prefix.lower()
 
     # The injected text is INSIDE the delimited region, not outside it or
     # straddling the boundary -- the tags must actually bracket the
-    # context block, not just appear somewhere in the prompt.
+    # context block, not just appear somewhere in the combined text.
     # The instruction paragraph above the context block itself mentions
     # the tag names in prose (explaining the delimiting scheme), so the
     # FIRST occurrence of each tag string is that prose mention, not the
     # real structural delimiter -- the real opening/closing tags (the ones
     # that actually bracket `{context_block}`) are each tag's LAST
-    # occurrence in the prompt.
-    open_tag_index = prompt.rindex("<retrieved_context>")
-    close_tag_index = prompt.rindex("</retrieved_context>")
+    # occurrence in the combined text.
+    open_tag_index = full_text.rindex("<retrieved_context>")
+    close_tag_index = full_text.rindex("</retrieved_context>")
     # The warning paragraph itself quotes "SYSTEM OVERRIDE" as an example
     # phrase (before the opening tag) -- search for the *injected chunk's*
     # actual occurrence, which is the one after the real opening tag.
-    injected_index = prompt.index("SYSTEM OVERRIDE", open_tag_index)
-    user_message_index = prompt.index("User message:")
+    injected_index = full_text.index("SYSTEM OVERRIDE", open_tag_index)
+    user_message_index = full_text.index("User message:")
     assert open_tag_index < injected_index < close_tag_index < user_message_index
 
     # The untrusted-data warning paragraph itself sits BEFORE the opening
     # tag (it is a real instruction to the model, not retrieved data), so
     # it is never inside the delimited/untrusted region.
-    warning_index = prompt.lower().index("untrusted")
+    warning_index = full_text.lower().index("untrusted")
     assert warning_index < open_tag_index
