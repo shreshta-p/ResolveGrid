@@ -302,6 +302,14 @@ def log_cache_hit_model_call(
             status="success",
             trace_id=trace_id,
             routing_reason=routing_reason,
+            # Code-review fix: spelled out explicitly, matching every other
+            # field at this call site, rather than relying on the column's
+            # default=0 -- this docstring's own "0 is itself a real,
+            # meaningful, honestly-recorded value" point applies just as
+            # much to auditability of this constructor call as to the
+            # column itself.
+            cache_creation_input_tokens=0,
+            cache_read_input_tokens=0,
         )
     )
 

@@ -280,6 +280,17 @@ CompleteFn = Callable[[str], str]
 # still had to be updated regardless -- the default exists for parity with
 # `risk_level`'s own calling convention and so a future second call site
 # (if one is ever added) isn't forced to always supply it.
+#
+# Convention note (code review): this `Protocol` declares both `risk_level`
+# and `cacheable_prefix` keyword-only, matching the one real call site
+# below, which always passes both as keywords. A future `ComposeCompleteFn`
+# implementation should match that shape (`def f(prompt, *, risk_level,
+# cacheable_prefix=None)`) for the same type-safety reason `risk_level` was
+# originally made keyword-only (see the comment above it) -- a plain
+# positional-or-keyword declaration still satisfies every real caller
+# today (keyword args bind to positional-or-keyword params fine), so this
+# is a convention to follow, not something this module can enforce at
+# runtime.
 class ComposeCompleteFn(Protocol):
     def __call__(self, prompt: str, *, risk_level: str, cacheable_prefix: str | None = None) -> str: ...
 
@@ -431,7 +442,26 @@ User message:
 # that isn't Anthropic-routed (Ollama/OpenAI callers "must see zero
 # behavior change" per the plan doc). `test_graph.py` asserts this
 # reconstruction identity directly, not just as an inline comment's claim.
+#
+# Code-review fix: `maxsplit=1` alone only fails loudly when the marker is
+# ABSENT (unpacking a 1-element list into two names raises ValueError) -- it
+# does NOT fail loudly if the marker instead appears TWICE (e.g. a future
+# template edit adds another example sentence mentioning "Classified
+# intent:"). In that case `split(..., 1)` would silently split at the FIRST
+# occurrence and fold everything from the SECOND occurrence onward into the
+# "variable" suffix -- no exception, and the reconstruction-identity test
+# would still pass (concatenation is correctness-preserving even for a
+# wrong split point), so the real bug (the stable/variable boundary quietly
+# moved, shrinking what's actually cache-control-annotated) would go
+# completely undetected. The explicit count check below fails loudly on
+# BOTH wrong-multiplicity cases, not just the zero case.
 _COMPOSE_WITH_CONTEXT_SPLIT_MARKER = "\n\nClassified intent:"
+assert _COMPOSE_PROMPT_WITH_CONTEXT_TEMPLATE.count(_COMPOSE_WITH_CONTEXT_SPLIT_MARKER) == 1, (
+    "expected exactly one occurrence of the with-context split marker in "
+    "_COMPOSE_PROMPT_WITH_CONTEXT_TEMPLATE -- if this template was edited to "
+    "add a second occurrence (e.g. another example mentioning 'Classified "
+    "intent:'), the stable/variable split point below would silently move"
+)
 _COMPOSE_STABLE_PREFIX_WITH_CONTEXT, _compose_with_context_suffix_tail = (
     _COMPOSE_PROMPT_WITH_CONTEXT_TEMPLATE.split(_COMPOSE_WITH_CONTEXT_SPLIT_MARKER, 1)
 )

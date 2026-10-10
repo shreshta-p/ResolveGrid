@@ -142,6 +142,13 @@ def provider_for_model(model: str) -> str:
     return _MODEL_GROUP_TO_PROVIDER.get(model, "unknown")
 
 
+# Code-review note (non-blocking, deliberately deferred): this function's
+# request-body construction has now grown across three phases (Phase 5's
+# think=false, Phase 11's virtual-key resolution, this task's cache_control
+# branch) to the point a `_build_request_body(model, prompt,
+# cacheable_prefix)` extraction would help readability. Not done here --
+# left as a note for a future, dedicated cleanup task rather than bundled
+# into this one's diff.
 def complete(
     prompt: str,
     *,

@@ -800,7 +800,7 @@ async def _execute_graph_dimension_cases(
         session_factory, tracer, purpose="eval.chat.compose_response"
     )
 
-    def compose_complete_fn(prompt: str, risk_level: str, cacheable_prefix: str | None = None) -> str:
+    def compose_complete_fn(prompt: str, *, risk_level: str, cacheable_prefix: str | None = None) -> str:
         """Adapter satisfying `ComposeCompleteFn`'s shape while deliberately
         ignoring `risk_level` -- see the comment above for why real
         eval-suite traffic always stays on the zero-cost local model
