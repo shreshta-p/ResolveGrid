@@ -1,0 +1,174 @@
+{
+  "uid": "cache-overview",
+  "title": "Cache Overview",
+  "description": "Phase 12 Task 6: real cache hit-rate and lookup-volume panels for all 5 Phase 12 caches (embedding/retrieval/response/semantic -- 'anthropic_prompt_prefix' from Task 4's provider-side mechanism is NOT included here since it emits no cache_lookups_total of its own, see docs/TELEMETRY_COST.md), from the real cache_lookups_total{cache,result} counter every cache module in apps/api/src/resolvegrid_api/cache.py's shared get_cache_lookups_counter() emits to. Provisioned via infra/grafana -- not built by hand in the UI, following Phase 11 Task 6's litellm-overview.json precedent exactly. No live latency-saved panel here: only a Prometheus datasource is provisioned (infra/grafana/provisioning/datasources/), and that comparison needs real Span/ModelCall latency rows, which live in Postgres -- see docs/TELEMETRY_COST.md's 'Phase 12 Task 6' section for the documented SQL query instead.",
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "10s",
+  "time": { "from": "now-30m", "to": "now" },
+  "tags": ["resolvegrid", "cache", "phase12"],
+  "panels": [
+    {
+      "id": 1,
+      "type": "stat",
+      "title": "Total Cache Lookups (all time)",
+      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "sum(cache_lookups_total)",
+          "legendFormat": "lookups",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "short", "color": { "mode": "thresholds" } },
+        "overrides": []
+      }
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "Overall Hit Rate (all time, all caches)",
+      "description": "sum(cache_lookups_total{result=\"hit\"}) / sum(cache_lookups_total{result=~\"hit|miss\"}) -- result=\"error\" (a real Redis/Postgres outage, see each cache module's docstring) is deliberately excluded from the denominator: an outage degrade is neither a hit nor a miss, and folding it in would understate the real hit rate during an unrelated infra blip.",
+      "gridPos": { "h": 4, "w": 6, "x": 6, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "sum(cache_lookups_total{result=\"hit\"}) / sum(cache_lookups_total{result=~\"hit|miss\"})",
+          "legendFormat": "hit rate",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "decimals": 2,
+          "color": { "mode": "thresholds" },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "yellow", "value": 0.2 },
+              { "color": "green", "value": 0.5 }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "Cache Lookups In Last 5m",
+      "gridPos": { "h": 4, "w": 6, "x": 12, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "sum(increase(cache_lookups_total[5m]))",
+          "legendFormat": "lookups (5m)",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "short", "color": { "mode": "thresholds" } },
+        "overrides": []
+      }
+    },
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "Real Outages (error-result lookups, all time)",
+      "description": "sum(cache_lookups_total{result=\"error\"}) -- a Redis/Postgres read failure degraded-to-compute event, per each cache module's documented outage-handling contract. Should be 0 in steady state; a nonzero value is a real, actionable signal, not noise.",
+      "gridPos": { "h": 4, "w": 6, "x": 18, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "sum(cache_lookups_total{result=\"error\"})",
+          "legendFormat": "errors",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": { "mode": "thresholds" },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "red", "value": 1 }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "Cache Hit Rate by Cache Kind",
+      "description": "sum(rate(cache_lookups_total{result=\"hit\"}[5m])) by (cache) / sum(rate(cache_lookups_total{result=~\"hit|miss\"}[5m])) by (cache) -- the real per-cache-kind hit-rate ratio this task's own plan doc PromQL example names, computed per cache in {embedding, retrieval, response, semantic}.",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 4 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "sum(rate(cache_lookups_total{result=\"hit\"}[5m])) by (cache) / sum(rate(cache_lookups_total{result=~\"hit|miss\"}[5m])) by (cache)",
+          "legendFormat": "{{cache}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0,
+          "max": 1,
+          "custom": { "drawStyle": "line", "fillOpacity": 10 }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "Cache Lookup Rate by Cache Kind and Result",
+      "description": "sum(rate(cache_lookups_total[$__rate_interval])) by (cache, result) -- real raw hit/miss/error throughput per cache kind, the un-ratio'd companion to the hit-rate panel above (useful for seeing real traffic VOLUME, not just the ratio -- a cache kind with a high hit rate but near-zero volume is a different story than one with real sustained traffic).",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 4 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "sum(rate(cache_lookups_total[$__rate_interval])) by (cache, result)",
+          "legendFormat": "{{cache}} ({{result}})",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "ops", "custom": { "drawStyle": "line", "fillOpacity": 10 } },
+        "overrides": []
+      }
+    },
+    {
+      "id": 7,
+      "type": "timeseries",
+      "title": "Cache Lookups by Cache Kind (stacked total volume)",
+      "description": "sum(rate(cache_lookups_total[$__rate_interval])) by (cache) -- total real lookup volume per cache kind (hit+miss+error combined), showing which of the 5 caches is actually receiving real traffic.",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 12 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "sum(rate(cache_lookups_total[$__rate_interval])) by (cache)",
+          "legendFormat": "{{cache}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": { "drawStyle": "line", "fillOpacity": 20, "stacking": { "mode": "normal" } }
+        },
+        "overrides": []
+      }
+    }
+  ]
+}

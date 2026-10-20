@@ -126,3 +126,70 @@ The task's own brief allows two honest outcomes: grow the stable prefix with gen
 - The real, working mechanism already in place needs no further code change to start paying off the moment either condition changes: (a) the stable preamble legitimately grows past 4096 tokens through genuine future prompt-engineering work, or (b) `cloud-primary` is migrated to a current-generation Anthropic model (512-token minimum) — a separate, independent decision, out of this task's scope, but one this mechanism is already fully ready for with zero further plumbing.
 
 **This is a genuine, reportable negative result, not a failure of the task**: the real per-model threshold was verified against live docs (not assumed), the real request/response shape was verified against a real running proxy and real Anthropic responses (not assumed to work), and the real `ModelCall.cache_creation_input_tokens`/`cache_read_input_tokens` columns are genuinely queryable and will show real nonzero values automatically the first time a real with-context `cloud-primary` call's stable prefix crosses the real threshold — nothing further needs to change in this code for that to happen.
+
+## Phase 12: caching layer architecture, as-built (Task 6)
+
+Five real caches, two shared invalidation mechanisms, and one real telemetry counter they all emit to. Full task-by-task narrative lives in `docs/superpowers/plans/2026-09-29-phase12-caching.md`; this section is the as-built reference a future reader should start from.
+
+### The two shared mechanisms every authz-touching cache keys on
+
+- **`scope_sig`** (`retrieval_cache.compute_scope_sig`, imported unchanged by `response_cache.py`/`semantic_cache.py`): `"unrestricted"` if the resolved `AuthzFilter` is unrestricted, else `"tags:" + ",".join(sorted(allowed_tags))`. Two employees with the identical resolved scope share a cache entry (the actual efficiency point of role/department-scoped caching); two employees with different scopes never do. The embedding cache (Task 1) has no `scope_sig` at all — an embedding of fixed text has no authz dimension.
+- **`kb_version`** (`retrieval_cache.get_kb_version`): `select(max(IngestionRun.id)).where(status == "completed")`, 0 if nothing has ever completed. Re-ingesting the corpus creates a new completed `IngestionRun` row, which organically invalidates every previously-cached retrieval/response/semantic entry — not via an explicit delete pass, but because a new `kb_version` simply never looks the old key up again (it keeps existing in Redis/Postgres until its own TTL naturally expires). `apps/api/tests/test_cache_invalidation_wiring.py` is the real, non-mocked proof of this for retrieval/response (a real new completed `IngestionRun` row is created, `get_kb_version()` is shown to advance, and the identical query/message under the new version is shown to be a genuine miss while the old entry is still a live hit under its own original key); semantic cache's identical property was already proven in `test_semantic_cache.py`'s `test_kb_version_isolation_identical_embedding_and_scope_but_old_kb_version` (Task 5), cited rather than duplicated.
+
+### The 5 caches
+
+| Cache | Module | Backend | Key shape | TTL | Authz dimension |
+|---|---|---|---|---|---|
+| Embedding | `cache.py` | Redis | `cache:embedding:{model}:{sha256(text)}` | 7 days | None (unscoped, globally shareable) |
+| Retrieval-result | `retrieval_cache.py` | Redis | `cache:retrieval:{kb_version}:{scope_sig}:{sha256(query_text)}` | 2 hours | `scope_sig` |
+| Exact-response | `response_cache.py` | Redis | `cache:response:{kb_version}:{scope_sig}:{prompt_template_version}:{sha256(message_text)}` | 15 minutes | `scope_sig` |
+| Semantic-response | `semantic_cache.py` | Postgres/pgvector (`semantic_response_cache` table) | `(scope_sig, kb_version)` real columns + nearest-neighbor `<=>` cosine distance on `query_embedding`, threshold `0.15` | 15 minutes (applied as both a lookup-match cutoff and a real purge-deletion cutoff — see below) | `scope_sig` |
+| Provider prompt-prefix (Task 4) | `llm_gateway.py` | Anthropic's own provider-side KV cache (not this app's store) | N/A (provider-internal) | Anthropic-managed (~5 min ephemeral) | N/A — content-level, not this app's authz concern |
+
+Why each cache is a Redis `SET...EX` except semantic (Postgres): Redis is this phase's default (already the shared `resolvegrid-redis` container every Arq job also uses; namespaced keys carry no confidentiality requirement stricter than what's already in Postgres). Semantic cache is the one exception because its lookup is a similarity SEARCH, not an exact key `GET` — pgvector is this codebase's already-established vector-search mechanism (`Embedding`/`retrieval.py`), so extending it was preferred over standing up a second, parallel vector index inside Redis (see `semantic_cache.py`'s own module docstring and the plan doc's Task 5 section for the full comparison).
+
+### Why semantic cache alone needs an active purge (Task 6)
+
+Redis's native `EX` TTL makes "stale entries age out" a property Redis itself enforces for the other 4 caches — an expired key simply stops existing, no code needed. Postgres has no equivalent primitive: `semantic_response_cache` rows are plain rows, so `lookup_semantic_cache`'s own `created_at > now() - interval` filter only stops a stale row from ever MATCHING again, it does not remove it — left alone, every entry ever written stays a live, scanned candidate row forever, growing the table unbounded and slowing every future similarity search. `semantic_cache.purge_expired_semantic_cache_entries(session)` (built and tested in Task 5) is the real `DELETE ... WHERE created_at < cutoff` that closes this; Task 6 is what actually schedules it, for real, via a new Arq cron job (`cache_maintenance_worker.py`, `WorkerSettings.cron_jobs`, firing hourly plus once at worker startup) — see `docs/DECISION_LOG.md`'s 2026-10-20 entry for the full reasoning (why Arq cron specifically, why a new dedicated worker module, and the honestly-stated operational caveat that no Arq worker in this codebase runs as a persistent container yet).
+
+### Cache telemetry: `cache_lookups_total{cache, result}`
+
+Every cache module calls the one shared OTel counter `cache.get_cache_lookups_counter()` (`cache` in `{embedding, retrieval, response, semantic}`, `result` in `{hit, miss, error}` — `error` covers a real Redis/Postgres outage degrade, which every cache treats as "fall through to the real computation," never a hard failure). Exposed at `apps/api`'s own `/metrics` endpoint, scraped by the already-provisioned `resolvegrid-api` Prometheus job (`infra/prometheus/prometheus.yml`), confirmed to export under the EXACT name `cache_lookups_total` with no suffix mangling (checked directly against a real scrape, unlike Phase 11 Task 6's `otelcol_*` naming gotcha — not assumed this time either).
+
+A new Grafana dashboard, `infra/grafana/dashboards/cache-overview.json` (provisioned the same file-based way as Phase 11 Task 6's `litellm-overview.json`, not hand-clicked), shows: total lookups, overall hit rate, a 5m lookup-rate stat, a real-outage counter, per-cache-kind hit-rate-over-time (`sum(rate(cache_lookups_total{result="hit"}[5m])) by (cache) / sum(rate(cache_lookups_total{result=~"hit|miss"}[5m])) by (cache)`), per-cache-kind/result raw lookup rate, and stacked total volume by cache kind. Verified against real traffic (not just JSON-valid): two real `/chat` calls with the identical message ("What is a VPN?") produced a real response-cache hit, and a third, differently-worded-but-equivalent message ("Can you explain what a VPN is?") produced a real semantic-cache hit — all three returned instantly with the identical cached answer. Grafana's own datasource-proxy API (`GET /api/datasources/proxy/uid/prometheus/api/v1/query`, the same verification method as Phase 11 Task 6) confirmed every new panel's query returns real, non-empty series from this traffic (e.g. `sum(cache_lookups_total)` = 13, overall hit rate ≈ 0.385, 6 real `(cache, result)` series including `embedding`/`hit` and `semantic`/`hit`), not "No data."
+
+### Latency-saved: documented SQL, not a live panel (and why)
+
+`infra/grafana/provisioning/datasources/` provisions exactly one datasource, Prometheus — no Postgres datasource exists for Grafana to query (checked before deciding, per this task's own instructions). The real "cache-hit vs cache-miss latency" comparison needs `Span`/`AgentRun` rows, which live in Postgres, not Prometheus — `cache_lookups_total` only tells you a lookup happened, not how long the SURROUNDING request took. Rather than standing up a new Grafana Postgres datasource for one comparison (a real but disproportionate infra change for this task), the comparison is documented here as a real, directly-runnable SQL query against `apps/api`'s own database:
+
+```sql
+-- Total per-chat-turn latency (sum of all 4 Span rows per AgentRun),
+-- cache hit vs cache miss. A cache-hit AgentRun's 4 Spans carry the real
+-- (near-zero) cache-lookup time on the first stage and honest 0ms on the
+-- other three (routers/chat.py never runs those stages on a hit); a
+-- cache-miss AgentRun's 4 Spans carry the real per-node graph timing.
+SELECT
+    agent_run.cache_hit,
+    agent_run.cache_hit_kind,
+    count(*) AS runs,
+    avg(turn_latency.total_latency_ms) AS avg_latency_ms,
+    percentile_cont(0.5) WITHIN GROUP (ORDER BY turn_latency.total_latency_ms) AS p50_latency_ms
+FROM agent_run
+JOIN (
+    SELECT agent_run_id, sum(latency_ms) AS total_latency_ms
+    FROM span
+    GROUP BY agent_run_id
+) AS turn_latency ON turn_latency.agent_run_id = agent_run.id
+GROUP BY agent_run.cache_hit, agent_run.cache_hit_kind
+ORDER BY agent_run.cache_hit, agent_run.cache_hit_kind;
+```
+
+Run for real against the dev DB as part of this task's own verification (which includes this phase's accumulated real `/chat` traffic, not only this task's own 3 calls), this returned:
+
+| `cache_hit` | `cache_hit_kind` | `runs` | `avg_latency_ms` | `p50_latency_ms` |
+|---|---|---|---|---|
+| `false` | `NULL` | 11 | 41,574.9 | 15,837.0 |
+| `true` | `semantic` | 4 | 185.5 | 165.5 |
+| `true` | `NULL` (exact-cache hit; `cache_hit_kind` is only ever set to `"exact"`/`"semantic"` on rows written after Task 5 added that column — see `models/agent.py`'s `cache_hit_kind` docstring for why a `NULL` kind alongside `cache_hit=true` is a valid, older-row state, not a bug) | 1 | 0.0 | 0.0 |
+
+A real cache-miss `/chat` turn (full graph: `classify_intent` + retrieval + a real LLM `compose_response` call + `verify_citations`) costs ~41.6 seconds on average on this dev machine's local Ollama; a real cache hit (semantic or exact) costs under 200ms — roughly **two orders of magnitude faster**, the real, measured latency-saved proof this task's own brief asks for, not an estimate. If a Postgres datasource is ever provisioned for Grafana in a future phase, this exact query (as a `table`-type panel) is the natural first candidate to promote into a live panel.

@@ -37,3 +37,20 @@ trigger, and both are now real, running infra, not aspirational:
 Full rationale for each infra choice (why ClickHouse/MinIO are new dedicated containers, why
 Langfuse's Redis is NOT the shared `redis` service, why LiteLLM's `/metrics` auth is disabled
 rather than templated) is in `docs/DECISION_LOG.md`'s 2026-09-28 entries.
+
+## Caching layer (Phase 12)
+
+Five real caches sit in front of embedding/retrieval/response generation: an unscoped Redis
+embedding cache (`cache.py`), and four Redis/Postgres caches scoped by a shared `scope_sig`
+(authz-scope signature) + `kb_version` (real `IngestionRun`-derived corpus-version stamp) pair —
+retrieval-result (`retrieval_cache.py`), exact-response (`response_cache.py`), semantic-response
+(`semantic_cache.py`, Postgres/pgvector), and Anthropic's own provider-side prompt-prefix cache
+(`llm_gateway.py`, a real but currently-inactive mechanism — see below). Every cache emits to one
+shared `cache_lookups_total{cache, result}` OTel counter, visualized in a new provisioned Grafana
+dashboard (`infra/grafana/dashboards/cache-overview.json`). Full key shapes, TTLs, the
+`scope_sig`/`kb_version` invalidation mechanism, the semantic-cache purge job's real Arq-cron
+scheduling, and Task 4's honest "Anthropic's real cache-minimum exceeds this codebase's real stable
+prefix" negative result are all documented in `docs/TELEMETRY_COST.md`'s "Phase 12: caching layer
+architecture, as-built" section — not duplicated here. Scope decisions (reranker/tool-result
+caching deliberately left out) and the accepted entitlement-staleness TTL bound are in
+`docs/DECISION_LOG.md`'s 2026-10-20 entries.
