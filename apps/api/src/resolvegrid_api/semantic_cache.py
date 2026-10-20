@@ -37,13 +37,40 @@ a lookup is a HIT iff the nearest candidate row's real pgvector `<=>`
 cosine distance is `<= SEMANTIC_CACHE_SIMILARITY_THRESHOLD`.
 
 Staleness bound (no TTL column exists -- see `SemanticResponseCache`'s
-docstring for why): `SEMANTIC_CACHE_TTL_SECONDS` is applied as a real
-`created_at > :cutoff` filter in the lookup query itself, mirroring Task
-3's `RESPONSE_CACHE_TTL_SECONDS` 15-minute entitlement-staleness bound
-(this cache carries the identical content-staleness/entitlement-staleness
-risk one layer up from Task 3's exact cache -- see that module's docstring
-for the full rationale, which applies here unchanged) -- a row older than
-the bound is simply never looked up again, never deleted by this module.
+docstring for why): `SEMANTIC_CACHE_TTL_SECONDS` is the identical value and
+rationale as Task 3's `RESPONSE_CACHE_TTL_SECONDS` (`response_cache.py`'s
+docstring has the full write-up; not repeated here). It is applied twice,
+for two different purposes: as a real `created_at > :cutoff` filter inside
+`lookup_semantic_cache`'s own query (a row older than the bound is simply
+never MATCHED), and separately as the real deletion cutoff
+`purge_expired_semantic_cache_entries` uses (a row older than the bound is
+actually REMOVED) -- see that function's own docstring, and `Semantic
+ResponseCache`'s class docstring, for why both halves need to exist
+together (the lookup filter alone does not bound this table's real row
+count).
+
+Thundering-herd tradeoff (undisclosed until this code-review follow-up --
+`response_cache.py` documents its own version of this; this module's
+version is WORSE, not merely equivalent, so it gets its own explicit
+callout rather than a one-line "same as Task 3"): there is no single
+-flight lock on concurrent population. If two requests for a near
+-identical `(scope_sig, kb_version)` question race past a miss on both
+caches, each one independently runs the real graph AND independently calls
+`store_semantic_cache_entry` -- and because this is an `INSERT` of a brand
+-new row (not a Redis `SET` on one shared key, which simply overwrites
+itself under a race), every racing caller's row survives, not just the
+last writer's. A race under sustained concurrent load therefore doesn't
+just duplicate work once (Task 2/3's accepted cost) -- it silently
+multiplies near-duplicate rows into exactly the unbounded-growth problem
+`SemanticResponseCache`'s docstring describes, with no deduplication at
+write time. Not fixed here (a real fix -- e.g. a Redis `SETNX`-based lock
+keyed on `(scope_sig, kb_version)`, or a post-insert dedup pass -- is left
+for a future task if this is ever measured to matter in practice, same
+"accepted, not yet measured to matter" posture Tasks 2/3 already took for
+their own single-flight gaps); flagged explicitly here because the
+consequence compounds the SAME growth risk the TTL/purge mechanism above
+exists to bound, unlike Task 2/3's version of this tradeoff, which costs
+only extra compute, never extra storage.
 
 Real Postgres-outage degrade (this cache's lookup/store touch Postgres, not
 Redis, so Task 1-3's `redis.exceptions.RedisError` precedent doesn't apply
@@ -105,13 +132,10 @@ from resolvegrid_api.models.knowledge import SemanticResponseCache
 SEMANTIC_CACHE_SIMILARITY_THRESHOLD = 0.15
 
 # Identical value and identical rationale to Task 3's `RESPONSE_CACHE_TTL_
-# SECONDS` (`response_cache.py`): this cache carries the SAME entitlement
-# -staleness bound (an admin-revoked role grant stays servable to that
-# employee's old scope_sig until this bound elapses) and the SAME inherited
-# ranking-staleness risk one layer up (a stale retrieval ranking underneath
-# a semantic-cache hit means a stale COMPOSED ANSWER can be served here
-# too) -- see that module's docstring for the full written-out reasoning,
-# which applies here completely unchanged.
+# SECONDS` (`response_cache.py`'s docstring has the full written-out
+# reasoning -- not repeated here). Used both as `lookup_semantic_cache`'s
+# match-staleness cutoff and as `purge_expired_semantic_cache_entries`'s
+# real deletion cutoff -- see this module's own docstring above.
 SEMANTIC_CACHE_TTL_SECONDS = 15 * 60  # 15 minutes
 
 
@@ -239,3 +263,59 @@ def store_semantic_cache_entry(
         session.commit()
     except DBAPIError:
         session.rollback()
+
+
+def purge_expired_semantic_cache_entries(session: Session) -> int:
+    """Real `DELETE FROM semantic_response_cache WHERE created_at < cutoff`,
+    using the SAME `SEMANTIC_CACHE_TTL_SECONDS` bound `lookup_semantic_
+    cache` already uses to decide a row is too stale to MATCH -- this
+    function is what actually REMOVES such a row, closing the gap flagged
+    on code review: a `created_at` lookup filter alone never bounds this
+    table's real row count, since an unmatched-but-not-deleted row still
+    occupies a live row (and a live candidate the next similarity search
+    has to rank past) forever.
+
+    Backed by `ix_semantic_response_cache_created_at` (migration 0021) --
+    this delete has no `scope_sig`/`kb_version` predicate (it purges stale
+    rows across every scope/kb_version in one pass), so without that index
+    it would require a full table scan, compounding the exact growth
+    problem it exists to fix.
+
+    Returns the real number of rows deleted (`CursorResult.rowcount`), so a
+    caller (a future scheduled job, or a manual/ops invocation -- see
+    `models/knowledge.py`'s `SemanticResponseCache` docstring for why
+    wiring an automatic SCHEDULE for this call is Task 6's "invalidation
+    wiring" job, not this task's) can log/verify real purge activity
+    rather than trusting a silent no-op.
+
+    Not wired to run automatically anywhere yet -- this is the real,
+    callable mechanism Task 6 will schedule, following the exact same
+    "build the real primitive now, wire its schedule in the dedicated
+    invalidation-wiring task" split the plan doc's cross-cutting design
+    section already establishes for `kb_version`-driven invalidation
+    elsewhere in this phase.
+
+    Real Postgres-outage degrade, same contract as `lookup_semantic_cache`/
+    `store_semantic_cache_entry`: a real `sqlalchemy.exc.DBAPIError` is
+    caught, the session is rolled back (left usable for the caller), and
+    this returns `0` (honestly "zero rows confirmed deleted this call", not
+    a raised exception) -- a failed purge loses nothing: every row it would
+    have deleted is already unmatchable via `lookup_semantic_cache`'s own
+    identical TTL filter, so the ONLY real cost of a failed purge is delayed
+    reclamation of storage/scan-candidate-count, never a correctness or
+    authz issue, exactly mirroring this module's other two functions'
+    "a cache-adjacent operation must never raise out to its caller" posture.
+    """
+    try:
+        result = session.execute(
+            text(
+                "DELETE FROM semantic_response_cache "
+                "WHERE created_at < now() - make_interval(secs => :ttl_seconds)"
+            ),
+            {"ttl_seconds": SEMANTIC_CACHE_TTL_SECONDS},
+        )
+        session.commit()
+        return result.rowcount
+    except DBAPIError:
+        session.rollback()
+        return 0

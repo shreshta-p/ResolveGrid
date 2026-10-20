@@ -21,7 +21,7 @@ vectors make them fast and deterministic.
 import json
 
 import pytest
-from sqlalchemy import create_engine, delete, text
+from sqlalchemy import create_engine, delete, select, text
 from sqlalchemy.orm import Session
 
 from resolvegrid_api.models.knowledge import SemanticResponseCache
@@ -29,6 +29,7 @@ from resolvegrid_api.semantic_cache import (
     SEMANTIC_CACHE_SIMILARITY_THRESHOLD,
     SEMANTIC_CACHE_TTL_SECONDS,
     lookup_semantic_cache,
+    purge_expired_semantic_cache_entries,
     store_semantic_cache_entry,
 )
 from resolvegrid_retrieval.embedder import DEFAULT_EMBEDDING_MODEL, embed_texts
@@ -334,3 +335,93 @@ def test_empirical_threshold_rejects_different_topic_question(semantic_session):
 
 def test_threshold_constant_is_the_documented_empirically_chosen_value():
     assert SEMANTIC_CACHE_SIMILARITY_THRESHOLD == 0.15
+
+
+# ---------------------------------------------------------------------------
+# purge_expired_semantic_cache_entries (Phase 12 Task 5 code-review
+# follow-up): the real DELETE that bounds this table's row count, closing
+# the gap flagged on review -- a `created_at` lookup filter alone never
+# deletes anything, so without this function the table grows unbounded.
+# ---------------------------------------------------------------------------
+
+
+def test_purge_deletes_only_rows_older_than_the_ttl_cutoff(semantic_session):
+    scope_sig = f"{_TEST_SCOPE_PREFIX}purge-check"
+
+    old_entry = SemanticResponseCache(
+        scope_sig=scope_sig, kb_version=1, query_embedding=_fixed_vector(0.11),
+        answer="old", citations_json=json.dumps([]), caption="c",
+        intent="general_question", risk_level="low",
+    )
+    fresh_entry = SemanticResponseCache(
+        scope_sig=scope_sig, kb_version=1, query_embedding=_fixed_vector(0.22),
+        answer="fresh", citations_json=json.dumps([]), caption="c",
+        intent="general_question", risk_level="low",
+    )
+    semantic_session.add_all([old_entry, fresh_entry])
+    semantic_session.commit()
+    # Captured as plain ints BEFORE any further commit -- `purge_expired_
+    # semantic_cache_entries` below commits internally, which (with
+    # SQLAlchemy's default expire_on_commit) expires these ORM instances'
+    # attributes; re-accessing `old_entry.id` afterward would try to
+    # refresh-SELECT a row that's genuinely gone by then, raising
+    # `ObjectDeletedError` -- plain python ints sidestep that entirely.
+    old_id, fresh_id = old_entry.id, fresh_entry.id
+
+    # Backdate ONLY the old entry past the real TTL bound via real SQL
+    # (mirrors test_stale_row_past_ttl_is_not_served's identical technique)
+    # -- the fresh entry's created_at is left at its real, just-inserted
+    # server_default=now() value.
+    semantic_session.execute(
+        text(
+            "UPDATE semantic_response_cache SET created_at = now() - make_interval(secs => :past) "
+            "WHERE id = :id"
+        ),
+        {"past": SEMANTIC_CACHE_TTL_SECONDS + 60, "id": old_id},
+    )
+    semantic_session.commit()
+
+    deleted_count = purge_expired_semantic_cache_entries(semantic_session)
+    assert deleted_count >= 1  # at least our one old row (a shared dev DB may have others)
+
+    remaining_ids = set(
+        semantic_session.scalars(
+            select(SemanticResponseCache.id).where(SemanticResponseCache.id.in_([old_id, fresh_id]))
+        ).all()
+    )
+    assert old_id not in remaining_ids  # purged -- past the TTL cutoff
+    assert fresh_id in remaining_ids  # kept -- still within the TTL window
+
+
+def test_purge_does_not_delete_a_fresh_unexpired_row(semantic_session):
+    scope_sig = f"{_TEST_SCOPE_PREFIX}purge-nothing-expired"
+    store_semantic_cache_entry(
+        semantic_session, query_embedding=_fixed_vector(0.33), scope_sig=scope_sig, kb_version=1,
+        value={"answer": "x", "citations": [], "caption": "c", "intent": "i", "risk_level": "low"},
+    )
+
+    # A real, freshly-inserted row must not be purged -- real purge activity
+    # on THIS test's own row must be zero (other pre-existing stale rows in
+    # a shared dev DB may still be purged by the same call, hence checking
+    # this test's own row survived rather than asserting a global count).
+    purge_expired_semantic_cache_entries(semantic_session)
+
+    survived = semantic_session.scalar(
+        select(SemanticResponseCache.id).where(
+            SemanticResponseCache.scope_sig == scope_sig, SemanticResponseCache.kb_version == 1,
+        )
+    )
+    assert survived is not None
+
+
+def test_purge_postgres_outage_degrades_to_zero_instead_of_raising():
+    unreachable_engine = create_engine(
+        "postgresql+psycopg://user:pass@localhost:1/db", connect_args={"connect_timeout": 1}
+    )
+    unreachable_session = Session(unreachable_engine)
+    try:
+        result = purge_expired_semantic_cache_entries(unreachable_session)
+        assert result == 0
+    finally:
+        unreachable_session.close()
+        unreachable_engine.dispose()

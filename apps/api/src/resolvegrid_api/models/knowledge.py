@@ -178,31 +178,53 @@ class SemanticResponseCache(Base):
     Redis mechanism), a Postgres row has no built-in expiry -- `semantic_
     cache.py`'s lookup query instead filters `created_at > :cutoff` using
     the same entitlement-staleness-bound reasoning Task 3's `RESPONSE_CACHE_
-    TTL_SECONDS` documents (this cache carries the identical content
-    -staleness and entitlement-staleness risk one layer up), so an old row
-    is simply never looked up again past that bound -- it is not deleted (a
-    future cleanup pass could prune `created_at`-expired rows; out of scope
-    here, matching the Redis caches' own "stale keys expire via TTL, no
-    explicit delete pass" documented strategy).
+    TTL_SECONDS` documents (see that module's docstring for the full
+    rationale, which applies here unchanged).
+
+    Code-review follow-up (reconciling two pieces of reasoning that were
+    previously left in unacknowledged tension with each other): the
+    no-ANN-index paragraph below depends on this table's real row count
+    staying small, which depends in turn on old rows actually being
+    deleted, not merely skipped by the lookup's `created_at` filter once
+    they age out. A row is NO LONGER deleted by this filter alone -- it is
+    deleted for real, by `resolvegrid_api.semantic_cache.purge_expired_
+    semantic_cache_entries` (a real `DELETE ... WHERE created_at < cutoff`,
+    backed by `ix_semantic_response_cache_created_at` below so that delete
+    itself never needs a full table scan). This function exists and is
+    real as of this migration (0021) -- what does NOT yet exist is a
+    schedule that calls it automatically (e.g. a periodic Arq job); wiring
+    that schedule is Task 6's job ("invalidation wiring", per the phase
+    plan), tracked there rather than assumed here. Until that scheduling
+    exists, this table's growth is bounded only by someone/something
+    actually invoking the purge function -- the no-ANN-index reasoning
+    below is honest ONLY in light of that real (if not yet automatically
+    -scheduled) mechanism, not as a standalone assumption.
 
     Deliberately no ANN (HNSW) index on `query_embedding`: this table's real
-    candidate set per `(scope_sig, kb_version)` is small (one organization's
-    worth of distinct recent questions within one scope), so a plain
-    sequential scan over the already-filtered candidate rows, exactly
-    ordered by real `<=>` cosine distance, is both fast enough and exactly
-    correct -- an ANN index trades a small, real chance of missing the true
-    nearest neighbor for speed at a scale this table doesn't operate at, and
-    this is a security/correctness-adjacent lookup (the whole point is a
-    precise, honest threshold decision), so exact ordering is the right
-    tradeoff here, unlike `Embedding.vector`'s HNSW index (Phase 7), whose
-    multi-chunk corpus-wide search genuinely benefits from ANN speed and
-    whose stakes are "which chunk ranks higher", not "does this query match
-    at all".
+    candidate set per `(scope_sig, kb_version)` is small -- one
+    organization's worth of distinct recent questions within one scope,
+    kept small for real by the purge mechanism above, not merely assumed
+    small -- so a plain sequential scan over the already-filtered candidate
+    rows, exactly ordered by real `<=>` cosine distance, is both fast enough
+    and exactly correct -- an ANN index trades a small, real chance of
+    missing the true nearest neighbor for speed at a scale this table
+    doesn't operate at, and this is a security/correctness-adjacent lookup
+    (the whole point is a precise, honest threshold decision), so exact
+    ordering is the right tradeoff here, unlike `Embedding.vector`'s HNSW
+    index (Phase 7), whose multi-chunk corpus-wide search genuinely
+    benefits from ANN speed and whose stakes are "which chunk ranks
+    higher", not "does this query match at all".
     """
 
     __tablename__ = "semantic_response_cache"
     __table_args__ = (
         Index("ix_semantic_response_cache_scope_kb", "scope_sig", "kb_version"),
+        # Migration 0021 (code-review follow-up): supports a real cleanup
+        # pass (`purge_expired_semantic_cache_entries`) that deletes purely
+        # by age, with no `scope_sig`/`kb_version` predicate -- without this,
+        # that delete would itself require a full table scan, compounding
+        # the exact unbounded-growth problem it exists to fix.
+        Index("ix_semantic_response_cache_created_at", "created_at"),
     )
 
     id: Mapped[int] = mapped_column(primary_key=True)

@@ -57,6 +57,52 @@ def test_agent_run_status_defaults_to_running(db_session):
     assert fetched.status == "running"
 
 
+def test_agent_run_cache_hit_kind_requires_cache_hit_true(db_session):
+    """Phase 12 Task 5 code-review follow-up: a real DB CHECK constraint
+    (migration 0021, `ck_agent_run_cache_hit_kind_requires_cache_hit`) must
+    make `cache_hit_kind` set alongside `cache_hit=False` structurally
+    impossible to write, not merely unlikely-by-convention -- a row saying
+    "semantically/exactly cache-hit" while simultaneously saying "this
+    wasn't a cache hit at all" is nonsensical and must fail at the DB layer
+    regardless of which future code path tries to write it.
+    """
+    invalid_run = AgentRun(
+        thread_id="thread-invalid-cache-hit-kind",
+        input_text="hello",
+        cache_hit=False,
+        cache_hit_kind="exact",
+    )
+    db_session.add(invalid_run)
+
+    with pytest.raises(IntegrityError):
+        db_session.flush()
+
+    # Same Postgres-transaction-abort cleanup as the FK-enforcement test
+    # below -- the session must be rolled back to a clean state before the
+    # fixture's own teardown rollback runs.
+    db_session.rollback()
+
+
+def test_agent_run_cache_hit_true_with_cache_hit_kind_is_allowed(db_session):
+    """The positive case: `cache_hit=True` with a real `cache_hit_kind`
+    ("exact" or "semantic") is exactly the valid combination the CHECK
+    constraint must still permit -- proves the constraint isn't
+    overly-broad and blocking legitimate rows too.
+    """
+    valid_run = AgentRun(
+        thread_id="thread-valid-cache-hit-kind",
+        input_text="hello",
+        cache_hit=True,
+        cache_hit_kind="semantic",
+    )
+    db_session.add(valid_run)
+    db_session.flush()  # must not raise
+
+    fetched = db_session.get(AgentRun, valid_run.id)
+    assert fetched.cache_hit is True
+    assert fetched.cache_hit_kind == "semantic"
+
+
 def test_span_agent_run_fk_is_enforced(db_session):
     """A Span referencing a nonexistent agent_run_id must fail to commit/flush."""
     orphan_span = Span(agent_run_id=999_999_999, stage_name="classify_intent", status="success", latency_ms=10)

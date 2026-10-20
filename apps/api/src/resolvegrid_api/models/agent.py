@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from sqlalchemy import ForeignKey, Index, false, func
+from sqlalchemy import CheckConstraint, ForeignKey, Index, false, func
 from sqlalchemy.orm import Mapped, mapped_column
 
 from resolvegrid_api.models.base import Base
@@ -16,6 +16,20 @@ class AgentRun(Base):
     """
 
     __tablename__ = "agent_run"
+    __table_args__ = (
+        # Phase 12 Task 5 code-review follow-up (migration 0021): a real DB
+        # CHECK, not just a convention both real write sites in `routers/
+        # chat.py` happen to follow -- `cache_hit_kind` naming WHICH cache
+        # served a run only ever makes sense when `cache_hit` itself is
+        # true; `cache_hit_kind` set alongside `cache_hit=False` would be a
+        # structurally nonsensical row ("which cache served a run that
+        # wasn't a cache hit at all"). This makes that combination
+        # impossible to write, not just unlikely.
+        CheckConstraint(
+            "cache_hit_kind IS NULL OR cache_hit = true",
+            name="ck_agent_run_cache_hit_kind_requires_cache_hit",
+        ),
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True)
     thread_id: Mapped[str] = mapped_column(unique=True)  # LangGraph's checkpoint key
