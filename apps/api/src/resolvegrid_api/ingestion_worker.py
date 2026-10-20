@@ -61,6 +61,21 @@ from resolvegrid_retrieval.embedder import DEFAULT_EMBEDDING_MODEL
 # (infra/docker-compose.yml: "6380:6379").
 REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6380/0")
 
+# Phase 12 Task 6 code-review follow-up: this module's `WorkerSettings`
+# previously had no explicit `queue_name`, so it shared Arq's library
+# -default queue (`arq.constants.default_queue_name`, "arq:queue") with
+# every OTHER `WorkerSettings` in this codebase (`eval_worker.py`, and now
+# `cache_maintenance_worker.py`) on the SAME Redis instance. A worker that
+# picks up a job for a function name outside its own `functions`/`cron_jobs`
+# registry fails it immediately (`arq.worker.Worker.run_job`'s real
+# `KeyError` -> `job_failed(JobExecutionFailed(...))` path, confirmed by
+# reading that code directly) -- so three same-queue workers is a real,
+# not theoretical, latent risk: a stray job from one worker's queue could
+# be picked up by a DIFFERENT worker's burst-mode test run and increment
+# `jobs_failed`, exactly the kind of cross-test flake a real fix should
+# close rather than leave as a known gap now that a third worker exists.
+QUEUE_NAME = "resolvegrid:ingestion"
+
 # Pinned versions for this phase's ingestion runs. Bumping any of these
 # is a deliberate re-ingestion-triggering event (a new parser_version or
 # chunking_version changes chunk_markdown's output; a new embedding_model
@@ -201,6 +216,7 @@ class WorkerSettings:
     """
 
     functions = [ingest_seed_corpus_task]
+    queue_name = QUEUE_NAME
     redis_settings = RedisSettings.from_dsn(REDIS_URL)
 
 

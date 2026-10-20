@@ -49,7 +49,7 @@ if not hasattr(signal, "SIGUSR1"):
     signal.SIGUSR1 = signal.SIGTERM
 
 import resolvegrid_api.eval_worker as eval_worker_module
-from resolvegrid_api.eval_worker import REDIS_URL, WorkerSettings, run_eval_suite
+from resolvegrid_api.eval_worker import QUEUE_NAME, REDIS_URL, WorkerSettings, run_eval_suite
 from resolvegrid_api.ingestion_worker import run_seed_corpus_ingestion
 from resolvegrid_api.models import ApprovalDecision, ApprovalRequest, Employee, ModelCall
 from resolvegrid_api.models.evaluation import EvalCaseResult, EvalRun
@@ -385,7 +385,12 @@ def test_arq_worker_processes_run_eval_suite_task_via_real_redis(monkeypatch, ra
     convention) -- a no-op cleanup if the corpus was already present.
     """
     async def _enqueue() -> None:
-        pool = await create_pool(RedisSettings.from_dsn(REDIS_URL))
+        # default_queue_name=QUEUE_NAME: must match WorkerSettings.queue_name
+        # (Phase 12 Task 6 code-review follow-up) -- see
+        # test_ingestion_worker.py's identical comment for the full
+        # rationale (queue isolation between this codebase's 3 real Arq
+        # worker modules).
+        pool = await create_pool(RedisSettings.from_dsn(REDIS_URL), default_queue_name=QUEUE_NAME)
         try:
             job = await pool.enqueue_job("run_eval_suite_task")
             assert job is not None, "enqueue_job returned None -- job may already be queued/deduped"

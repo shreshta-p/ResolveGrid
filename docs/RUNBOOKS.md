@@ -116,3 +116,43 @@ out of scope for Phase 9, whose exit criteria were about proving the
 grant path end-to-end, not building the inverse operation. Revisit trigger:
 before any non-local/shared deployment where manual SQL access to
 production is not an acceptable normal operating procedure.
+
+## Background job workers (Arq) — none run as a persistent container
+
+**This codebase has no persistent Arq-worker container.** `infra/docker
+-compose.yml` runs Postgres/Redis/Ollama/LiteLLM/the observability stack,
+but every real Arq `WorkerSettings` in `apps/api` —
+`resolvegrid_api.ingestion_worker` (seed-corpus ingestion),
+`resolvegrid_api.eval_worker` (eval-suite batch runs), and
+`resolvegrid_api.cache_maintenance_worker` (Phase 12 Task 6: hourly
+semantic-response-cache purge) — must be started manually, as its own
+long-running process, for its jobs to ever actually execute:
+
+```bash
+uv run --package resolvegrid-api arq resolvegrid_api.ingestion_worker.WorkerSettings
+uv run --package resolvegrid-api arq resolvegrid_api.eval_worker.WorkerSettings
+uv run --package resolvegrid-api arq resolvegrid_api.cache_maintenance_worker.WorkerSettings
+```
+
+**Operational consequence an on-call engineer must know**: if nobody is
+running the third command above, `semantic_response_cache` (Postgres) grows
+unbounded forever — `lookup_semantic_cache`'s own 15-minute TTL filter stops
+a stale row from being *matched*, but only the `cache_maintenance_worker`
+cron job (fires hourly, plus once at worker startup) actually *deletes*
+expired rows. A slow-growing `semantic_response_cache` table with no
+Arq-worker process visible in `ps`/your process manager is the real symptom
+to check for — see `docs/DECISION_LOG.md`'s 2026-10-20 entry and
+`cache_maintenance_worker.py`'s own module docstring for the full reasoning
+(why Arq cron, why no persistent container was stood up for it this phase).
+Each of the three workers now also owns its own real Arq queue name
+(`QUEUE_NAME` in each module — `resolvegrid:ingestion` /
+`resolvegrid:eval` / `resolvegrid:cache-maintenance`) rather than sharing
+Arq's single library-default queue, so starting one does not risk it
+dequeuing and failing a job meant for another.
+
+Before any non-local/shared deployment: stand up each of these three as a
+real persistent process (a dedicated container/systemd unit/supervisor
+entry per worker, or one process with all three `WorkerSettings` merged —
+not decided yet, tracked future work) — manual-start-per-dev-session is not
+an acceptable production operating model, the same revisit trigger the VPN
+-grant runbook above already names for its own manual-SQL remediation step.

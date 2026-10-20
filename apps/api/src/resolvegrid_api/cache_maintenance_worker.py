@@ -81,6 +81,19 @@ from resolvegrid_api.semantic_cache import purge_expired_semantic_cache_entries
 # independent worker modules.
 REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6380/0")
 
+# Code-review follow-up, applied here from the start (and retrofitted onto
+# `ingestion_worker.py`/`eval_worker.py` in the same commit): every
+# `WorkerSettings` in this codebase previously had no explicit `queue_name`,
+# so all shared Arq's library-default queue on the same Redis instance -- a
+# real risk (not theoretical: a worker that dequeues a job for a function
+# name outside its own registry fails it immediately, confirmed by reading
+# `arq.worker.Worker.run_job`'s real `KeyError` -> `job_failed(...)` path)
+# that a stray job from one worker's queue gets picked up and failed by a
+# DIFFERENT worker's burst-mode test run. Each worker module now owns its
+# own queue name; see `ingestion_worker.QUEUE_NAME`'s comment for the full
+# writeup.
+QUEUE_NAME = "resolvegrid:cache-maintenance"
+
 
 async def purge_expired_semantic_cache_task(ctx: dict) -> dict:
     """The real Arq job function -- registered in both `WorkerSettings.
@@ -123,4 +136,5 @@ class WorkerSettings:
             run_at_startup=True,
         )
     ]
+    queue_name = QUEUE_NAME
     redis_settings = RedisSettings.from_dsn(REDIS_URL)

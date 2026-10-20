@@ -1218,6 +1218,15 @@ async def run_eval_suite_task(ctx: dict) -> dict:
         engine.dispose()
 
 
+# Phase 12 Task 6 code-review follow-up: see `ingestion_worker.py`'s
+# identical `QUEUE_NAME` constant/comment for the full rationale -- this
+# module's `WorkerSettings` previously shared Arq's library-default queue
+# name with every other real `WorkerSettings` in this codebase, a real
+# (not theoretical) cross-worker job-collision/test-flake risk now that a
+# third worker (`cache_maintenance_worker.py`) exists on the same Redis.
+QUEUE_NAME = "resolvegrid:eval"
+
+
 class WorkerSettings:
     """Arq worker process entry point:
     `uv run --package resolvegrid-api arq resolvegrid_api.eval_worker.WorkerSettings`
@@ -1225,6 +1234,7 @@ class WorkerSettings:
     """
 
     functions = [run_eval_suite_task]
+    queue_name = QUEUE_NAME
     redis_settings = RedisSettings.from_dsn(REDIS_URL)
 
 

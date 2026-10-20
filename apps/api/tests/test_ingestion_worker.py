@@ -45,6 +45,7 @@ from resolvegrid_api.ingestion_worker import (
     CHUNKING_VERSION,
     EMBEDDING_VERSION,
     PARSER_VERSION,
+    QUEUE_NAME,
     REDIS_URL,
     WorkerSettings,
     run_seed_corpus_ingestion,
@@ -131,7 +132,11 @@ def test_arq_worker_processes_ingest_seed_corpus_task_via_real_redis(raw_db_sess
     from resolvegrid_api.models.knowledge import Chunk, Document, DocumentVersion, Embedding
 
     async def _enqueue() -> None:
-        pool = await create_pool(RedisSettings.from_dsn(REDIS_URL))
+        # default_queue_name=QUEUE_NAME: must match WorkerSettings.queue_name
+        # (Phase 12 Task 6 code-review follow-up) -- otherwise this enqueues
+        # onto Arq's library-default queue, which the burst-mode worker
+        # below (reading from its own explicit QUEUE_NAME) would never see.
+        pool = await create_pool(RedisSettings.from_dsn(REDIS_URL), default_queue_name=QUEUE_NAME)
         try:
             job = await pool.enqueue_job("ingest_seed_corpus_task")
             assert job is not None, "enqueue_job returned None -- job may already be queued/deduped"
