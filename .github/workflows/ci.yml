@@ -92,6 +92,23 @@ jobs:
           # qwen3:14b (9.3GB) is new to this job as of Phase 10 Task 9 --
           # see the LiteLLM step below for why it's now needed here.
           curl -sf http://localhost:11434/api/pull -d '{"model": "qwen3:14b", "stream": false}'
+          # Phase 12 Task 7 CI fix: `pull` only gets the model onto disk --
+          # it does NOT load it into memory/compile its runner. Without a
+          # real warm-up generation call here, the FIRST real completion
+          # request against qwen3:14b during the test suite itself (in
+          # practice, test_adversarial_suite.py's real-model test below,
+          # since it runs early) pays that one-time cold-start cost inside
+          # its own 60s per-call `llm_gateway.complete()` timeout -- a real,
+          # reproduced CI failure (run 39584346071: `assert 502 == 200`,
+          # the clean "agent run failed: timed out" 502 contract, not a
+          # crash), matching exactly the 2-cold-attempt pattern this same
+          # closing task's own local verification independently observed
+          # against a freshly-pulled model. Paying that cost here, during
+          # setup (generous CI timeout budget), rather than inside a single
+          # test's fixed 60s window, is the real root-cause fix -- not a
+          # weakened test assertion or a longer per-call timeout that would
+          # just as easily be exhausted by the same cold-start cost.
+          curl -sf http://localhost:11434/api/generate -d '{"model": "qwen3:14b", "prompt": "hello", "stream": false}' >/dev/null
       # Phase 10 Task 9: apps/api/tests/test_adversarial_suite.py's
       # test_adversarial_injected_document_never_triggers_a_real_tool_call
       # (Phase 10 Task 6) is the first test in this repo's history to call
