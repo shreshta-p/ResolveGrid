@@ -522,9 +522,27 @@ def test_chat_span_latency_distribution_differs_across_two_different_inputs(
         return response.json()["thread_id"]
 
     # Run 1: classify_intent does the (relatively) heavier real work.
-    thread_id_1 = _run(0.06, 0.01, "first message, slow classification")
+    #
+    # CI root-cause note (found during Phase 12 Task 7's fresh-state
+    # verification): the originally-committed deltas here were 0.06s vs
+    # 0.01s -- a real 50ms margin between the two sleeps. That margin held
+    # reliably on this project's local (lightly-loaded, dedicated) hardware
+    # but is not reliably larger than real scheduler jitter on GitHub's
+    # shared, CPU-only hosted runners (already-documented elsewhere in this
+    # project as noisier than local hardware, e.g. `qwen3:14b` generation
+    # variance) -- CI run 39577607942 reproduced a genuine inversion
+    # (`compose_response` measured 64ms, `classify_intent` 138ms, in the
+    # run where `compose_response` was supposed to be the heavier one).
+    # Reproduced as a real, non-mocked timing race, not a code defect in
+    # the span-timing instrumentation itself (every other assertion in
+    # this file about per-node latency correctness still passes). Fixed by
+    # widening the margin to ~280ms (0.30s vs 0.02s) so the real, deliberately
+    # injected work dominates over real scheduler noise -- not by weakening
+    # the assertion itself, which still requires the genuinely-slower node
+    # to measure as genuinely slower.
+    thread_id_1 = _run(0.30, 0.02, "first message, slow classification")
     # Run 2: compose_response does the heavier real work instead.
-    thread_id_2 = _run(0.01, 0.06, "second message, slow composition")
+    thread_id_2 = _run(0.02, 0.30, "second message, slow composition")
 
     latencies_1 = {s.stage_name: s.latency_ms for s in _spans_for_thread(raw_db_session, thread_id_1)}
     latencies_2 = {s.stage_name: s.latency_ms for s in _spans_for_thread(raw_db_session, thread_id_2)}
