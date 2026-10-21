@@ -24,6 +24,7 @@ dependencies = [
     "jsonschema>=4.26.0",
     "redis>=5.0",
     "prometheus-client>=0.20",
+    "google-adk[extensions]>=1.14.1",
 ]
 
 [tool.uv.sources]
