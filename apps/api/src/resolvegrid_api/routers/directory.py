@@ -2,6 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from resolvegrid_api.authz_scope import apply_decision_scope, resource_in_scope
 from resolvegrid_api.db import get_db
 from resolvegrid_api.deps import get_principal
 from resolvegrid_api.models import Employee
@@ -22,24 +23,24 @@ def _employee_to_dict(employee: Employee) -> dict:
 
 
 def _apply_scope(query, decision: Decision):
-    """Narrow a query to a Decision's allowed set. Unrestricted (admin) decisions
-    (department_ids is None and employee_id is None) apply no filter at all."""
-    if decision.department_ids is not None:
-        query = query.where(Employee.department_id.in_(decision.department_ids))
-    if decision.employee_id is not None:
-        query = query.where(Employee.id == decision.employee_id)
-    return query
+    """Narrow a query to a Decision's allowed set -- delegates to
+    `authz_scope.apply_decision_scope` (Phase 13 Task 2 code-review
+    follow-up: this used to be an independent copy of the same two rules
+    `routers/tickets.py`'s `_apply_ticket_scope` implements for `Ticket`).
+    Unrestricted (admin) decisions (department_ids is None and employee_id
+    is None) apply no filter at all."""
+    return apply_decision_scope(
+        query, decision, department_id_column=Employee.department_id, owner_id_column=Employee.id
+    )
 
 
 def _in_scope(decision: Decision, employee: Employee) -> bool:
-    """Verify one already-fetched Employee is within a Decision's allowed set.
-    Required for single-resource endpoints, where a query-level filter alone
-    isn't enough to prove the specific row returned was actually authorized."""
-    if decision.employee_id is not None and decision.employee_id != employee.id:
-        return False
-    if decision.department_ids is not None and employee.department_id not in decision.department_ids:
-        return False
-    return True
+    """Verify one already-fetched Employee is within a Decision's allowed
+    set -- delegates to `authz_scope.resource_in_scope` (see that module's
+    docstring). Required for single-resource endpoints, where a query-level
+    filter alone isn't enough to prove the specific row returned was
+    actually authorized."""
+    return resource_in_scope(decision, department_id=employee.department_id, owner_id=employee.id)
 
 
 @router.get("/employees")

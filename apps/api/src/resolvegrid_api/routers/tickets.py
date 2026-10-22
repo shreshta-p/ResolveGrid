@@ -5,6 +5,7 @@ from sqlalchemy.orm import Session
 
 from resolvegrid_api import llm_gateway
 from resolvegrid_api.audit import record_audit_event
+from resolvegrid_api.authz_scope import apply_decision_scope, resource_in_scope
 from resolvegrid_api.db import get_db
 from resolvegrid_api.deps import get_principal
 from resolvegrid_api.model_call_logging import current_pricing_version, log_completion
@@ -43,19 +44,18 @@ def _ticket_to_dict(ticket: Ticket) -> dict:
 
 
 def _apply_ticket_scope(query, decision: Decision):
+    # The join is conditional (only when department-scoping is actually in
+    # play) -- see `authz_scope.apply_decision_scope`'s docstring for why
+    # that join can't move into the shared helper itself.
     if decision.department_ids is not None:
-        query = query.join(Queue, Ticket.queue_id == Queue.id).where(Queue.department_id.in_(decision.department_ids))
-    if decision.employee_id is not None:
-        query = query.where(Ticket.requester_id == decision.employee_id)
-    return query
+        query = query.join(Queue, Ticket.queue_id == Queue.id)
+    return apply_decision_scope(
+        query, decision, department_id_column=Queue.department_id, owner_id_column=Ticket.requester_id
+    )
 
 
 def _ticket_in_scope(decision: Decision, ticket: Ticket, ticket_department_id: int | None) -> bool:
-    if decision.employee_id is not None and decision.employee_id != ticket.requester_id:
-        return False
-    if decision.department_ids is not None and ticket_department_id not in decision.department_ids:
-        return False
-    return True
+    return resource_in_scope(decision, department_id=ticket_department_id, owner_id=ticket.requester_id)
 
 
 @router.post("", status_code=201)

@@ -54,6 +54,31 @@ stop a caller from probing the TOOL REGISTRY itself; here the equivalent
 precedent is `routers/tickets.py`/`routers/directory.py`'s existing,
 already-reviewed 404-vs-403 distinction for a single RESOURCE, which this
 module mirrors exactly rather than inventing a third convention.
+
+Code-review follow-up: the actual `Decision`-interpretation rules (what
+`department_ids`/`employee_id` mean for a query filter / an in-scope check)
+now live in `resolvegrid_api.authz_scope`, shared with `routers/tickets.py`
+and `routers/directory.py` -- this module used to keep its own independent
+copy of the same ticket-scoping logic `routers/tickets.py` already had,
+which would have made it the THIRD such copy codebase-wide (the other being
+`routers/directory.py`'s Employee-scoped equivalent). See `authz_scope.py`'s
+module docstring for the full reasoning.
+
+Note for Task 3 (ADK Agent/Runner wiring): Task 1's spike
+(`test_adk_integration_spike.py`) only ever exercised a ZERO-argument tool
+function (`get_current_server_time`) -- it never proved ADK's real schema
+-introspection (`google.adk.tools.function_tool`'s `build_function_declaration`)
+behaves correctly for a `functools.partial`-bound multi-argument tool like
+the four defined here (where `session`/`principal` must be curried away
+before the model ever sees a schema). Task 3 must empirically verify this
+against the real installed package before assuming currying is sufficient,
+and should also check whether ADK has a native `ToolContext`-style
+injected-parameter mechanism (a real, first-class way to pass
+caller-supplied context into a tool without it appearing in the model
+-visible schema) before committing to `functools.partial` as the only
+approach -- don't assume either way without checking the real source, per
+this phase's own established "verify against the installed package, not
+secondhand research" precedent (ADR 0003).
 """
 
 from __future__ import annotations
@@ -64,6 +89,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from resolvegrid_api.agent_retrieval import retrieve_for_agent
+from resolvegrid_api.authz_scope import apply_decision_scope, resource_in_scope
 from resolvegrid_api.models.org import Employee
 from resolvegrid_api.models.ticketing import AuditLog, Queue, Ticket, TicketMessage
 from resolvegrid_api.operational_adapters.entitlements import lookup_employee_entitlements
@@ -96,12 +122,12 @@ class EmployeeNotAuthorizedError(DiagnosticToolError):
 
 
 # ---------------------------------------------------------------------------
-# Shared ticket-scoping helpers (single source of truth for this module --
-# deliberately NOT imported from `routers/tickets.py`, whose equivalents are
-# private/underscore-prefixed module internals; this mirrors that module's
-# own precedent of `routers/directory.py` keeping its own near-identical
-# `_apply_scope`/`_in_scope` pair rather than cross-importing another
-# router's private helpers).
+# Ticket-scoping helpers specific to this module's fetch-then-check flow.
+# The actual Decision-interpretation logic (what department_ids/employee_id
+# mean for a query filter / an in-scope check) lives in
+# `resolvegrid_api.authz_scope` (see that module's docstring) -- shared with
+# `routers/tickets.py` and `routers/directory.py` rather than each keeping
+# an independent copy of the same two rules.
 # ---------------------------------------------------------------------------
 
 
@@ -112,20 +138,14 @@ def _ticket_department_id(session: Session, ticket: Ticket) -> int | None:
 
 def _apply_ticket_scope(query, decision: Decision):
     if decision.department_ids is not None:
-        query = query.join(Queue, Ticket.queue_id == Queue.id).where(
-            Queue.department_id.in_(decision.department_ids)
-        )
-    if decision.employee_id is not None:
-        query = query.where(Ticket.requester_id == decision.employee_id)
-    return query
+        query = query.join(Queue, Ticket.queue_id == Queue.id)
+    return apply_decision_scope(
+        query, decision, department_id_column=Queue.department_id, owner_id_column=Ticket.requester_id
+    )
 
 
 def _ticket_in_scope(decision: Decision, ticket: Ticket, department_id: int | None) -> bool:
-    if decision.employee_id is not None and decision.employee_id != ticket.requester_id:
-        return False
-    if decision.department_ids is not None and department_id not in decision.department_ids:
-        return False
-    return True
+    return resource_in_scope(decision, department_id=department_id, owner_id=ticket.requester_id)
 
 
 def _require_ticket_in_scope(session: Session, decision: Decision, ticket_id: int) -> Ticket:
@@ -142,11 +162,7 @@ def _require_ticket_in_scope(session: Session, decision: Decision, ticket_id: in
 
 
 def _employee_in_scope(decision: Decision, employee: Employee) -> bool:
-    if decision.employee_id is not None and decision.employee_id != employee.id:
-        return False
-    if decision.department_ids is not None and employee.department_id not in decision.department_ids:
-        return False
-    return True
+    return resource_in_scope(decision, department_id=employee.department_id, owner_id=employee.id)
 
 
 # ---------------------------------------------------------------------------
@@ -155,9 +171,27 @@ def _employee_in_scope(decision: Decision, employee: Employee) -> bool:
 
 _TOKEN_PATTERN = re.compile(r"[a-z0-9]+")
 
+# Code-review follow-up (Minor): short ticket subjects are dominated by a
+# handful of common function words ("for", "with", "to") that inflate
+# Jaccard overlap between otherwise-unrelated tickets sharing the same
+# category/type, without the specialist (or an analyst reading its output)
+# having any way to tell a real content match from this noise. A small,
+# fixed stopword set -- not an NLP dependency, just the highest-frequency
+# English function words most likely to appear in a short ticket subject --
+# is removed before scoring. Deliberately conservative (no stemming/lemma,
+# no domain-specific exclusions): this is a precision improvement over the
+# plan doc's explicitly-allowed simple heuristic, not a new modeling
+# pipeline.
+_STOPWORDS = frozenset(
+    {
+        "a", "an", "the", "for", "with", "to", "of", "in", "on", "at", "is",
+        "are", "and", "or", "my", "it", "this", "that", "be", "has", "have",
+    }
+)
+
 
 def _tokenize(text: str) -> frozenset[str]:
-    return frozenset(_TOKEN_PATTERN.findall(text.lower()))
+    return frozenset(_TOKEN_PATTERN.findall(text.lower())) - _STOPWORDS
 
 
 def _jaccard_similarity(a: frozenset[str], b: frozenset[str]) -> float:
