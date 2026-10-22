@@ -91,6 +91,33 @@ of ADK where noted:
   (e.g. a dedicated Alembic migration mirroring these tables, or an accepted
   exception to the "everything is a migration" convention) rather than
   silently inheriting tables with no migration history.
+- **`delete_session`'s real cleanup scope, verified by reading its source AND
+  by directly querying all four tables before/after a real call**: it issues
+  exactly one `DELETE FROM sessions WHERE ...` statement (confirmed via
+  `inspect.getsource`) -- nothing else. `events` rows still genuinely
+  disappear with it, but only as a real Postgres-level side effect: `events`
+  has a real `ON DELETE CASCADE` foreign key onto `sessions` (confirmed via
+  psql's describe-table output for `events`), not any Python-level cleanup code. `app_states`/
+  `user_states` are NEVER touched by `delete_session` -- confirmed both by
+  reading its source (no reference to either table) and empirically: a real
+  row survived in each after a real `delete_session` call in an earlier run
+  of this exact test, found still present in the shared dev Postgres and
+  manually cleaned up during this finding's own verification. This is
+  `DatabaseSessionService`'s real, deliberate design, not a bug:
+  `create_session`'s own source shows `app_states`/`user_states` are keyed
+  only by `app_name` / `(app_name, user_id)` -- genuinely session-independent,
+  long-lived state meant to persist across every session for that app/user,
+  so a single session's deletion correctly leaves them alone. The real
+  consequence for this project: nothing in ADK's own public API deletes an
+  `app_states`/`user_states` row (`DatabaseSessionService`'s only public
+  methods are `append_event`/`create_session`/`delete_session`/`get_session`/
+  `list_sessions` -- confirmed via `dir()`), so a caller that wants to avoid
+  leaving residue in a shared database (this test does) must delete them
+  directly via raw SQL -- there is no ADK-provided alternative. The second
+  test below verifies both halves directly: `events` really reaches zero rows
+  (the cascade), and `app_states`/`user_states` really still have a row
+  immediately after `delete_session` (proving they are NOT cascaded) before
+  this test's own raw-SQL cleanup removes them.
 - **`Runner`/`DatabaseSessionService` are safe under this project's
   UNMODIFIED, default Windows `ProactorEventLoop`** -- confirmed by reading
   `DatabaseSessionService`'s real source: it uses a plain, synchronous
@@ -116,6 +143,8 @@ of ADK where noted:
 """
 
 import asyncio
+
+from sqlalchemy import create_engine, text
 
 from google.adk.agents.llm_agent import Agent
 from google.adk.agents.run_config import RunConfig
@@ -242,6 +271,23 @@ def test_adk_agent_genuinely_invokes_real_tool_and_returns_tool_informed_answer(
         assert usage.total_token_count > 0, f"expected real non-zero usage, got {usage!r}"
 
 
+_DB_TEST_APP_NAME = "adk-integration-spike-db-test"
+_DB_TEST_USER_ID = "spike-db-tester"
+
+
+def _row_count(engine, table: str, *, app_name: str, user_id: str | None = None) -> int:
+    """Real, direct row count against one of ADK's own auto-created tables --
+    used both to prove `events` really cascades to zero and that `app_states`/
+    `user_states` do NOT (see this module's docstring), and to drive this
+    test's own cleanup (ADK's public API has no method for either of the
+    latter two tables).
+    """
+    where = "app_name = :app_name" + (" AND user_id = :user_id" if user_id is not None else "")
+    params = {"app_name": app_name} | ({"user_id": user_id} if user_id is not None else {})
+    with engine.connect() as conn:
+        return conn.execute(text(f"SELECT count(*) FROM {table} WHERE {where}"), params).scalar_one()  # noqa: S608 -- table is one of 4 hardcoded literals below, never user input
+
+
 def test_database_session_service_creates_and_retrieves_a_real_session_against_project_postgres():
     """Real, non-mocked proof `DatabaseSessionService` genuinely works
     against this project's actual Postgres (`resolvegrid_api.db.
@@ -251,32 +297,74 @@ def test_database_session_service_creates_and_retrieves_a_real_session_against_p
     immune to the Windows ProactorEventLoop/async-psycopg issue
     `AsyncPostgresSaver` has, since it uses a plain sync SQLAlchemy engine
     internally.
+
+    Also real, direct proof of `delete_session`'s exact cleanup scope (code
+    -review follow-up -- not assumed, each half independently verified by
+    querying Postgres directly): `sessions`/`events` genuinely reach zero rows
+    (the latter via a real DB-level `ON DELETE CASCADE`, not any `delete_
+    session` application code), while `app_states`/`user_states` genuinely do
+    NOT -- a real row is independently confirmed still present in each
+    immediately after `delete_session` returns, before this test's own raw
+    -SQL cleanup (the only way to remove them; ADK's public API has none)
+    runs. Without that cleanup, every run of this test would permanently leave
+    one more orphaned `app_states`/`user_states` row behind in this shared dev
+    database -- confirmed to have actually happened across this task's own
+    earlier manual verification runs, found and cleaned up by hand before
+    this fix.
     """
+    engine = create_engine(DATABASE_URL)
 
     async def _round_trip() -> None:
         service = DatabaseSessionService(db_url=DATABASE_URL)
-        session = await service.create_session(
-            app_name="adk-integration-spike-db-test", user_id="spike-db-tester"
-        )
+        session = await service.create_session(app_name=_DB_TEST_APP_NAME, user_id=_DB_TEST_USER_ID)
         try:
             fetched = await service.get_session(
-                app_name="adk-integration-spike-db-test",
-                user_id="spike-db-tester",
-                session_id=session.id,
+                app_name=_DB_TEST_APP_NAME, user_id=_DB_TEST_USER_ID, session_id=session.id
             )
             assert fetched is not None
             assert fetched.id == session.id
-            assert fetched.app_name == "adk-integration-spike-db-test"
-            assert fetched.user_id == "spike-db-tester"
+            assert fetched.app_name == _DB_TEST_APP_NAME
+            assert fetched.user_id == _DB_TEST_USER_ID
+
+            # Real proof app_states/user_states rows really were created by
+            # create_session (per its own source -- see this module's
+            # docstring), before we can meaningfully prove delete_session
+            # leaves them alone.
+            assert _row_count(engine, "app_states", app_name=_DB_TEST_APP_NAME) == 1
+            assert _row_count(engine, "user_states", app_name=_DB_TEST_APP_NAME, user_id=_DB_TEST_USER_ID) == 1
         finally:
-            # Real cleanup -- do not leave spike rows behind in the shared
-            # dev database (matches this repo's established test-hygiene
-            # convention elsewhere, e.g. test_checkpoint_restore.py's own
-            # `adelete_thread` cleanup).
             await service.delete_session(
-                app_name="adk-integration-spike-db-test",
-                user_id="spike-db-tester",
-                session_id=session.id,
+                app_name=_DB_TEST_APP_NAME, user_id=_DB_TEST_USER_ID, session_id=session.id
             )
 
-    asyncio.run(_round_trip())
+            # Real cascade proof: sessions/events both genuinely reach zero,
+            # not assumed from delete_session's return value alone.
+            assert _row_count(engine, "sessions", app_name=_DB_TEST_APP_NAME) == 0
+            assert _row_count(engine, "events", app_name=_DB_TEST_APP_NAME) == 0
+
+            # Real proof app_states/user_states are NOT touched by
+            # delete_session -- still present at this point, confirming this
+            # module's documented finding rather than assuming it.
+            assert _row_count(engine, "app_states", app_name=_DB_TEST_APP_NAME) == 1
+            assert _row_count(engine, "user_states", app_name=_DB_TEST_APP_NAME, user_id=_DB_TEST_USER_ID) == 1
+
+            # Real cleanup of the two tables ADK's own public API cannot
+            # clean up itself (see this module's docstring) -- do not leave
+            # residue behind in this shared dev database.
+            with engine.begin() as conn:
+                conn.execute(
+                    text("DELETE FROM app_states WHERE app_name = :app_name"),
+                    {"app_name": _DB_TEST_APP_NAME},
+                )
+                conn.execute(
+                    text("DELETE FROM user_states WHERE app_name = :app_name AND user_id = :user_id"),
+                    {"app_name": _DB_TEST_APP_NAME, "user_id": _DB_TEST_USER_ID},
+                )
+
+            assert _row_count(engine, "app_states", app_name=_DB_TEST_APP_NAME) == 0
+            assert _row_count(engine, "user_states", app_name=_DB_TEST_APP_NAME, user_id=_DB_TEST_USER_ID) == 0
+
+    try:
+        asyncio.run(_round_trip())
+    finally:
+        engine.dispose()

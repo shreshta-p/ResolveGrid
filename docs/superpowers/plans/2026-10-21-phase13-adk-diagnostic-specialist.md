@@ -33,9 +33,12 @@ ADK specifically):
 
 Fetched `https://adk.dev/` (the current official ADK docs site — the old
 `google.github.io/adk-docs/` URL 301-redirects here), its Python quickstart,
-and its API reference (`google-adk` version `2.12.0` as currently published),
-plus corroborating secondary sources for A2A guidance. Confirmed facts this
-plan relies on:
+and its API reference (`google-adk` version `2.12.0` as currently published
+— **superseded, this was wrong: the version Task 1 actually installed is
+1.14.1 — see "Task 1 status: DONE" below and `docs/adr/0003-adk-real-
+integration-findings.md`**), plus corroborating secondary sources for A2A
+guidance. Confirmed facts this plan relies on (several corrected by Task 1's
+real testing — see the forward-pointers inline below):
 
 - Real Python package: `google-adk` (`pip install google-adk`). Core import:
   `from google.adk.agents.llm_agent import Agent` (also re-exported as
@@ -46,14 +49,21 @@ plan relies on:
   its OWN internal agent loop (tool-calling turns, retries) given an `Agent`
   + a `SessionService`; `InMemorySessionService`, `DatabaseSessionService`
   (has `prepare_tables()` — looks SQLAlchemy-generic, not vendor-specific;
-  **verify this against Postgres directly in Task 1**, don't assume),
+  **verify this against Postgres directly in Task 1**, don't assume —
+  **superseded: the real installed `DatabaseSessionService` has no
+  `prepare_tables()` method at all; it auto-creates its own tables lazily
+  inside `create_session` instead, outside Alembic's migration history —
+  see "Task 1 status: DONE" below and ADR 0003's Finding 6**),
   `VertexAiSessionService`, `RedisSessionService` all exist. The docs site's
   rendered content did not expose the exact `Runner.__init__`/`run_async()`
   signatures or confirm async/thread-safety inside an existing FastAPI event
   loop — **Task 1 must determine these empirically** (`python -c
   "import inspect; from google.adk.runners import Runner; print(inspect.
   signature(Runner.__init__))"` against the actually-installed package,
-  which is authoritative; do not trust secondhand blog posts for this).
+  which is authoritative; do not trust secondhand blog posts for this —
+  **superseded: both are now determined — see "Task 1 status: DONE" below
+  and ADR 0003's Findings 1 and 7 for the real signature and real
+  event-loop-safety result**).
 - **Critical integration fact**: ADK is model-agnostic via a real `LiteLlm`
   wrapper (`from google.adk.models.lite_llm import LiteLlm`,
   `model=LiteLlm(model="<provider>/<model>", api_base=..., api_key=...)`),
@@ -127,7 +137,9 @@ module docstring precedent). Concretely:
   post-call callbacks** (check the installed package for a callback/plugin
   mechanism — `google.adk`'s module list includes a `plugin_manager`
   attribute on `Runner`, suggesting a real plugin/callback hook point exists;
-  verify and use it rather than guessing).
+  verify and use it rather than guessing — **superseded: confirmed real, see
+  "Task 1 status: DONE" below and ADR 0003's Finding 8 for the exact real
+  hook (`BasePlugin.after_model_callback`) and how it's invoked**).
 
 ## Scope decisions (deliberate, not oversights)
 
