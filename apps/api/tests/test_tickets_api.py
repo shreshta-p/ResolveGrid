@@ -21,6 +21,19 @@ _SEED_QUEUE_NAME = "Ticket Test Queue"
 _SEED_DEPARTMENT_NAME = "Ticket Test Dept"
 _SEED_LOCATION_NAME = "Ticket Test HQ"
 
+# A SECOND, disjoint department/queue/requester -- used only by
+# test_admin_sees_tickets_across_departments below, to prove a global admin
+# Decision (department_ids is None and employee_id is None, per
+# authz_scope.py's docstring) really does see tickets from a department it
+# has no explicit grant for, not merely "the one department ticket_fixtures
+# happens to set up". Mirrors test_directory_api.py's
+# test_admin_sees_all_employees precedent for the same admin-sanity-check
+# coverage gap, now closed for GET /tickets too.
+_SEED_EMAIL_OTHER_REQUESTER = "ticket.requester.other@example.test"
+_SEED_EMAIL_ADMIN = "ticket.admin@example.test"
+_SEED_QUEUE_NAME_OTHER = "Ticket Test Queue Other"
+_SEED_DEPARTMENT_NAME_OTHER = "Ticket Test Dept Other"
+
 
 @pytest.fixture
 def ticket_fixtures(raw_db_session):
@@ -110,6 +123,82 @@ def test_employee_sees_only_own_tickets(ticket_fixtures):
     assert response.status_code == 200
     subjects = {t["subject"] for t in response.json()}
     assert "Mine" in subjects
+
+
+def test_admin_sees_tickets_across_departments(ticket_fixtures, raw_db_session):
+    """Real, non-mocked proof that a global admin Decision (the
+    `department_ids is None and employee_id is None` case
+    `authz_scope.apply_decision_scope` applies NO filter for) genuinely
+    returns tickets from a SECOND department the admin has no explicit
+    grant for -- not just the one department `ticket_fixtures` already sets
+    up, which `test_employee_sees_only_own_tickets` could pass even if admin
+    scoping were silently broken for every OTHER department.
+
+    Reuses `ticket_fixtures`' idempotent query-first-then-create convention
+    for the extra department/queue/employee rows (safe to rerun -- natural
+    -key lookups, not delete+recreate, for anything `audit_log` could hold
+    an FK to).
+    """
+    requester, _analyst, queue, dept = ticket_fixtures
+
+    loc = raw_db_session.scalar(select(Location).where(Location.name == _SEED_LOCATION_NAME))
+
+    other_dept = raw_db_session.scalar(select(Department).where(Department.name == _SEED_DEPARTMENT_NAME_OTHER))
+    if other_dept is None:
+        other_dept = Department(name=_SEED_DEPARTMENT_NAME_OTHER)
+        raw_db_session.add(other_dept)
+        raw_db_session.flush()
+
+    other_queue = raw_db_session.scalar(select(Queue).where(Queue.name == _SEED_QUEUE_NAME_OTHER))
+    if other_queue is None:
+        other_queue = Queue(name=_SEED_QUEUE_NAME_OTHER, department_id=other_dept.id)
+        raw_db_session.add(other_queue)
+        raw_db_session.flush()
+
+    other_requester = raw_db_session.scalar(select(Employee).where(Employee.email == _SEED_EMAIL_OTHER_REQUESTER))
+    if other_requester is None:
+        other_requester = Employee(
+            display_name="Ticket Requester Other", email=_SEED_EMAIL_OTHER_REQUESTER, title="Engineer",
+            hire_date="2024-01-01T00:00:00", timezone=loc.timezone, location_id=loc.id, department_id=other_dept.id,
+        )
+        raw_db_session.add(other_requester)
+        raw_db_session.flush()
+
+    admin = raw_db_session.scalar(select(Employee).where(Employee.email == _SEED_EMAIL_ADMIN))
+    if admin is None:
+        admin = Employee(
+            display_name="Ticket Admin", email=_SEED_EMAIL_ADMIN, title="Admin",
+            hire_date="2024-01-01T00:00:00", timezone=loc.timezone, location_id=loc.id, department_id=dept.id,
+        )
+        raw_db_session.add(admin)
+        raw_db_session.flush()
+
+    raw_db_session.execute(delete(RoleAssignment).where(RoleAssignment.employee_id == admin.id))
+    raw_db_session.add(RoleAssignment(employee_id=admin.id, role="admin", scope="global"))
+    raw_db_session.flush()
+    raw_db_session.commit()
+
+    own_dept_ticket = client.post(
+        "/tickets",
+        json={"subject": "Admin visibility own dept", "body": "x", "type": "incident", "queue_id": queue.id},
+        headers={"X-Debug-Employee-Id": str(requester.id)},
+    ).json()
+    other_dept_ticket = client.post(
+        "/tickets",
+        json={
+            "subject": "Admin visibility other dept",
+            "body": "x",
+            "type": "incident",
+            "queue_id": other_queue.id,
+        },
+        headers={"X-Debug-Employee-Id": str(other_requester.id)},
+    ).json()
+
+    response = client.get("/tickets", headers={"X-Debug-Employee-Id": str(admin.id)})
+    assert response.status_code == 200
+    ticket_ids = {t["id"] for t in response.json()}
+    assert own_dept_ticket["id"] in ticket_ids
+    assert other_dept_ticket["id"] in ticket_ids
 
 
 def test_analyst_can_transition_a_ticket_the_employee_cannot(ticket_fixtures):
