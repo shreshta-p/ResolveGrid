@@ -84,6 +84,7 @@ secondhand research" precedent (ADR 0003).
 from __future__ import annotations
 
 import re
+from typing import Optional
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -321,9 +322,23 @@ def get_employee_entitlements(session: Session, principal: Principal, employee_i
 # Tool 3: retrieve relevant knowledge-base evidence for a ticket's issue
 # ---------------------------------------------------------------------------
 
+# Code-review follow-up (Phase 13 Task 3, real empirical finding against the
+# installed `google-adk==1.14.1` package -- see ADR 0004): `query_text`'s
+# original `str | None` (PEP 604) annotation made ADK's real automatic
+# function-calling schema parser (`google.adk.tools.
+# _function_parameter_parse_util`) raise `ValueError: Failed to parse the
+# parameter...` -- confirmed by reading its source: it checks `get_origin(
+# annotation) is typing.Union`, which is `False` for a PEP 604 union
+# (`get_origin(str | None)` is `types.UnionType`, a different object from
+# `typing.Union`), so it falls through to an unhandled-shape error. `typing.
+# Optional[str]` is byte-for-byte behaviorally identical at every call site
+# (nothing about this function's logic/authz changed) but evaluates to a
+# real `typing.Union` origin ADK's parser does recognize. A pure
+# type-hint-spelling fix for ADK-schema compatibility, not a semantic change.
+
 
 def retrieve_ticket_kb_evidence(
-    session: Session, principal: Principal, ticket_id: int, query_text: str | None = None
+    session: Session, principal: Principal, ticket_id: int, query_text: Optional[str] = None
 ) -> dict:
     """Retrieve knowledge-base evidence relevant to `ticket_id`'s described
     issue, via the existing Phase 7/8 hybrid retrieval pipeline

@@ -223,6 +223,99 @@ def log_completion(
     return result
 
 
+def log_adk_model_call(
+    session: Session,
+    tracer: Tracer,
+    *,
+    purpose: str,
+    provider: str,
+    model: str,
+    usage_metadata,
+    latency_ms: int = 0,
+    routing_reason: str | None = None,
+) -> None:
+    """Write a real `ModelCall` row for ONE internal model call a Google ADK
+    `Runner` made during a diagnostic-specialist run (Phase 13 Task 3),
+    driven by the real, confirmed `BasePlugin.after_model_callback` hook
+    (`docs/adr/0003-adk-real-integration-findings.md`'s Finding 8) --
+    deliberately NOT `log_completion` above, which assumes a direct
+    `llm_gateway.complete()` call this path never makes: ADK's own `LiteLlm`
+    wrapper calls `litellm.acompletion()` directly, bypassing `llm_gateway.
+    complete()` (and therefore `log_completion`'s try/except around it)
+    entirely. A new, small, sibling function -- same precedent as `log_
+    cache_hit_model_call` above for the same "no existing helper covers this
+    real shape" reason.
+
+    `usage_metadata` is the real `google.genai.types.
+    GenerateContentResponseUsageMetadata` object `after_model_callback`'s
+    `llm_response.usage_metadata` carries -- `prompt_token_count`/
+    `candidates_token_count` map onto `ModelCall.input_tokens`/`output_
+    tokens` exactly like `log_completion`'s `result.input_tokens`/`output_
+    tokens` do. Both fields are `Optional[int]` on the real installed
+    `google-genai` type (confirmed by reading its source) -- `or 0` degrades
+    a `None` to the same honest zero every other optional-usage-field read
+    in this module already uses, never raising on a field ADK's real
+    response happened not to populate.
+
+    One row per real internal call, by design (Task 3's explicit "a new,
+    honestly-distinct purpose value per real internal call, not one fake
+    aggregate row for the whole multi-turn run" requirement): the caller
+    (`diagnostic_agent.py`'s `_ModelCallLoggingPlugin`) invokes this once per
+    real `after_model_callback` firing, so a single multi-turn diagnostic run
+    that makes N real internal model calls produces N real `ModelCall` rows,
+    each independently priced/traced -- never collapsed into one combined
+    row for the whole run.
+
+    `latency_ms` is measured by the CALLER (a real `time.monotonic()` pair
+    bracketing `before_model_callback`/`after_model_callback`), not this
+    function -- unlike `log_completion`, no real completion call happens
+    INSIDE this function (the real call already finished inside the ADK
+    `Runner`'s own internal loop before this callback fires), so there is
+    nothing for this function to time itself. Defaults to 0 only for a
+    caller that genuinely has no measurement to pass.
+
+    Same commit-boundary convention as `log_completion`/`log_cache_hit_model_
+    call`: `session.add()`s, never `session.commit()`s -- the caller owns
+    the transaction boundary.
+    """
+    prompt_tokens = usage_metadata.prompt_token_count or 0
+    output_tokens = usage_metadata.candidates_token_count or 0
+
+    with tracer.start_as_current_span(f"llm.{purpose}") as span:
+        span.set_attribute("gen_ai.system", provider)
+        span.set_attribute("gen_ai.request.model", model)
+        span.set_attribute("gen_ai.usage.input_tokens", prompt_tokens)
+        span.set_attribute("gen_ai.usage.output_tokens", output_tokens)
+        trace_id = _current_trace_id()
+
+    pricing = current_pricing_version(session, provider, model)
+    if pricing is not None:
+        estimated_cost_usd = (
+            prompt_tokens / 1000 * pricing.input_cost_per_1k_tokens_usd
+            + output_tokens / 1000 * pricing.output_cost_per_1k_tokens_usd
+        )
+    else:
+        estimated_cost_usd = 0.0
+
+    session.add(
+        ModelCall(
+            purpose=purpose,
+            provider=provider,
+            model=model,
+            pricing_version_id=pricing.id if pricing is not None else None,
+            input_tokens=prompt_tokens,
+            output_tokens=output_tokens,
+            latency_ms=latency_ms,
+            estimated_cost_usd=estimated_cost_usd,
+            status="success",
+            trace_id=trace_id,
+            routing_reason=routing_reason,
+            cache_creation_input_tokens=0,
+            cache_read_input_tokens=0,
+        )
+    )
+
+
 def log_cache_hit_model_call(
     session: Session,
     tracer: Tracer,

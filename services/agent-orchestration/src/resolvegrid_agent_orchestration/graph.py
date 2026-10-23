@@ -334,6 +334,47 @@ class RetrievalOutcome(TypedDict):
 # counts/provider/latency are for `CompleteFn`.
 RetrieveFn = Callable[[str, dict | None], RetrievalOutcome]
 
+
+class DiagnosisOutcome(TypedDict):
+    """Return shape a future diagnostic-specialist graph node (Phase 13
+    Task 4, not yet built) would attach to state. Added in Task 3
+    (`docs/superpowers/plans/2026-10-21-phase13-adk-diagnostic-specialist.md`)
+    alongside `apps/api`'s real `Agent`/`Runner` wiring
+    (`resolvegrid_api.diagnostic_agent.diagnose_ticket`) so Task 4 has a
+    ready, primitive-typed contract to wire a real node against -- this
+    package still never imports `google.adk`/`resolvegrid_api` directly
+    (see module docstring), so this shape only describes DATA, not how it's
+    produced.
+
+    Deliberately NOT a 1:1 mirror of `resolvegrid_api.diagnostic_agent.
+    DiagnosisResult` (which carries a live-session-adjacent `ticket_id` plus
+    bookkeeping fields meaningful only to `apps/api`'s own caller) -- this
+    is the narrower, graph-relevant subset: the model's own final answer
+    text, and which real tools it actually called (useful for a future
+    node to decide e.g. whether to show a "no evidence found" banner).
+    """
+
+    summary: str
+    tool_calls_made: list[str]
+
+
+# A diagnosis function: takes a ticket id and the requesting principal's
+# employee id (plain ints, not a `Principal` object -- this package has no
+# `resolvegrid_authz` dependency and `RequestApprovalFn`'s existing
+# `payload: dict` precedent already established that a principal crosses
+# this exact DI boundary as a bare id, with the real implementation
+# resolving it back into a full `Principal` on the `apps/api` side, never
+# as a typed domain object this package would need a new dependency to
+# describe), returns a `DiagnosisOutcome`. NOT yet wired into `build_graph`
+# -- Task 4's job. `apps/api`'s real `diagnose_ticket(session, tracer,
+# principal, ticket_id)` is NOT this signature verbatim (it needs a live
+# `Session`/`Tracer`/`Principal`, none of which can cross into this
+# package); Task 4 must write the same kind of session-opening/committing
+# closure wrapper `model_call_logging.make_logging_complete_fn` already
+# demonstrates for `CompleteFn` to adapt one to the other. See ADR 0004's
+# "Consequences" section.
+DiagnosisFn = Callable[[int, int], DiagnosisOutcome]
+
 _VALID_INTENTS = {"general_question", "greeting", "unclear"}
 _VALID_RISK_LEVELS = {"low", "medium", "high"}
 
