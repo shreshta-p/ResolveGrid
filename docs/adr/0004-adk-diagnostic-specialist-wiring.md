@@ -164,6 +164,27 @@ real-confirmed "cloud providers reject this field outright" precedent.
 Recorded here per this phase's "report honestly" standing directive, not
 silently amended.
 
+## Flagged, deferred decision: sync tool calls block the event loop
+
+ADK's real `FunctionTool._invoke_callable` (confirmed by reading its
+source) calls a sync tool function directly (`target(**args_to_call)`),
+with no thread-pool offload -- so each of this specialist's 4 curried tool
+calls (all plain, synchronous, DB-querying functions) blocks `diagnose_
+ticket`'s own event loop for the real duration of its DB round-trip. For
+TODAY's scope -- one bounded, single-shot diagnostic request -- this is not
+disqualifying: the blocking window is one real (fast, local Postgres)
+query at a time, and nothing else in this process needs that event loop
+during a single synchronous test/request. It is explicitly flagged here,
+not fixed now, because it is a genuinely different real risk under Task
+4's actual deployment shape: a FastAPI process serving several concurrent
+analyst diagnose requests at once would have each one's tool calls blocking
+the SAME shared event loop other requests' coroutines are also scheduled
+on, degrading concurrent throughput. Task 4/5 should revisit this
+deliberately once real concurrent-usage numbers exist (e.g. wrapping each
+curried tool body in `asyncio.to_thread(...)`, or confirming the real
+request volume never makes it matter) rather than this ADR silently
+assuming single-request behavior generalizes.
+
 ## Consequences
 - `apps/api/src/resolvegrid_api/diagnostic_agent.py` is the new real
   `Agent`/`Runner` wiring; `model_call_logging.py` gains `log_adk_model_

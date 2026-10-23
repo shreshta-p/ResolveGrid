@@ -233,6 +233,7 @@ def log_adk_model_call(
     usage_metadata,
     latency_ms: int = 0,
     routing_reason: str | None = None,
+    error_message: str | None = None,
 ) -> None:
     """Write a real `ModelCall` row for ONE internal model call a Google ADK
     `Runner` made during a diagnostic-specialist run (Phase 13 Task 3),
@@ -257,14 +258,30 @@ def log_adk_model_call(
     in this module already uses, never raising on a field ADK's real
     response happened not to populate.
 
+    Code-review follow-up (Phase 13 Task 3, restoring parity with `log_
+    completion`'s existing error-path convention): `usage_metadata` being
+    `None` is a real, confirmed shape `after_model_callback` can receive --
+    `google.adk.models.llm_response.LlmResponse` has real `error_code`/
+    `error_message` fields populated instead of `usage_metadata` when the
+    real internal call failed or returned something malformed (confirmed by
+    reading its source). The original version of this function silently
+    dropped that case entirely (no row, no error signal) whenever `usage_
+    metadata is None` -- the caller never even invoked it for that case.
+    Now writes a real, `status="error"`-shaped `ModelCall` row instead (zero
+    tokens/cost/pricing_version_id, matching `log_completion`'s own
+    error-path row shape exactly), so a failed real internal ADK model call
+    stays visible in cost/observability accounting instead of vanishing
+    without a trace.
+
     One row per real internal call, by design (Task 3's explicit "a new,
     honestly-distinct purpose value per real internal call, not one fake
     aggregate row for the whole multi-turn run" requirement): the caller
     (`diagnostic_agent.py`'s `_ModelCallLoggingPlugin`) invokes this once per
-    real `after_model_callback` firing, so a single multi-turn diagnostic run
-    that makes N real internal model calls produces N real `ModelCall` rows,
-    each independently priced/traced -- never collapsed into one combined
-    row for the whole run.
+    real `after_model_callback` firing -- success or error alike -- so a
+    single multi-turn diagnostic run that makes N real internal model calls
+    produces N real `ModelCall` rows, each independently priced/traced --
+    never collapsed into one combined row for the whole run, and never
+    silently skipped.
 
     `latency_ms` is measured by the CALLER (a real `time.monotonic()` pair
     bracketing `before_model_callback`/`after_model_callback`), not this
@@ -278,6 +295,33 @@ def log_adk_model_call(
     call`: `session.add()`s, never `session.commit()`s -- the caller owns
     the transaction boundary.
     """
+    if usage_metadata is None:
+        with tracer.start_as_current_span(f"llm.{purpose}") as span:
+            span.set_attribute("gen_ai.system", provider)
+            span.set_attribute("gen_ai.request.model", model)
+            span.set_attribute("error.type", "AdkModelCallError")
+            trace_id = _current_trace_id()
+
+        session.add(
+            ModelCall(
+                purpose=purpose,
+                provider=provider,
+                model=model,
+                pricing_version_id=None,
+                input_tokens=0,
+                output_tokens=0,
+                latency_ms=latency_ms,
+                estimated_cost_usd=0.0,
+                status="error",
+                error_message=error_message
+                or "ADK after_model_callback fired with no usage_metadata "
+                "(real internal call failed or returned a malformed response)",
+                trace_id=trace_id,
+                routing_reason=routing_reason,
+            )
+        )
+        return
+
     prompt_tokens = usage_metadata.prompt_token_count or 0
     output_tokens = usage_metadata.candidates_token_count or 0
 

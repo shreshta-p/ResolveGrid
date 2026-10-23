@@ -24,6 +24,15 @@ dependencies = [
     "jsonschema>=4.26.0",
     "redis>=5.0",
     "prometheus-client>=0.20",
+    # No upper bound pinned, but note for whoever bumps this blind:
+    # resolvegrid_api.diagnostic_agent._curry_tool depends on real,
+    # confirmed-by-reading-source ADK internals (FunctionTool's
+    # inspect.signature()-based schema introspection, BasePlugin.
+    # after_model_callback's real shape) that are NOT public API -- see
+    # docs/adr/0004-adk-diagnostic-specialist-wiring.md. A version bump that
+    # changes that internal behavior would be caught by
+    # apps/api/tests/test_diagnostic_agent.py, but re-verify against the
+    # ADR's cited findings before trusting a bump blind.
     "google-adk[extensions]>=1.14.1",
 ]
 

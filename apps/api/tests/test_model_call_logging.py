@@ -1,11 +1,12 @@
 import re
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
 from sqlalchemy import select
 
 from resolvegrid_api.llm_gateway import CompletionResult, LLMGatewayError
-from resolvegrid_api.model_call_logging import log_completion
+from resolvegrid_api.model_call_logging import log_adk_model_call, log_completion
 from resolvegrid_api.models import ModelCall, PricingVersion
 from resolvegrid_telemetry import init_tracing
 
@@ -138,3 +139,91 @@ def test_log_completion_no_pricing_version_falls_back_to_zero_cost(db_session, t
     assert call.pricing_version_id is None
     assert call.estimated_cost_usd == 0.0
     _assert_real_trace_id(call.trace_id)
+
+
+def test_log_adk_model_call_success_writes_model_call_row(db_session, tracer):
+    pricing = PricingVersion(
+        provider="test-adk-provider", model="test-adk-model",
+        input_cost_per_1k_tokens_usd=1.0, output_cost_per_1k_tokens_usd=2.0,
+    )
+    db_session.add(pricing)
+    db_session.flush()
+
+    # A real google.genai.types.GenerateContentResponseUsageMetadata only
+    # needs these two attributes read by log_adk_model_call -- a plain
+    # SimpleNamespace is sufficient and avoids a heavier real-type
+    # construction this test doesn't need.
+    usage_metadata = SimpleNamespace(prompt_token_count=100, candidates_token_count=50)
+
+    log_adk_model_call(
+        db_session, tracer,
+        purpose="diagnostic.specialist_turn", provider="test-adk-provider", model="test-adk-model",
+        usage_metadata=usage_metadata, latency_ms=1234, routing_reason="risk_level=medium",
+    )
+
+    call = db_session.scalar(
+        select(ModelCall)
+        .where(ModelCall.purpose == "diagnostic.specialist_turn", ModelCall.model == "test-adk-model")
+        .order_by(ModelCall.id.desc())
+    )
+    assert call is not None
+    assert call.status == "success"
+    assert call.input_tokens == 100
+    assert call.output_tokens == 50
+    assert call.latency_ms == 1234
+    assert call.routing_reason == "risk_level=medium"
+    assert call.pricing_version_id == pricing.id
+    # 100/1000 * 1.0 + 50/1000 * 2.0 == 0.1 + 0.1 == 0.2
+    assert call.estimated_cost_usd == pytest.approx(0.2)
+    _assert_real_trace_id(call.trace_id)
+
+
+def test_log_adk_model_call_error_path_writes_error_row_when_usage_metadata_missing(db_session, tracer):
+    """Code-review fix (Phase 13 Task 3): the first version of `log_adk_
+    model_call` was only ever called when `usage_metadata is not None` --
+    a real internal ADK model call that failed or returned a malformed
+    response (confirmed real shape: `google.adk.models.llm_response.
+    LlmResponse` carries `error_code`/`error_message` instead of `usage_
+    metadata` in that case) was silently dropped entirely: no row, no error
+    signal. This proves the restored parity with `log_completion`'s own
+    error-path convention: a real `status="error"` row, zero tokens/cost,
+    with the real `error_message` passed through.
+    """
+    log_adk_model_call(
+        db_session, tracer,
+        purpose="diagnostic.specialist_turn", provider="test-adk-provider", model="test-adk-model-error",
+        usage_metadata=None, latency_ms=42, routing_reason="risk_level=medium",
+        error_message="real upstream failure message",
+    )
+
+    call = db_session.scalar(
+        select(ModelCall)
+        .where(ModelCall.purpose == "diagnostic.specialist_turn", ModelCall.model == "test-adk-model-error")
+        .order_by(ModelCall.id.desc())
+    )
+    assert call is not None
+    assert call.status == "error"
+    assert call.error_message == "real upstream failure message"
+    assert call.pricing_version_id is None
+    assert call.input_tokens == 0
+    assert call.output_tokens == 0
+    assert call.latency_ms == 42
+    assert call.estimated_cost_usd == 0.0
+    _assert_real_trace_id(call.trace_id)
+
+
+def test_log_adk_model_call_error_path_degrades_to_default_message_when_none_given(db_session, tracer):
+    log_adk_model_call(
+        db_session, tracer,
+        purpose="diagnostic.specialist_turn", provider="test-adk-provider", model="test-adk-model-error-default",
+        usage_metadata=None,
+    )
+
+    call = db_session.scalar(
+        select(ModelCall)
+        .where(ModelCall.purpose == "diagnostic.specialist_turn", ModelCall.model == "test-adk-model-error-default")
+        .order_by(ModelCall.id.desc())
+    )
+    assert call is not None
+    assert call.status == "error"
+    assert call.error_message  # a real, non-empty default message, not blank

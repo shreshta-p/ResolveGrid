@@ -235,18 +235,27 @@ class _ModelCallLoggingPlugin(BasePlugin):
     async def after_model_callback(self, *, callback_context, llm_response):
         start = self._start_times.pop() if self._start_times else None
         latency_ms = int((time.monotonic() - start) * 1000) if start is not None else 0
-        if llm_response.usage_metadata is not None:
-            log_adk_model_call(
-                self._session,
-                self._tracer,
-                purpose=_MODEL_CALL_PURPOSE,
-                provider=self._provider,
-                model=self._model,
-                usage_metadata=llm_response.usage_metadata,
-                latency_ms=latency_ms,
-                routing_reason=self._routing_reason,
-            )
-            self.logged_count += 1
+        # Code-review fix: this used to only call `log_adk_model_call` when
+        # `usage_metadata is not None`, silently dropping any real internal
+        # call that failed or returned a malformed response (no row, no
+        # error signal -- a real gap vs. `log_completion`'s own error-path
+        # convention). Now ALWAYS logs, every real `after_model_callback`
+        # firing -- `log_adk_model_call` itself branches on `usage_metadata`
+        # to write a success- or error-shaped row (see its docstring),
+        # passing through `llm_response.error_message` (a real field on
+        # `LlmResponse`, confirmed by reading its source) when present.
+        log_adk_model_call(
+            self._session,
+            self._tracer,
+            purpose=_MODEL_CALL_PURPOSE,
+            provider=self._provider,
+            model=self._model,
+            usage_metadata=llm_response.usage_metadata,
+            latency_ms=latency_ms,
+            routing_reason=self._routing_reason,
+            error_message=llm_response.error_message,
+        )
+        self.logged_count += 1
         return None
 
 
