@@ -25,7 +25,7 @@ import re
 
 import pytest
 from google.adk.tools.function_tool import FunctionTool
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from resolvegrid_api.diagnostic_agent import (
     _MODEL_CALL_PURPOSE,
@@ -212,6 +212,27 @@ def test_diagnose_ticket_real_end_to_end_against_live_stack(db_session, tracer):
 
     principal = Principal(employee_id=requester.id, roles=(RoleGrant(role="admin", scope="global"),))
 
+    # Phase 13 Task 4 fix (found via this codebase's own real full-suite
+    # run, not assumed): this test's `ModelCall` query below used to filter
+    # by `purpose == _MODEL_CALL_PURPOSE` ALONE, which was correct only
+    # while this test's own `db_session` (rollback-based, so THIS test's
+    # own rows never persist) was the sole real caller ever writing rows
+    # under that purpose. Task 4's `POST /tickets/{id}/diagnose` is a
+    # SECOND real caller that writes real, permanently COMMITTED rows under
+    # the identical purpose string (via a genuinely different connection --
+    # Postgres' read-committed default means those committed rows are
+    # visible here too) -- a real end-to-end run of that endpoint (or a
+    # repeat full-suite run) inflates this query's result, exactly as this
+    # task's own real test run demonstrated (`assert 12 == 3`, not a
+    # mocked/predicted failure). A watermark -- the max existing matching
+    # `ModelCall.id` taken BEFORE this call -- scopes the later assertion to
+    # rows this run itself created, mirroring `test_chat_api.py`'s own
+    # established watermark-based cleanup precedent for the identical
+    # "shared real DB, can't just filter by a global column" problem.
+    watermark_id = db_session.scalar(
+        select(func.max(ModelCall.id)).where(ModelCall.purpose == _MODEL_CALL_PURPOSE)
+    ) or 0
+
     result = asyncio.run(diagnose_ticket(db_session, tracer, principal, anchor.id))
 
     assert result.ticket_id == anchor.id
@@ -228,12 +249,28 @@ def test_diagnose_ticket_real_end_to_end_against_live_stack(db_session, tracer):
     }
     assert result.model_calls_logged > 0
 
+    # Phase 13 Task 4: `cited_chunks` is real, verified evidence (never a
+    # fabrication) -- if the specialist actually called
+    # retrieve_ticket_kb_evidence AND cited something from it, every
+    # resulting entry must be a real {chunk_id, document_title} dict whose
+    # id is drawn from this run's own real tool results, and `summary` must
+    # never contain a `[chunk:<id>]` marker for an id NOT in `cited_chunks`
+    # (a fabricated/unverified citation would have been stripped).
+    import re as _re
+
+    cited_ids = {entry["chunk_id"] for entry in result.cited_chunks}
+    for entry in result.cited_chunks:
+        assert isinstance(entry["chunk_id"], int)
+        assert isinstance(entry["document_title"], str)
+    summary_marker_ids = {int(m) for m in _re.findall(r"\[chunk:(\d+)\]", result.summary)}
+    assert summary_marker_ids <= cited_ids
+
     # Real DB proof: one ModelCall row per real internal call this run
     # logged, under the new, honestly-distinct purpose -- not one fake
     # aggregate row. Uses the SAME session (autoflush sees the pending
     # ModelCall rows diagnose_ticket added without needing a commit).
     rows = db_session.scalars(
-        select(ModelCall).where(ModelCall.purpose == _MODEL_CALL_PURPOSE)
+        select(ModelCall).where(ModelCall.purpose == _MODEL_CALL_PURPOSE, ModelCall.id > watermark_id)
     ).all()
     assert len(rows) == result.model_calls_logged
     for row in rows:

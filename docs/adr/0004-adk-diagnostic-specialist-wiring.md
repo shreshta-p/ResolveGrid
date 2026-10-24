@@ -204,3 +204,117 @@ assuming single-request behavior generalizes.
   write the same kind of session-opening/committing closure wrapper
   `model_call_logging.make_logging_complete_fn` already demonstrates for
   `CompleteFn`.
+
+## Task 4 addendum: no LangGraph node/graph wraps `diagnose_ticket`
+
+The plan doc's "Architecture decision" section explicitly left open,
+as a real Task 4 decision, whether this specialist reaches the app via a
+new node in the existing chat graph, a small separate compiled graph
+(mirroring Phase 9's `build_tool_invocation_graph`), or "another
+mechanism" -- and further invited a THIN one-node wrapper as a middle
+ground if a full graph felt like pure ceremony. Having now built the real
+endpoint against `diagnose_ticket`'s actual shape, the decision is: **no
+LangGraph artifact at all** -- `POST /tickets/{id}/diagnose`
+(`apps/api/src/resolvegrid_api/routers/tickets.py`) calls `diagnostic_
+agent.diagnose_ticket(session, tracer, principal, ticket_id)` directly,
+the same way `summarize_ticket` calls `log_completion` directly.
+
+Reasoning, real and specific to what was actually built (not a generic
+"graphs are overhead" preference):
+
+1. **No pause/resume boundary exists for a graph to own.** Every other
+   LangGraph artifact in this codebase earns its real checkpointing either
+   because a run spans multiple HTTP calls across a human-approval
+   `interrupt()` (`build_tool_invocation_graph`, genuinely needs durable
+   pause/resume across process restarts -- Phase 9 Task 8's own exit
+   criterion) or because per-node state needs to accumulate across a
+   multi-stage pipeline with real conditional branching (`build_graph`'s
+   classify_intent -> retrieve -> compose_response -> verify_citations ->
+   finalize chain). `diagnose_ticket` has neither: ADK's own `Runner`
+   already owns its ENTIRE multi-turn tool-calling loop as one opaque,
+   synchronous-from-the-caller's-perspective unit and returns a finished
+   `DiagnosisResult` in one `await`. There is nothing for a checkpointer to
+   persist that `diagnose_ticket`'s own return value doesn't already
+   carry, and nothing to resume.
+2. **The real signature doesn't fit `AgentState` without inventing new
+   plumbing for zero benefit.** `AgentState` (services/agent-orchestration/
+   state.py) can never hold a live `Session`/`Tracer`/`Principal` (its own
+   module docstring's hard rule -- it's checkpointed to Postgres after
+   every superstep). A graph node wrapping `diagnose_ticket` would
+   therefore need the SAME closure-over-apps/api-internals shape
+   `model_call_logging.make_logging_complete_fn` already uses for
+   `CompleteFn` -- except unlike `CompleteFn` (a reusable, built-once-at
+   -startup closure), `diagnose_ticket` needs a FRESH, request-scoped
+   `Session`/`Principal`/`ticket_id` on every call, so the closure would
+   have to be built per-request anyway, inside the endpoint handler,
+   immediately before `ainvoke()`-ing a graph that does nothing but call
+   it once and hand the result straight back out. That is strictly more
+   code than calling it directly, for a StateGraph/checkpointer wrapper
+   that adds no real capability on top.
+3. **The already-added `DiagnosisFn`/`DiagnosisOutcome` types remain
+   real, but unused by this task's actual implementation.** They were
+   added by Task 3 as a primitive-typed, ready contract IN CASE a future
+   graph node needed one (see Task 3's own docstring on those types,
+   `graph.py`) -- not a mandate that Task 4 must produce such a node. They
+   are left in place (removing public, documented types from a published
+   workspace package for a hypothetical future consumer is a worse trade
+   than a few unused lines), with their existing docstrings already
+   stating this explicitly ("NOT yet wired into `build_graph`"). If a
+   future phase genuinely needs diagnosis reachable FROM the general chat
+   graph (e.g. `classify_intent` learning to route a ticket-diagnosis-
+   shaped question there), these types are exactly the ready seam for
+   that -- this addendum is not asking anyone to remove them, only
+   recording why Task 4 itself did not consume them.
+
+Real, honest Span-shape consequence of this decision (see `routers/
+tickets.py`'s `diagnose_ticket_endpoint` docstring for the full detail):
+without a LangGraph node's own `time.monotonic()` instrumentation around
+each of ADK's internal turns, there is no real per-tool-call latency
+breakdown to report -- `/chat`'s `node_latencies_ms` mechanism has no
+equivalent here. Rather than fabricate one, this endpoint writes exactly
+ONE `Span` row per diagnostic run (`stage_name="diagnose_ticket"`,
+covering the whole real measured call), with `Span.detail_json` carrying
+the real `tool_calls_made`/`turn_count`/`model_calls_logged` structured
+counts `DiagnosisResult` already reports -- real, honest detail at the
+granularity this architecture can actually measure, not a second
+fabricated timing breakdown.
+
+## Task 4 addendum: citation evidence (`DiagnosisResult.cited_chunks`)
+
+Task 3 deliberately left `DiagnosisResult` minimal (`summary`/`tool_calls_
+made`/`turn_count`/`model_calls_logged` only -- see that class's own
+docstring: "real prompt-engineering/parsing work left for Task 4"). Task 4
+needed structured, UI-renderable citations (the plan's own requirement:
+"real `[chunk:<id>]`-shaped citations, same rendering contract `/chat`
+already uses") -- `summary`'s raw text alone isn't that; a caller would
+need to re-parse `[chunk:<id>]` markers out of prose and would have no
+real `document_title` to show alongside each id.
+
+`diagnose_ticket` (`apps/api/src/resolvegrid_api/diagnostic_agent.py`) now
+also inspects each real ADK `function_response` event (not just the
+`function_call` events the pre-existing `tool_calls_made` tracking already
+read) for `name == "retrieve_ticket_kb_evidence"`, recovering that real
+tool call's own `{"chunks": [...], ...}` return value -- confirmed by
+reading the installed `google-adk==1.14.1` source
+(`google.adk.flows.llm_flows.functions.__build_response_event`): a
+dict-returning tool's raw return value is used AS-IS as `function_
+response.response`, never wrapped under a `{"result": ...}` key. The
+real `[chunk:<id>]` markers in `summary` are then verified against
+exactly those real chunk ids via `resolvegrid_retrieval.citation_
+verification.verify_citations` -- the SAME deterministic function `/chat`'s
+`verify_citations_node` already uses (`services/agent-orchestration/.../
+graph.py`), reused directly rather than inventing a second, parallel
+citation-trust mechanism. Any fabricated marker is stripped from `summary`
+before it is returned (same "strip, don't abstain" consequence that
+node's own docstring documents and justifies), and `DiagnosisResult.
+cited_chunks` carries only the verified `{chunk_id, document_title}`
+pairs -- the exact shape `/chat`'s own `citations` response field already
+uses, so `apps/web`'s existing citation-rendering markup needed zero
+changes to also render a diagnosis's citations.
+
+`_strip_fabricated_citation_spans` in `diagnostic_agent.py` is a small,
+deliberate duplicate of `graph.py`'s module-private `_strip_spans` (not
+imported: that name is not part of `services/agent-orchestration`'s
+public surface, and `apps/api` must not reach into another package's
+private internals) -- both are a tiny, un-driftable "remove these spans,
+back to front" algorithm.

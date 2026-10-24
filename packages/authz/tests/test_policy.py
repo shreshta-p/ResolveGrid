@@ -174,6 +174,31 @@ def test_principal_has_role_true_for_global_admin_regardless_of_requested_role()
     assert principal_has_role(principal, "admin") is True
 
 
+def test_ticket_diagnose_denied_for_plain_employee():
+    # Phase 13 Task 4: unlike ticket.view/ticket.list, a plain employee gets
+    # no self-scoped fallback for ticket.diagnose -- "diagnose my own
+    # ticket" is a staff-only capability, mirroring ticket.transition.
+    principal = Principal(employee_id=23, roles=())
+    decision = authorize(principal, "ticket.diagnose")
+    assert decision.allowed is False
+
+
+def test_ticket_diagnose_allowed_for_department_scoped_analyst():
+    principal = Principal(
+        employee_id=24, roles=(RoleGrant(role="analyst", scope="department", scope_id=6),)
+    )
+    decision = authorize(principal, "ticket.diagnose")
+    assert decision.allowed is True
+    assert decision.department_ids == (6,)
+
+
+def test_ticket_diagnose_allowed_for_admin():
+    principal = Principal(employee_id=25, roles=(RoleGrant(role="admin", scope="global"),))
+    decision = authorize(principal, "ticket.diagnose")
+    assert decision.allowed is True
+    assert decision.department_ids is None
+
+
 def test_principal_has_role_ignores_department_scoped_admin_grant():
     # Mirrors authorize()'s test_admin_grant_with_wrong_scope_is_ignored --
     # a non-global admin grant does not dominate, but it IS still a direct

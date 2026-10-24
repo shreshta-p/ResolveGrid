@@ -99,6 +99,7 @@ from google.adk.runners import Runner
 from google.adk.sessions import InMemorySessionService
 from google.genai import types
 from opentelemetry.trace import Tracer
+from resolvegrid_retrieval.citation_verification import verify_citations
 from sqlalchemy.orm import Session
 
 from resolvegrid_api import llm_gateway
@@ -112,6 +113,13 @@ from resolvegrid_api.diagnostic_tools import (
 from resolvegrid_api.model_call_logging import log_adk_model_call
 from resolvegrid_api.routing import select_model_for_risk_level
 from resolvegrid_authz import Principal
+
+# The real tool name whose `function_response` event this module inspects
+# to recover STRUCTURED evidence (chunk_id/document_title pairs) for the
+# citations Task 4's endpoint surfaces to the UI -- see `DiagnosisResult.
+# cited_chunks`'s docstring below for the full "why this is a Task 4
+# addition, not something Task 3 already did" rationale.
+_KB_EVIDENCE_TOOL_NAME = "retrieve_ticket_kb_evidence"
 
 # Ticket.priority values (free-text column, no DB-level enum -- see
 # models/ticketing.py) that map to risk_level "high" for `routing.select_
@@ -195,6 +203,21 @@ class DiagnosisResult:
     tool_calls_made: list[str] = field(default_factory=list)
     turn_count: int = 0
     model_calls_logged: int = 0
+    # Phase 13 Task 4 addition (not present when Task 3 wrote this module --
+    # see this class's own docstring above for why Task 3 deliberately left
+    # this kind of parsing to Task 4): real, VERIFIED `{"chunk_id": int,
+    # "document_title": str}` evidence the specialist actually cited in
+    # `summary`, using the exact same real `resolvegrid_retrieval.
+    # citation_verification.verify_citations` deterministic check `/chat`'s
+    # `verify_citations_node` already uses (graph.py) -- never a new,
+    # parallel citation-trust mechanism. `summary` itself has already had
+    # any FABRICATED `[chunk:<id>]` marker stripped (same "strip, don't
+    # abstain" consequence `verify_citations_node`'s docstring documents and
+    # justifies) by the time a caller reads this field -- see
+    # `diagnose_ticket`'s own docstring for the real mechanics (which ADK
+    # event this is parsed from, and why only `retrieve_ticket_kb_evidence`'s
+    # real tool results are eligible evidence).
+    cited_chunks: list[dict] = field(default_factory=list)
 
 
 class _ModelCallLoggingPlugin(BasePlugin):
@@ -301,6 +324,27 @@ def _curry_tool(func, session: Session, principal: Principal):
     return wrapper
 
 
+def _strip_fabricated_citation_spans(text: str, spans: list[tuple[int, int]]) -> str:
+    """Remove each `(start, end)` character span from `text`, descending-
+    start order (so removing one span never shifts the offsets of a
+    not-yet-processed span -- every span was computed against the
+    *original* text by `verify_citations`, not a partially-edited copy).
+
+    A deliberate, small duplicate of `resolvegrid_agent_orchestration.
+    graph._strip_spans` -- not imported, since that name is module-private
+    (no leading-underscore name is part of that package's public surface,
+    per its own `__init__.py` docstring) and `apps/api` must not reach
+    into another package's private internals. Both copies are tiny (4
+    lines) and share zero real risk of silently drifting apart (the
+    algorithm is "remove these spans, back to front" -- there is no second
+    way to implement it correctly).
+    """
+    result = text
+    for start, end in sorted(spans, key=lambda span: span[0], reverse=True):
+        result = result[:start] + result[end:]
+    return result
+
+
 def _risk_level_for_ticket(priority: str) -> str:
     return "high" if priority in _HIGH_PRIORITY_VALUES else "medium"
 
@@ -361,6 +405,24 @@ async def diagnose_ticket(
     `model_call_logging.py` already established); the caller must commit (or
     otherwise flush) after this returns, or every `ModelCall` row this run
     logged is silently lost.
+
+    Citation evidence (Phase 13 Task 4): every real `retrieve_ticket_kb_
+    evidence` tool call this run makes produces a real ADK `function_
+    response` event alongside the `function_call` event the pre-existing
+    `tool_calls_made` tracking already read -- this function now ALSO reads
+    that event (`part.function_response.name ==
+    "retrieve_ticket_kb_evidence"`, confirmed by reading the installed
+    `google-adk==1.14.1` source: a dict-returning tool's raw return value is
+    used as-is as `function_response.response`, never wrapped) to recover
+    the real `{chunk_id, document_title}` pairs `retrieve_ticket_kb_
+    evidence` actually returned. After the run, `summary`'s own
+    `[chunk:<id>]` markers are verified against exactly those real chunk
+    ids via `resolvegrid_retrieval.citation_verification.verify_citations`
+    (the SAME deterministic check `/chat`'s `verify_citations_node` already
+    applies -- never a second, parallel mechanism); any fabricated marker is
+    stripped from `summary` before it's returned, and `DiagnosisResult.
+    cited_chunks` carries only the verified subset. See that field's own
+    docstring for the full rationale.
     """
     ticket_state = get_ticket_state_and_history(session, principal, ticket_id)
     ticket = ticket_state["ticket"]
@@ -384,6 +446,14 @@ async def diagnose_ticket(
     tool_calls_made: list[str] = []
     turn_count = 0
     final_text: str | None = None
+    # Phase 13 Task 4: real evidence recovered from `retrieve_ticket_kb_
+    # evidence`'s own real `function_response` event(s) -- see this
+    # function's docstring's "Citation evidence" section below. Keyed by
+    # chunk_id (deduped across however many times the tool was actually
+    # called this run, last-write-wins -- the underlying chunk row's own
+    # title is stable across calls, so this is a dedup, not a
+    # correctness-sensitive ordering choice).
+    evidence_chunks: dict[int, dict] = {}
 
     prompt = (
         f"Diagnose ticket #{ticket['id']} (subject: {ticket['subject']!r}, "
@@ -403,15 +473,55 @@ async def diagnose_ticket(
                 if part.function_call is not None:
                     turn_count += 1
                     tool_calls_made.append(part.function_call.name)
+                # Real, empirically-confirmed shape (see this function's
+                # docstring): since `retrieve_ticket_kb_evidence` already
+                # returns a real `dict`, ADK's own `__build_response_event`
+                # (google.adk.flows.llm_flows.functions, read directly from
+                # the installed `google-adk==1.14.1` source) uses that dict
+                # AS-IS as `function_response.response` -- never wraps it
+                # under a `{"result": ...}` key the way it would for a
+                # non-dict return value. `.get(...)` throughout (never bare
+                # indexing): a `{"error": ...}` result (the authz-denial/
+                # not-found degrade `_curry_tool` produces) has no "chunks"
+                # key at all, and must not raise here.
+                response = part.function_response
+                if response is not None and response.name == _KB_EVIDENCE_TOOL_NAME:
+                    chunks = (response.response or {}).get("chunks") or []
+                    for chunk in chunks:
+                        chunk_id = chunk.get("chunk_id")
+                        if chunk_id is not None:
+                            evidence_chunks[chunk_id] = {
+                                "chunk_id": chunk_id,
+                                "document_title": chunk.get("document_title", ""),
+                            }
         if event.is_final_response() and event.content and event.content.parts:
             text_parts = [part.text for part in event.content.parts if part.text]
             if text_parts:
                 final_text = "".join(text_parts)
 
+    # Citation verification/stripping (Phase 13 Task 4): the exact same
+    # real, deterministic check `/chat`'s `verify_citations_node` applies
+    # (`resolvegrid_agent_orchestration.graph`), reused directly rather than
+    # a second, parallel citation-trust mechanism -- see `DiagnosisResult.
+    # cited_chunks`'s docstring for the full rationale. `valid_chunk_ids` is
+    # exactly the set of chunk ids `retrieve_ticket_kb_evidence` actually
+    # returned THIS run (never the full KB), matching `verify_citations`'s
+    # own documented "shown to the model, not exists anywhere" semantic.
+    # `verify_citations("", ...)`/an answer with no `[chunk:<id>]` markers
+    # at all is itself a real, unremarkable, vacuously-verified case (see
+    # that function's own docstring) -- no special-casing needed here.
+    summary_text = final_text or ""
+    verification = verify_citations(summary_text, set(evidence_chunks.keys()))
+    if not verification.all_verified:
+        fabricated_spans = [(c.start, c.end) for c in verification.citations if not c.verified]
+        summary_text = _strip_fabricated_citation_spans(summary_text, fabricated_spans)
+    cited_chunks = [evidence_chunks[chunk_id] for chunk_id in verification.verified_chunk_ids]
+
     return DiagnosisResult(
         ticket_id=ticket_id,
-        summary=final_text or "",
+        summary=summary_text,
         tool_calls_made=tool_calls_made,
         turn_count=turn_count,
         model_calls_logged=plugin.logged_count,
+        cited_chunks=cited_chunks,
     )

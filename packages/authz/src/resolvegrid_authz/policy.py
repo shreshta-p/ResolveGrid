@@ -53,7 +53,24 @@ _SELF_SCOPED_ACTIONS = {
 # chunk ids, tool params, approval outcomes) across every employee's data,
 # never a single employee's own resource, so a plain employee with no
 # admin/department-scoped analyst-or-approver grant must be denied outright.
-_STAFF_ONLY_ACTIONS = {"ticket.transition", "approval.list", "approval.decide", "eval.view"}
+# Phase 13 Task 4: "ticket.diagnose" joins this set for the identical reason
+# -- the ADK diagnostic specialist's tools (Phase 13 Task 2) can surface a
+# ticket's full audit history, an employee's entitlements, and
+# cross-department "similar ticket" candidates in one real agent run; that
+# is squarely the same "staff capability, not a personal resource" shape as
+# `ticket.transition`/`approval.list`/`approval.decide`/`eval.view` above,
+# not a per-resource view like `ticket.view`. A plain employee (the
+# ticket's own requester included) must be denied outright, never
+# downgraded to a self-scoped Decision -- "diagnose my own ticket" is not a
+# capability this phase's plan grants to ordinary employees, only to
+# admin/department-scoped analyst-or-approver roles.
+_STAFF_ONLY_ACTIONS = {
+    "ticket.transition",
+    "approval.list",
+    "approval.decide",
+    "eval.view",
+    "ticket.diagnose",
+}
 
 _KNOWN_ACTIONS = _SELF_SCOPED_ACTIONS | _STAFF_ONLY_ACTIONS
 

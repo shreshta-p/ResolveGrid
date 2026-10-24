@@ -22,6 +22,18 @@ interface SummarizeResult {
   estimated_cost_usd: number;
 }
 
+interface DiagnosisCitation {
+  chunk_id: number;
+  document_title: string;
+}
+
+interface DiagnosisResult {
+  summary: string;
+  citations: DiagnosisCitation[];
+  tool_calls_made: string[];
+  thread_id: string;
+}
+
 // Keep in sync with ALLOWED_TRANSITIONS in
 // packages/contracts/src/resolvegrid_contracts/tickets.py -- the backend is
 // the single source of truth and is the actual enforcement point; this map
@@ -42,6 +54,9 @@ export default function TicketDetailPage({ params }: { params: Promise<{ id: str
   const [message, setMessage] = useState<string | null>(null);
   const [summarizing, setSummarizing] = useState(false);
   const [summarizeResult, setSummarizeResult] = useState<SummarizeResult | null>(null);
+  const [diagnosing, setDiagnosing] = useState(false);
+  const [diagnosisResult, setDiagnosisResult] = useState<DiagnosisResult | null>(null);
+  const [diagnoseError, setDiagnoseError] = useState<string | null>(null);
 
   function handleEmployeeIdChange(value: string) {
     setEmployeeIdState(value);
@@ -116,6 +131,40 @@ export default function TicketDetailPage({ params }: { params: Promise<{ id: str
     setSummarizing(false);
   }
 
+  // Phase 13 Task 4: "Diagnose" -- analyst/approver/admin-only action
+  // (`ticket.diagnose`, a new staff-only authz action), running the real
+  // Google ADK diagnostic specialist via `POST /tickets/{id}/diagnose`.
+  // No client-side role check hides this button: `/approvals`
+  // (apps/web/app/approvals/page.tsx) is this codebase's existing
+  // precedent for a staff-only action with ZERO frontend role-gating --
+  // every page here relies on the backend's real authz check (a 403
+  // surfaced through the same `setError`-style pattern already used
+  // below), not a client-side guess at the viewer's roles. Matched here
+  // rather than inventing a new, inconsistent convention.
+  async function diagnose() {
+    setDiagnoseError(null);
+    setDiagnosisResult(null);
+    setDiagnosing(true);
+    let response: Response;
+    try {
+      response = await apiFetch(`/tickets/${id}/diagnose`, { method: "POST" });
+    } catch {
+      setDiagnoseError("Network error: could not reach the API. Is it running?");
+      setDiagnosing(false);
+      return;
+    }
+    if (!response.ok) {
+      const detail = await response.json().catch(() => ({}));
+      const message =
+        typeof detail.detail === "string" ? detail.detail : JSON.stringify(detail.detail ?? "request failed");
+      setDiagnoseError(`Error ${response.status}: ${message}`);
+      setDiagnosing(false);
+      return;
+    }
+    setDiagnosisResult(await response.json());
+    setDiagnosing(false);
+  }
+
   return (
     <main>
       <h1>Ticket #{id}</h1>
@@ -151,6 +200,29 @@ export default function TicketDetailPage({ params }: { params: Promise<{ id: str
                     {summarizeResult.latency_ms}ms · {summarizeResult.input_tokens}→{summarizeResult.output_tokens}{" "}
                     tokens · ${summarizeResult.estimated_cost_usd.toFixed(4)}
                   </small>
+                </p>
+              </div>
+            )}
+          </div>
+          <div>
+            <button onClick={diagnose} disabled={diagnosing}>
+              {diagnosing ? "Diagnosing..." : "Diagnose"}
+            </button>
+            {diagnoseError && <p role="alert">{diagnoseError}</p>}
+            {diagnosisResult && (
+              <div role="status">
+                <p>{diagnosisResult.summary}</p>
+                {diagnosisResult.citations.length > 0 && (
+                  <ul aria-label="citations">
+                    {diagnosisResult.citations.map((citation) => (
+                      <li key={citation.chunk_id}>
+                        [chunk:{citation.chunk_id}] {citation.document_title}
+                      </li>
+                    ))}
+                  </ul>
+                )}
+                <p>
+                  <small>Tools used: {diagnosisResult.tool_calls_made.join(", ") || "none"}</small>
                 </p>
               </div>
             )}

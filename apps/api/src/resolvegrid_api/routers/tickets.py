@@ -1,3 +1,8 @@
+import json
+import time
+from datetime import datetime, timezone
+from uuid import uuid4
+
 from fastapi import APIRouter, Depends, HTTPException
 from opentelemetry import trace
 from sqlalchemy import select
@@ -8,8 +13,10 @@ from resolvegrid_api.audit import record_audit_event
 from resolvegrid_api.authz_scope import apply_decision_scope, resource_in_scope
 from resolvegrid_api.db import get_db
 from resolvegrid_api.deps import get_principal
+from resolvegrid_api.diagnostic_agent import diagnose_ticket
+from resolvegrid_api.diagnostic_tools import TicketNotAuthorizedError, TicketNotFoundError
 from resolvegrid_api.model_call_logging import current_pricing_version, log_completion
-from resolvegrid_api.models import Queue, Ticket, TicketMessage, TicketStateTransition
+from resolvegrid_api.models import AgentRun, Queue, Span, Ticket, TicketMessage, TicketStateTransition
 from resolvegrid_api.rate_limit import check_ticket_creation_rate_limit
 from resolvegrid_authz import Decision, Principal, authorize
 from resolvegrid_contracts import TicketCreateRequest, TicketTransitionRequest, is_valid_transition
@@ -212,4 +219,156 @@ def summarize_ticket(
         "output_tokens": result.output_tokens,
         "latency_ms": result.latency_ms,
         "estimated_cost_usd": estimated_cost_usd,
+    }
+
+
+@router.post("/{ticket_id}/diagnose")
+async def diagnose_ticket_endpoint(
+    ticket_id: int,
+    session: Session = Depends(get_db),
+    principal: Principal = Depends(get_principal),
+) -> dict:
+    """Phase 13 Task 4: real Google ADK diagnostic specialist, exposed as an
+    analyst-facing ticket-detail-page action (the "Diagnose" button), per
+    `docs/superpowers/plans/2026-10-21-phase13-adk-diagnostic-specialist.md`.
+
+    Architecture decision -- NO LangGraph node/graph wraps this call (see
+    `docs/adr/0004-adk-diagnostic-specialist-wiring.md`'s Task 4 addendum
+    for the full, documented reasoning): `diagnostic_agent.diagnose_ticket`
+    already runs ADK's own `Runner`'s complete, bounded, single-shot
+    tool-calling loop and returns a finished result -- there is no
+    `interrupt()`/resume boundary, no conditional routing, and no
+    multi-turn state needing LangGraph's checkpointing the way `build_
+    tool_invocation_graph` genuinely needs it for a durable, human-paused
+    approval. `diagnose_ticket`'s own signature (a live `Session`/`Tracer`/
+    `Principal` in, a plain `DiagnosisResult` out) is also not AgentState
+    -shaped -- wrapping it in a one-node `StateGraph` would only add
+    checkpointer-sharing/state-marshalling ceremony for zero real
+    capability, so this handler calls it directly, exactly like
+    `summarize_ticket` above calls `log_completion` directly.
+
+    Authz, two independent layers (defense in depth, mirroring `diagnostic_
+    tools.py`'s own documented two-layer pattern):
+      1. `ticket.diagnose` (a new, Phase 13 Task 4 `_STAFF_ONLY_ACTIONS`
+         entry -- `packages/authz/policy.py`) gates this endpoint to
+         admin/department-scoped analyst-or-approver principals only,
+         checked FIRST, before any `AgentRun` row or real model call is
+         spent on a principal who cannot use this feature AT ALL --
+         mirrors `routers/approvals.py`'s `approval.list`/`approval.decide`
+         precedent exactly (same staff-only action shape, same "deny
+         outright, never downgrade to self-scope" semantic). A ticket's own
+         requester gets no special self-view carve-out here, unlike
+         `ticket.view` -- "diagnose my own ticket" is a staff capability in
+         this phase's plan, not a personal one.
+      2. The specific target ticket's own 404-then-403 (mirrors `get_
+         ticket`'s existing precedent exactly): `diagnose_ticket` calls the
+         real `get_ticket_state_and_history` tool internally, BEFORE
+         building any real `Agent`/spending any real model call, raising
+         `TicketNotFoundError`/`TicketNotAuthorizedError` -- caught below
+         and translated to 404/403 respectively.
+
+    Real `AgentRun`/`Span` telemetry (per this task's own requirement --
+    does NOT need to match `/chat`'s exact 4-row `_STAGE_NAMES` shape,
+    since this is a genuinely different, single-call workflow, not a
+    5-node LangGraph chain): one `AgentRun` row per real diagnostic run
+    (status/timing/output, same columns `/chat` populates), and exactly ONE
+    `Span` row (`stage_name="diagnose_ticket"`) carrying the REAL measured
+    wall-clock latency of the whole `diagnose_ticket` call. A per-tool-call
+    breakdown the way `/chat`'s `node_latencies_ms` provides is not
+    available here and is not fabricated: ADK's own `Runner` owns its
+    internal multi-turn tool-calling loop as one opaque unit (unlike
+    LangGraph's own per-node `time.monotonic()` instrumentation, nothing
+    inside that loop is separately timed), so `Span.detail_json` instead
+    carries the real `tool_calls_made`/`turn_count`/`model_calls_logged`
+    counts `DiagnosisResult` already reports -- real, structured,
+    non-fabricated detail, just not a second latency breakdown this
+    codebase has no real measurement for. `AgentRun.thread_id` is populated
+    with a fresh `uuid4().hex` for this row's own uniqueness constraint
+    (matching `/chat`'s minting convention), but -- since no LangGraph
+    graph is invoked here -- it is NOT a real LangGraph checkpoint key for
+    this run, unlike every other `AgentRun` row in this codebase; this is a
+    direct, documented consequence of this handler's own "no graph" design
+    decision, not an oversight.
+
+    `async def` for the same reason `chat.py`'s/`tools.py`'s handlers are:
+    `diagnose_ticket` is itself `async` (ADK's `Runner.run_async` requires
+    a running event loop).
+    """
+    decision = authorize(principal, "ticket.diagnose")
+    if not decision.allowed:
+        raise HTTPException(status_code=403, detail=decision.reason)
+
+    agent_run = AgentRun(
+        status="running",
+        thread_id=uuid4().hex,
+        principal_employee_id=principal.employee_id,
+        input_text=f"[diagnose] ticket #{ticket_id}",
+    )
+    session.add(agent_run)
+    session.commit()
+
+    start = time.monotonic()
+    try:
+        result = await diagnose_ticket(session, tracer, principal, ticket_id)
+    except TicketNotFoundError as exc:
+        latency_ms = int((time.monotonic() - start) * 1000)
+        agent_run.status = "error"
+        agent_run.error_message = str(exc)
+        agent_run.completed_at = datetime.now(timezone.utc)
+        session.add(
+            Span(agent_run_id=agent_run.id, stage_name="diagnose_ticket", status="error", latency_ms=latency_ms)
+        )
+        session.commit()
+        raise HTTPException(status_code=404, detail="ticket not found") from exc
+    except TicketNotAuthorizedError as exc:
+        latency_ms = int((time.monotonic() - start) * 1000)
+        agent_run.status = "error"
+        agent_run.error_message = str(exc)
+        agent_run.completed_at = datetime.now(timezone.utc)
+        session.add(
+            Span(agent_run_id=agent_run.id, stage_name="diagnose_ticket", status="error", latency_ms=latency_ms)
+        )
+        session.commit()
+        raise HTTPException(status_code=403, detail="not authorized to diagnose this ticket") from exc
+    except Exception as exc:
+        # Mirrors chat.py's broad catch: a real ADK/LiteLLM/DB failure can
+        # come from several layers beneath this call; the endpoint's
+        # contract is "the diagnostic run failed, cleanly" regardless of
+        # which layer raised.
+        latency_ms = int((time.monotonic() - start) * 1000)
+        agent_run.status = "error"
+        agent_run.error_message = str(exc)
+        agent_run.completed_at = datetime.now(timezone.utc)
+        session.add(
+            Span(agent_run_id=agent_run.id, stage_name="diagnose_ticket", status="error", latency_ms=latency_ms)
+        )
+        session.commit()
+        raise HTTPException(status_code=502, detail=f"diagnosis failed: {exc}") from exc
+
+    latency_ms = int((time.monotonic() - start) * 1000)
+    agent_run.status = "completed"
+    agent_run.output_text = result.summary
+    agent_run.completed_at = datetime.now(timezone.utc)
+    session.add(
+        Span(
+            agent_run_id=agent_run.id,
+            stage_name="diagnose_ticket",
+            status="success",
+            latency_ms=latency_ms,
+            detail_json=json.dumps(
+                {
+                    "tool_calls_made": result.tool_calls_made,
+                    "turn_count": result.turn_count,
+                    "model_calls_logged": result.model_calls_logged,
+                }
+            ),
+        )
+    )
+    session.commit()
+
+    return {
+        "summary": result.summary,
+        "citations": result.cited_chunks,
+        "tool_calls_made": result.tool_calls_made,
+        "thread_id": agent_run.thread_id,
     }
