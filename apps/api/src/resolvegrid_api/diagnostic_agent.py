@@ -99,7 +99,7 @@ from google.adk.runners import Runner
 from google.adk.sessions import InMemorySessionService
 from google.genai import types
 from opentelemetry.trace import Tracer
-from resolvegrid_retrieval.citation_verification import verify_citations
+from resolvegrid_retrieval.citation_verification import strip_fabricated_spans, verify_citations
 from sqlalchemy.orm import Session
 
 from resolvegrid_api import llm_gateway
@@ -324,27 +324,6 @@ def _curry_tool(func, session: Session, principal: Principal):
     return wrapper
 
 
-def _strip_fabricated_citation_spans(text: str, spans: list[tuple[int, int]]) -> str:
-    """Remove each `(start, end)` character span from `text`, descending-
-    start order (so removing one span never shifts the offsets of a
-    not-yet-processed span -- every span was computed against the
-    *original* text by `verify_citations`, not a partially-edited copy).
-
-    A deliberate, small duplicate of `resolvegrid_agent_orchestration.
-    graph._strip_spans` -- not imported, since that name is module-private
-    (no leading-underscore name is part of that package's public surface,
-    per its own `__init__.py` docstring) and `apps/api` must not reach
-    into another package's private internals. Both copies are tiny (4
-    lines) and share zero real risk of silently drifting apart (the
-    algorithm is "remove these spans, back to front" -- there is no second
-    way to implement it correctly).
-    """
-    result = text
-    for start, end in sorted(spans, key=lambda span: span[0], reverse=True):
-        result = result[:start] + result[end:]
-    return result
-
-
 def _risk_level_for_ticket(priority: str) -> str:
     return "high" if priority in _HIGH_PRIORITY_VALUES else "medium"
 
@@ -514,7 +493,7 @@ async def diagnose_ticket(
     verification = verify_citations(summary_text, set(evidence_chunks.keys()))
     if not verification.all_verified:
         fabricated_spans = [(c.start, c.end) for c in verification.citations if not c.verified]
-        summary_text = _strip_fabricated_citation_spans(summary_text, fabricated_spans)
+        summary_text = strip_fabricated_spans(summary_text, fabricated_spans)
     cited_chunks = [evidence_chunks[chunk_id] for chunk_id in verification.verified_chunk_ids]
 
     return DiagnosisResult(

@@ -213,7 +213,7 @@ from typing import Callable, Protocol, TypedDict
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import interrupt
 from pydantic import BaseModel, ValidationError
-from resolvegrid_retrieval.citation_verification import verify_citations
+from resolvegrid_retrieval.citation_verification import strip_fabricated_spans, verify_citations
 
 from resolvegrid_agent_orchestration.state import AgentState, RetrievedChunk
 
@@ -699,18 +699,13 @@ def make_retrieve_node(retrieve_fn: RetrieveFn):
     return retrieve
 
 
-def _strip_spans(text: str, spans: list[tuple[int, int]]) -> str:
-    """Remove each `(start, end)` character span from `text`, in-place
-    string surgery. Spans are processed in descending `start` order so
-    removing one span never shifts the offsets of a not-yet-processed
-    span (each span's offsets were computed against the *original*
-    `answer_text` by `verify_citations`, not against a partially-edited
-    copy).
-    """
-    result = text
-    for start, end in sorted(spans, key=lambda span: span[0], reverse=True):
-        result = result[:start] + result[end:]
-    return result
+# `strip_fabricated_spans` used to be a private, module-local copy
+# (`_strip_spans`) of this exact algorithm -- promoted to a real, public,
+# shared function in `resolvegrid_retrieval.citation_verification` (Phase
+# 13 Task 4 code review) once `apps/api`'s `diagnostic_agent.py` needed
+# the identical logic and had no non-duplicating way to reuse this
+# module-private name. See that function's own docstring for the full
+# "why promote, not keep two copies" rationale.
 
 
 def verify_citations_node(state: AgentState) -> dict:
@@ -736,8 +731,8 @@ def verify_citations_node(state: AgentState) -> dict:
     citations from what's surfaced to the user rather than presenting an
     unverified citation as trustworthy"): **strip, don't abstain.** Every
     fabricated `[chunk:<id>]` marker is removed from `output_text` in
-    place (via `_strip_spans`, using `Citation.start`/`end`) -- the
-    surrounding prose and any genuinely verified citations are left
+    place (via `strip_fabricated_spans`, using `Citation.start`/`end`) --
+    the surrounding prose and any genuinely verified citations are left
     untouched. The whole answer is not discarded/replaced with a refusal:
     a fabricated citation means "this one claimed source is untrustworthy,"
     not "the entire answer is untrustworthy" -- the rest of the answer may
@@ -793,7 +788,7 @@ def verify_citations_node(state: AgentState) -> dict:
         }
 
     fabricated_spans = [(c.start, c.end) for c in result.citations if not c.verified]
-    stripped_output_text = _strip_spans(output_text, fabricated_spans)
+    stripped_output_text = strip_fabricated_spans(output_text, fabricated_spans)
     elapsed_ms = int((time.monotonic() - start) * 1000)
     return {
         "output_text": stripped_output_text,

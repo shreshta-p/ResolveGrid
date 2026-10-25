@@ -170,3 +170,36 @@ def verify_citations(answer_text: str, valid_chunk_ids: set[int]) -> Verificatio
         verified_chunk_ids=verified_ids,
         fabricated_chunk_ids=fabricated_ids,
     )
+
+
+def strip_fabricated_spans(text: str, spans: list[tuple[int, int]]) -> str:
+    """Remove each `(start, end)` character span from `text`, in-place
+    string surgery for stripping fabricated `[chunk:<id>]` markers out of
+    an answer (every `verify_citations` caller's "strip, don't abstain"
+    consequence for a fabricated citation -- see e.g.
+    `resolvegrid_agent_orchestration.graph.verify_citations_node`'s
+    docstring for the full rationale this module has no opinion on).
+
+    Spans are processed in descending `start` order so removing one span
+    never shifts the offsets of a not-yet-processed span -- each span's
+    offsets must have been computed against the *original* `text` by
+    `verify_citations` (via its `Citation.start`/`end`), never against a
+    partially-edited copy.
+
+    Promoted to this module (Phase 13 Task 4 code review) from two
+    independent, logically-identical private copies this codebase used to
+    carry side by side -- `services/agent-orchestration/.../graph.py`'s
+    `_strip_spans` (used by `verify_citations_node`) and `apps/api`'s
+    `diagnostic_agent.py`'s `_strip_fabricated_citation_spans` (used by
+    `diagnose_ticket`). Both call sites already depend on this module for
+    `verify_citations` itself, so a real, public, shared function here --
+    not a third private copy, and not a new shared package -- is what
+    guarantees a future fix to this algorithm's real edge cases (e.g.
+    overlapping-span handling, unicode offset nuances) reaches every
+    caller at once instead of silently drifting between copies that
+    nothing but a manual diff review would ever catch.
+    """
+    result = text
+    for start, end in sorted(spans, key=lambda span: span[0], reverse=True):
+        result = result[:start] + result[end:]
+    return result

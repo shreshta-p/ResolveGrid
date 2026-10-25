@@ -57,6 +57,7 @@ export default function TicketDetailPage({ params }: { params: Promise<{ id: str
   const [diagnosing, setDiagnosing] = useState(false);
   const [diagnosisResult, setDiagnosisResult] = useState<DiagnosisResult | null>(null);
   const [diagnoseError, setDiagnoseError] = useState<string | null>(null);
+  const [diagnoseElapsedSeconds, setDiagnoseElapsedSeconds] = useState(0);
 
   function handleEmployeeIdChange(value: string) {
     setEmployeeIdState(value);
@@ -81,6 +82,26 @@ export default function TicketDetailPage({ params }: { params: Promise<{ id: str
   }
 
   useEffect(load, [employeeId, id]);
+
+  // Code review follow-up: a real diagnostic run's internal ADK tool-
+  // calling loop can take up to _MAX_LLM_CALLS=60 turns (ADR 0004's own
+  // cited finding) -- 20-50+ real seconds, an order of magnitude longer
+  // than `summarize()`'s single LLM call. A static "Diagnosing..." label
+  // with nothing moving risks reading as a frozen page to a real analyst
+  // during that whole window. This ticks a plain elapsed-seconds counter
+  // once a second while `diagnosing` is true, resetting to 0 the moment a
+  // new run starts (see `diagnose()` below) -- deliberately NOT a fake
+  // progress bar (there is no real sub-step progress to report; ADK's own
+  // Runner owns its internal loop as one opaque unit, same reason
+  // `routers/tickets.py`'s `diagnose_ticket_endpoint` writes only one real
+  // `Span` row rather than a fabricated per-tool-call breakdown), just an
+  // honest "time elapsed so far" signal that something is actively
+  // running.
+  useEffect(() => {
+    if (!diagnosing) return;
+    const interval = setInterval(() => setDiagnoseElapsedSeconds((s) => s + 1), 1000);
+    return () => clearInterval(interval);
+  }, [diagnosing]);
 
   async function transition(toStatus: string) {
     setMessage(null);
@@ -144,6 +165,7 @@ export default function TicketDetailPage({ params }: { params: Promise<{ id: str
   async function diagnose() {
     setDiagnoseError(null);
     setDiagnosisResult(null);
+    setDiagnoseElapsedSeconds(0);
     setDiagnosing(true);
     let response: Response;
     try {
@@ -208,6 +230,18 @@ export default function TicketDetailPage({ params }: { params: Promise<{ id: str
             <button onClick={diagnose} disabled={diagnosing}>
               {diagnosing ? "Diagnosing..." : "Diagnose"}
             </button>
+            {diagnosing && (
+              // Real, non-mocked diagnostic runs can take 20-50+ seconds
+              // (see the useEffect above) -- a cycling dot animation
+              // (changes every second, so it's visibly moving, not a
+              // static label) plus a real elapsed-seconds counter, so
+              // this reads as "working" the whole time, not "stuck" after
+              // the first couple of seconds a static disabled-button
+              // label alone would read fine for.
+              <p role="status" aria-live="polite">
+                Investigating ticket{".".repeat((diagnoseElapsedSeconds % 3) + 1)} ({diagnoseElapsedSeconds}s elapsed)
+              </p>
+            )}
             {diagnoseError && <p role="alert">{diagnoseError}</p>}
             {diagnosisResult && (
               <div role="status">

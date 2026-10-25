@@ -312,9 +312,20 @@ pairs -- the exact shape `/chat`'s own `citations` response field already
 uses, so `apps/web`'s existing citation-rendering markup needed zero
 changes to also render a diagnosis's citations.
 
-`_strip_fabricated_citation_spans` in `diagnostic_agent.py` is a small,
-deliberate duplicate of `graph.py`'s module-private `_strip_spans` (not
-imported: that name is not part of `services/agent-orchestration`'s
-public surface, and `apps/api` must not reach into another package's
-private internals) -- both are a tiny, un-driftable "remove these spans,
-back to front" algorithm.
+**Code-review amendment**: the first real draft of this task duplicated
+the span-stripping algorithm as a small, private `_strip_fabricated_
+citation_spans` in `diagnostic_agent.py`, reasoning that `graph.py`'s
+`_strip_spans` was module-private and therefore off-limits to reach into
+from `apps/api`. Code review correctly flagged this as understating a
+real drift risk: nothing enforced the two copies staying identical, so a
+future real edge case found in one (overlapping-span dedup, unicode
+offset handling) would silently not reach the other. Fixed by promoting
+the algorithm to a real, PUBLIC function --
+`resolvegrid_retrieval.citation_verification.strip_fabricated_spans` --
+since both `apps/api` and `services/agent-orchestration` already depend
+on that package for `verify_citations` itself; this removes the
+cross-package-private-access objection entirely (it's public API now) and
+needed no new shared package. Both real call sites (`graph.py`'s
+`verify_citations_node` and `diagnostic_agent.py`'s `diagnose_ticket`) now
+import and call the same shared function; the two private copies were
+deleted, not left behind as dead code.

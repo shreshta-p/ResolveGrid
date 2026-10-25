@@ -10,6 +10,7 @@ confirmed exact text quoted from that template.
 from resolvegrid_retrieval.citation_verification import (
     Citation,
     VerificationResult,
+    strip_fabricated_spans,
     verify_citations,
 )
 
@@ -126,3 +127,40 @@ def test_valid_chunk_ids_empty_set_flags_every_citation_as_fabricated():
 
     assert result.all_verified is False
     assert result.fabricated_chunk_ids == [1]
+
+
+# ---------------------------------------------------------------------------
+# strip_fabricated_spans (Phase 13 Task 4 code review: promoted here from
+# two independent, logically-identical private copies -- see this
+# function's own docstring for the full "why promote, not keep two copies"
+# rationale).
+# ---------------------------------------------------------------------------
+
+
+def test_strip_fabricated_spans_removes_only_the_given_spans():
+    answer = "Per policy [chunk:1], but also [chunk:999] which is fabricated."
+    result = verify_citations(answer, valid_chunk_ids={1})
+    fabricated_spans = [(c.start, c.end) for c in result.citations if not c.verified]
+
+    stripped = strip_fabricated_spans(answer, fabricated_spans)
+
+    assert "[chunk:999]" not in stripped
+    assert "[chunk:1]" in stripped
+    assert "Per policy [chunk:1], but also  which is fabricated." == stripped
+
+
+def test_strip_fabricated_spans_handles_multiple_spans_without_offset_drift():
+    # Three fabricated spans at increasing offsets -- processed back-to-
+    # front (descending start) so removing a later span never shifts an
+    # earlier, not-yet-processed span's offsets.
+    answer = "[chunk:1] and [chunk:2] and [chunk:3] all fabricated."
+    result = verify_citations(answer, valid_chunk_ids=set())
+    fabricated_spans = [(c.start, c.end) for c in result.citations if not c.verified]
+
+    stripped = strip_fabricated_spans(answer, fabricated_spans)
+
+    assert stripped == " and  and  all fabricated."
+
+
+def test_strip_fabricated_spans_empty_list_returns_text_unchanged():
+    assert strip_fabricated_spans("no spans to strip", []) == "no spans to strip"
