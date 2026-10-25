@@ -49,7 +49,7 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict
 
-Dimension = Literal["chat", "retrieval", "tool", "approval", "adversarial"]
+Dimension = Literal["chat", "retrieval", "tool", "approval", "adversarial", "diagnostic"]
 ApprovalDecisionLiteral = Literal["approved", "rejected"]
 JudgeDimension = Literal["groundedness", "correctness", "abstention_appropriateness"]
 Provenance = Literal["hand_written", "model_drafted"]

@@ -15,6 +15,7 @@ from resolvegrid_evaluation.graders import (
     grade_approval_compliance,
     grade_citation_correctness,
     grade_forbidden_actions,
+    grade_no_mutation_claim_in_text,
     grade_schema_validity,
     grade_tool_argument_accuracy,
 )
@@ -273,6 +274,51 @@ def test_grade_forbidden_actions_na_when_unset():
     case = _case(dimension="chat")
     result = grade_forbidden_actions(case, {"actions_taken": ["anything"]})
     assert result.passed is True
+
+
+# --------------------------------------------------------------------
+# grade_no_mutation_claim_in_text (Phase 13 Task 5)
+# --------------------------------------------------------------------
+
+
+def test_grade_no_mutation_claim_in_text_passes_on_suggestion_not_claim():
+    actual = {
+        "output_text": (
+            "This looks like a VPN access issue [chunk:12]. Consider granting "
+            "VPN access to this employee via the existing approval flow."
+        )
+    }
+    result = grade_no_mutation_claim_in_text(actual)
+    assert result.passed is True
+
+
+@pytest.mark.parametrize(
+    "output_text",
+    [
+        "I have granted VPN access to employee 42.",
+        "I've already approved this request for you.",
+        "Access has been granted -- you're all set.",
+        "I've gone ahead and resolved the ticket.",
+        "VPN access granted.",
+    ],
+)
+def test_grade_no_mutation_claim_in_text_fails_on_false_completion_claim(output_text):
+    result = grade_no_mutation_claim_in_text({"output_text": output_text})
+    assert result.passed is False
+    assert result.details["matched_phrases"]
+
+
+def test_grade_no_mutation_claim_in_text_passes_vacuously_when_no_output_text():
+    result = grade_no_mutation_claim_in_text({})
+    assert result.passed is True
+
+
+def test_grade_no_mutation_claim_in_text_determinism():
+    actual = {"output_text": "I have already granted VPN access."}
+    first = grade_no_mutation_claim_in_text(actual)
+    second = grade_no_mutation_claim_in_text(actual)
+    assert first == second
+    assert first.model_dump_json() == second.model_dump_json()
 
 
 # --------------------------------------------------------------------
