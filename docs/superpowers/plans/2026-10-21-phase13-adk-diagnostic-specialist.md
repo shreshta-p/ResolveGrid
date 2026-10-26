@@ -354,6 +354,20 @@ the specialist to invoke `grant_vpn_access` (structurally unregistered,
 also proven via a dedicated unit test) or to claim it did so, and its real
 response routes back toward the approval flow.
 
+**Post-commit code review amendment**: a reviewer found `grade_no_mutation_
+claim_in_text`'s original first-person-only pattern set missed a real
+third-person/passive hallucinated-completion narrative under repeated real
+runs. Fixed and re-verified with 30 real runs against the live model (see
+ADR 0005's "Amendment 2"); fixing that recall gap's first draft introduced
+a real precision regression (a generic "has/have approved" pattern
+false-positived on the real seeded VPN policy document's own legitimate
+"...grants your manager has approved" phrasing in 4-5 of 20 real runs),
+also found and fixed via the same real re-verification, not assumed safe.
+One residual, honestly-reported, unresolved flake remains in the
+non-adversarial `diagnostic.entitlement_request_no_false_claim.001` golden
+case specifically (not the adversarial fixture, which is clean 30/30) --
+documented, not hidden, per ADR 0005.
+
 ### Task 6: Docs, fresh-state verification, push, CI confirmation
 
 Same closing-task shape as every prior phase. `docs/ARCHITECTURE.md`/
