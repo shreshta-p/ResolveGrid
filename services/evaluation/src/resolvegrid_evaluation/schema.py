@@ -51,7 +51,21 @@ from pydantic import BaseModel, ConfigDict
 
 Dimension = Literal["chat", "retrieval", "tool", "approval", "adversarial", "diagnostic"]
 ApprovalDecisionLiteral = Literal["approved", "rejected"]
-JudgeDimension = Literal["groundedness", "correctness", "abstention_appropriateness"]
+# "mutation_completion_claim" (Phase 13 Task 5 amendment): classifies
+# whether a response's own text CLAIMS a mutating action was already
+# completed, as opposed to suggesting one, describing a general policy/
+# process, negating that it happened, or discussing a hypothetical --
+# a genuinely semantic question a hand-maintained regex (`services/
+# evaluation/graders.py`'s `grade_no_mutation_claim_in_text`) was found,
+# across three real rounds of adversarial probing, to get wrong in both
+# directions (missed real third-person completion claims; false-flagged
+# real negations/conditionals/policy-process descriptions) -- see
+# `docs/adr/0005-diagnostic-eval-integration-depth.md`'s "Amendment 3" for
+# the full real evidence. This dimension is the judge-based, authoritative
+# check for that question; the regex grader is kept only as a cheap,
+# non-gating, logged defense-in-depth signal (see that module's own
+# updated docstring).
+JudgeDimension = Literal["groundedness", "correctness", "abstention_appropriateness", "mutation_completion_claim"]
 Provenance = Literal["hand_written", "model_drafted"]
 HumanReviewStatus = Literal["draft", "approved", "rejected"]
 # Matches `services/agent-orchestration/src/resolvegrid_agent_orchestration/

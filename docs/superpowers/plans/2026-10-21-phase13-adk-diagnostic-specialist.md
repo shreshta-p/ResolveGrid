@@ -363,10 +363,43 @@ a real precision regression (a generic "has/have approved" pattern
 false-positived on the real seeded VPN policy document's own legitimate
 "...grants your manager has approved" phrasing in 4-5 of 20 real runs),
 also found and fixed via the same real re-verification, not assumed safe.
-One residual, honestly-reported, unresolved flake remains in the
-non-adversarial `diagnostic.entitlement_request_no_false_claim.001` golden
-case specifically (not the adversarial fixture, which is clean 30/30) --
-documented, not hidden, per ADR 0005.
+
+**Second post-commit code review amendment**: a re-reviewer found the
+regex grader STILL wrong a third time (missed "enabled"/"restored"/"now
+active" completion claims; false-flagged a real negation and a real
+conditional) -- confirming "does this text claim completion" is a
+genuinely semantic question a fixed pattern list cannot reliably answer.
+Per the re-reviewer's explicit instruction, stopped patching the regex:
+built a real, calibrated judge-based classifier
+(`resolvegrid_api.eval_judge.classify_mutation_completion_claim_real`,
+reusing Phase 10's established `judge.py` methodology verbatim, calibrated
+against `eval/golden/mutation_claim_calibration_v1.jsonl`'s 16 hand
+-labeled cases at 93.8% real measured agreement) as the new AUTHORITATIVE
+safety check; the regex is demoted to a cheap, non-gating, always-logged
+defense-in-depth signal. Re-verified: the real prompt-injection adversarial
+test passed 6/6 real runs under the new check (one run showed a real,
+logged regex/judge disagreement that the judge correctly resolved), and
+all 8 adversarial strings found across all three rounds of real probing
+were individually confirmed correctly classified against the real live
+model. A further, unrelated real finding from this same re-verification (a
+reproducible ADK tool-hallucination crash in one golden case) was isolated
+and fixed within scope; the root-cause robustness gap in `diagnostic_agent
+.diagnose_ticket` itself is flagged for Task 3/4 follow-up, not silently
+absorbed into this fix. A SEPARATE real finding from the same
+re-verification -- this task's own `diagnostic.audit_history_grounding
+.001` fixture had committed a real `AuditLog` row with a hand-written,
+non-algorithmic hash, permanently corrupting `audit.verify_chain_
+integrity`'s global tamper-evident chain for the whole shared dev
+database (confirmed: a later real audit event legitimately chained onto
+the fake hash, propagating the corruption through 46 rows) -- was found,
+repaired (recomputed the real hash chain from the break point forward,
+preserving all real content; zero data loss), and fixed at the source
+(the fixture now uses the real `record_audit_event` helper and never
+deletes its own real audit row, since ANY deletion mid-chain is unsafe
+regardless of hash correctness). See ADR 0005's "Amendment 3" and its
+closing note for full detail, including an honest statement of the new
+judge-based approach's own remaining limits (a judge is strong evidence,
+not a formal proof of 100% coverage).
 
 ### Task 6: Docs, fresh-state verification, push, CI confirmation
 
