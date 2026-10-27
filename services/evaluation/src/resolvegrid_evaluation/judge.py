@@ -1,7 +1,12 @@
 """Model-judge grader + calibration harness (Phase 10 Task 4): sends a
 structured grading prompt to an injected completion callable for each of
 `EvalCase.judge_dimensions` (groundedness/correctness/
-abstention_appropriateness), parses a `{"passed": bool, "reasoning": str}`
+abstention_appropriateness, plus `mutation_completion_claim` -- added in
+Phase 13 Task 5 as the authoritative replacement for a hand-maintained
+regex that three separate rounds of real adversarial probing found
+unreliable; see `docs/adr/0005-diagnostic-eval-integration-depth.md`'s
+"Amendment 3" and `resolvegrid_api.eval_judge.classify_mutation_
+completion_claim_real`), parses a `{"passed": bool, "reasoning": str}`
 verdict per dimension, and reports how often that automated judge agrees
 with a human-labeled calibration sample.
 

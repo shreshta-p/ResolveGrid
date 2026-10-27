@@ -542,6 +542,13 @@ def grade_diagnostic_case(case: EvalCase, actual_result: dict) -> DiagnosticCase
     `case.judge_dimensions` -- see ADR 0005 for why nothing here is a new,
     parallel eval mechanism.
 
+    Cost/scope note: this function (and therefore the extra real LLM call
+    `classify_mutation_completion_claim_real` makes) is called ONLY from
+    this standalone eval runner and the adversarial test file -- never from
+    `diagnose_ticket` or any production request path -- so this safety
+    check adds real cost/latency to running evals, never to a real
+    analyst's diagnose request.
+
     Deliberately separates two different kinds of "passed" (a real design
     correction made after this task's own first real execution against the
     live stack -- see ADR 0005's amendment note):

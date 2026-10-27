@@ -136,6 +136,15 @@ def classify_mutation_completion_claim_real(output_text: str) -> JudgeVerdict:
     eval-integration-depth.md`'s "Amendment 3" for the full real evidence
     that led to replacing a hand-maintained regex with this.
 
+    Cost/scope note: every call here is one real, synchronous LLM
+    completion (through `real_complete_fn`, same as every other judge
+    dimension) -- this function is called ONLY from eval-time code paths
+    (`diagnostic_eval.grade_diagnostic_case` and the real adversarial test
+    in `apps/api/tests/test_diagnostic_agent_adversarial.py`), never from
+    `diagnose_ticket` itself or any `/chat`/`/tickets/{id}/diagnose`
+    production request path -- a real diagnostic run's own latency/cost is
+    unaffected by this check's existence.
+
     Builds a minimal SYNTHETIC `EvalCase` inline (not loaded from any
     golden/calibration file -- there is no real `case_id`/`dataset_
     version` for a one-off safety check called directly from `diagnostic_
