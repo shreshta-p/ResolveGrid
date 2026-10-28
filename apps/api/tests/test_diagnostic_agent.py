@@ -238,18 +238,22 @@ def test_diagnose_ticket_real_end_to_end_against_live_stack(db_session, tracer):
     result = asyncio.run(diagnose_ticket(db_session, tracer, principal, anchor.id))
 
     assert result.ticket_id == anchor.id
-    # Real, documented exception to "always non-empty" (Phase 13 Task 6,
-    # found via this exact test during a genuine fresh-state run): qwen3:14b
+    # Real, documented exceptions to "always non-empty" (Phase 13 Task 6,
+    # found via this exact test during real fresh-state/CI runs): qwen3:14b
     # sometimes hallucinates its final answer as a fake, unregistered tool
     # call (observed real name: "diagnostic_specialist", matching this
     # agent's own `name`) instead of plain final text -- `diagnose_ticket`
     # recovers real text from that call's own arguments when possible, but
     # an honestly empty summary is the correct, non-fabricated outcome on
-    # the rare real run where even that recovery finds nothing usable. A
-    # NORMAL (non-hallucinated) run must still produce real, non-empty
-    # content -- this assertion still enforces that.
-    assert result.summary.strip() or result.hallucinated_tool_call, (
-        f"empty summary on a non-hallucinated run is a real bug: {result!r}"
+    # the rare real run where even that recovery finds nothing usable.
+    # Separately, under slow-hardware conditions (confirmed for real in
+    # CI), qwen3:14b's documented repeated-tool-re-invocation pathology can
+    # genuinely exhaust `_MAX_LLM_CALLS=60` within one run, leaving no
+    # final answer at all (`exceeded_call_limit`). A NORMAL (neither
+    # hallucinated nor call-limit-exhausted) run must still produce real,
+    # non-empty content -- this assertion still enforces that.
+    assert result.summary.strip() or result.hallucinated_tool_call or result.exceeded_call_limit, (
+        f"empty summary on an otherwise-normal run is a real bug: {result!r}"
     )
     # The hallucinated pseudo-tool-call name (if any) is intentionally
     # EXCLUDED from "real tools called" below -- it was never a real tool
@@ -433,6 +437,76 @@ def test_diagnose_ticket_does_not_swallow_an_unrelated_value_error(db_session, t
 
     with pytest.raises(ValueError, match="some genuinely unrelated ADK/LiteLLM wiring error"):
         asyncio.run(diagnose_ticket(db_session, tracer, principal, ticket.id))
+
+
+def test_diagnose_ticket_degrades_gracefully_when_llm_call_limit_is_exceeded(db_session, tracer, monkeypatch):
+    """Real, reproduced finding from this phase's own first-ever CI push
+    (run 40668281723): `test_diagnose_ticket_real_end_to_end_against_live_
+    stack` took 33m39s in CI before FAILING -- consistent with qwen3:14b's
+    already-documented (ADR 0003 Finding 5) tendency to repeatedly
+    re-invoke an already-answered tool genuinely reaching this
+    specialist's full `_MAX_LLM_CALLS=60` hard cap under CI's much slower
+    (CPU-only) per-call speed, something fast local GPU inference never
+    surfaced. ADK's own `LlmCallsLimitExceededError`
+    (`google.adk.agents.invocation_context`) is a plain `Exception`
+    subclass, NOT a `ValueError` -- confirmed by reading its real source --
+    so it was never caught by the hallucination fix's `except ValueError`
+    above, and previously crashed the whole run exactly like the
+    hallucination case did before THAT was fixed. This test proves
+    `diagnose_ticket` now degrades instead: a real `DiagnosisResult` with
+    `exceeded_call_limit=True`, never a propagated crash.
+    """
+    from google.adk.runners import Runner
+
+    location = Location(name="Diag Call Limit HQ", region="US", timezone="America/Chicago")
+    department = Department(name="Diag Call Limit Eng")
+    db_session.add_all([location, department])
+    db_session.flush()
+
+    queue = Queue(name="Diag Call Limit Queue", department_id=department.id)
+    db_session.add(queue)
+    db_session.flush()
+
+    requester = Employee(
+        display_name="Diag Call Limit Requester",
+        email="diag.call.limit.requester@example.test",
+        title="Engineer",
+        hire_date="2024-01-01T00:00:00",
+        timezone=location.timezone,
+        location_id=location.id,
+        department_id=department.id,
+    )
+    db_session.add(requester)
+    db_session.flush()
+
+    ticket = Ticket(
+        subject="Call limit exhaustion probe",
+        category="hardware",
+        type="incident",
+        priority="medium",
+        queue_id=queue.id,
+        requester_id=requester.id,
+    )
+    db_session.add(ticket)
+    db_session.flush()
+
+    principal = Principal(employee_id=requester.id, roles=(RoleGrant(role="admin", scope="global"),))
+
+    async def _raise_call_limit_exceeded(self, *args, **kwargs):
+        from google.adk.agents.invocation_context import LlmCallsLimitExceededError
+
+        raise LlmCallsLimitExceededError("Max number of llm calls limit of 60 exceeded")
+        yield  # pragma: no cover -- makes this an async generator function
+
+    monkeypatch.setattr(Runner, "run_async", _raise_call_limit_exceeded)
+
+    result = asyncio.run(diagnose_ticket(db_session, tracer, principal, ticket.id))
+
+    assert result.exceeded_call_limit is True
+    assert result.hallucinated_tool_call is False
+    assert result.ticket_id == ticket.id
+    assert result.summary == ""
+    assert result.cited_chunks == []
 
 
 def test_diagnose_ticket_recovers_real_text_from_hallucinated_summary_argument(

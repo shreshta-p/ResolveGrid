@@ -424,6 +424,44 @@ deleted row's own hash was ever correct. Re-verified clean across 2
 full real runs of the fixed fixture plus confirmed-intact chain checks
 before and after.
 
+## Amendment 4: a second real robustness gap, found via this phase's first-ever real CI push -- `LlmCallsLimitExceededError` is a plain `Exception`, not caught by Amendment 3's `ValueError` fix
+
+After the ADK-hallucination `ValueError` fix above was pushed, CI run
+40668281723 (the second real CI attempt) still failed:
+`test_diagnose_ticket_real_end_to_end_against_live_stack` ran for
+**33m39s** before FAILING, and the prompt-injection adversarial test ran
+for **17m19s** before also FAILING -- both durations consistent with
+qwen3:14b approaching or reaching this specialist's full
+`_MAX_LLM_CALLS=60` hard cap at CI's observed real per-call pace
+(~10-30s/call on the CPU-only runner, vs ~1-3s locally with a warm GPU),
+not a hang. Root-caused, not assumed: reading `google.adk.agents.
+invocation_context`'s real source directly shows
+`LlmCallsLimitExceededError` is declared as a plain `class
+LlmCallsLimitExceededError(Exception)` -- NOT a `ValueError` -- so it was
+never caught by the narrowly-scoped `except ValueError` added for the
+tool-hallucination gap; it propagated uncaught exactly the same way the
+hallucination `ValueError` did before THAT was fixed. This is ADR 0003
+Finding 5's already-documented qwen3:14b pathology (repeatedly
+re-invoking an already-answered tool, up to 36 observed real turns for a
+single trivial tool) proving genuinely reachable within one real test's
+lifetime under slow-hardware conditions -- something fast local GPU
+inference never surfaced during any of this phase's local development or
+verification.
+
+**Fix**: `diagnostic_agent.diagnose_ticket` now also catches
+`LlmCallsLimitExceededError` around the same `runner.run_async` loop,
+degrading to whatever real state was gathered before the cap was hit
+(never fabricating a recovered answer -- there is no real "the model
+tried to answer via the wrong envelope" text to recover here, unlike the
+hallucination case). A new `DiagnosisResult.exceeded_call_limit: bool`
+field reports this honestly and distinctly from `hallucinated_tool_call`
+(the two are different real qwen3:14b pathologies, not the same finding
+twice), surfaced the same way in `routers/tickets.py`'s response and
+`Span.detail_json`. A new deterministic (monkeypatched-ADK) regression
+test, `test_diagnose_ticket_degrades_gracefully_when_llm_call_limit_is_
+exceeded`, proves the catch without depending on real-model
+nondeterminism to reach the actual 60-call cap.
+
 ## Future work, explicitly deferred (not forgotten)
 
 If diagnostic evals grow beyond a small, human-curated regression set (for

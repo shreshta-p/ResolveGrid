@@ -90,6 +90,7 @@ import inspect
 import time
 from dataclasses import dataclass, field
 
+from google.adk.agents.invocation_context import LlmCallsLimitExceededError
 from google.adk.agents.llm_agent import Agent
 from google.adk.agents.run_config import RunConfig
 from google.adk.apps.app import App
@@ -239,6 +240,17 @@ class DiagnosisResult:
     # up being, so a hallucination-recovered summary can never carry an
     # unverified `[chunk:<id>]` marker either.
     hallucinated_tool_call: bool = False
+    # Real Task 6 CI finding, distinct from `hallucinated_tool_call` above:
+    # `True` when this run's own `Runner.run_async` hit ADK's real
+    # `RunConfig.max_llm_calls` hard cap (`_MAX_LLM_CALLS=60`) -- ADR 0003
+    # Finding 5's already-documented qwen3:14b "repeatedly re-invokes an
+    # already-answered tool" pathology, confirmed reachable within one
+    # real run's lifetime under CI's slower per-call speed (not just a
+    # theoretical worst case). Unlike `hallucinated_tool_call`, there is no
+    # real candidate answer text to recover here -- `summary` is "" unless
+    # an earlier, genuine final-response event already set it before the
+    # cap was hit.
+    exceeded_call_limit: bool = False
 
 
 class _ModelCallLoggingPlugin(BasePlugin):
@@ -463,6 +475,7 @@ async def diagnose_ticket(
     )
 
     hallucinated_tool_call = False
+    exceeded_call_limit = False
     # Real Task 6 finding (see the `except ValueError` branch below): when
     # qwen3:14b hallucinates a call to an unregistered tool name, the call's
     # own `args` have been observed to contain exactly the model's real
@@ -554,6 +567,30 @@ async def diagnose_ticket(
         hallucinated_tool_call = True
         if final_text is None:
             final_text = candidate_summary_text
+    except LlmCallsLimitExceededError:
+        # Real, previously-undiscovered robustness gap, found via this
+        # phase's first-ever real CI push (run 40668281723): ADR 0003
+        # Finding 5's already-documented qwen3:14b pathology (repeatedly
+        # re-invoking an already-answered tool, up to 36 observed real
+        # turns for a SINGLE trivial tool) is real and reproducible enough,
+        # under CI's genuinely slower CPU-only per-call speed (~10-30s vs
+        # ~1-3s locally with a warm GPU), that a real run can reach this
+        # specialist's full `_MAX_LLM_CALLS=60` hard cap within one test's
+        # lifetime -- confirmed by this exact test taking 33m39s in CI
+        # before failing, consistent with ~60 real sequential calls at
+        # CI's observed per-call pace, not a hang or a deadlock. ADK's own
+        # `InvocationContext.increment_llm_call_count` (google.adk.agents.
+        # invocation_context) raises this as a plain `Exception` subclass,
+        # NOT a `ValueError` -- confirmed by reading its real source -- so
+        # it was never caught by the `except ValueError` branch above, and
+        # previously crashed the whole run exactly like the hallucination
+        # case did before THAT was fixed. Degrades the same honest way:
+        # whatever real state was gathered before the cap was hit is kept,
+        # with no recovery-via-candidate-summary-text (unlike the
+        # hallucination case, there is no real "the model tried to answer
+        # but used the wrong envelope" text to recover here -- the run
+        # genuinely never produced a final answer).
+        exceeded_call_limit = True
 
     # Citation verification/stripping (Phase 13 Task 4): the exact same
     # real, deterministic check `/chat`'s `verify_citations_node` applies
@@ -581,4 +618,5 @@ async def diagnose_ticket(
         model_calls_logged=plugin.logged_count,
         cited_chunks=cited_chunks,
         hallucinated_tool_call=hallucinated_tool_call,
+        exceeded_call_limit=exceeded_call_limit,
     )

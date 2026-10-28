@@ -361,6 +361,7 @@ async def diagnose_ticket_endpoint(
                     "turn_count": result.turn_count,
                     "model_calls_logged": result.model_calls_logged,
                     "hallucinated_tool_call": result.hallucinated_tool_call,
+                    "exceeded_call_limit": result.exceeded_call_limit,
                 }
             ),
         )
@@ -380,4 +381,10 @@ async def diagnose_ticket_endpoint(
         # this to show an honest "degraded run" indicator rather than
         # silently treating every 200 as equally content-complete.
         "hallucinated_tool_call": result.hallucinated_tool_call,
+        # Real, honest signal, distinct from the above (Phase 13 Task 6):
+        # the run hit ADK's real `max_llm_calls` hard cap (qwen3:14b's
+        # documented repeated-tool-re-invocation pathology, confirmed
+        # reachable for real under slow-hardware conditions) rather than
+        # producing any final answer at all.
+        "exceeded_call_limit": result.exceeded_call_limit,
     }
