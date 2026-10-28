@@ -43,13 +43,41 @@ def test_diagnostic_golden_cases_shape():
         assert case.judge_dimensions, f"{case.case_id} is missing judge_dimensions"
 
 
+# Phase 13 Task 6 real CI finding (first-ever CI push of this phase's
+# code): this test alone running all 6 real cases -- each a FULL real
+# `diagnose_ticket` call, up to `_MAX_LLM_CALLS=60` real sequential model
+# turns worst-case -- combined with this suite's other real single-call
+# diagnostic end-to-end tests, pushed the `api` job past its 50-minute
+# timeout on GitHub's CPU-only runners (confirmed via the real CI log:
+# dozens of real `/api/generate` calls, mostly 10-20s each, some spiking
+# past a minute). Mirrors `test_eval_worker.py`'s own established
+# `_CI_SAMPLE_CASE_IDS` precedent exactly (Phase 10 Task 9's real,
+# identical CI-timeout finding): reduce real CALL VOLUME, not real system
+# coverage -- every sampled case still runs for real (real DB, real
+# `Agent`/`Runner`, real Ollama/LiteLLM), only the CASE COUNT drops. The
+# full 6-case suite remains fully exercisable via `diagnostic_eval.
+# run_diagnostic_eval_suite(session, tracer)` with no `cases` argument
+# (the documented production/manual-verification entry point) and was
+# genuinely, exhaustively run that way during this same Task 6's
+# fresh-state verification -- see `docs/PROGRESS.md`'s Phase 13 row for
+# that real run's per-case safety/quality results.
+_CI_SAMPLE_CASE_IDS = frozenset(
+    {
+        "diagnostic.vpn_access_issue.001",
+        "diagnostic.entitlement_request_no_false_claim.001",
+    }
+)
+
+
 def test_diagnostic_eval_suite_real_end_to_end_against_live_stack(raw_db_session, tracer):
-    """The real Task 5 completion proof: every real diagnostic golden case
-    (`eval/golden/diagnostic_v1.jsonl`) is run through the REAL
-    `diagnose_ticket` against the real live stack (real local-qwen3 via
-    LiteLLM/Ollama -- no mocking anywhere in this path), graded honestly via
-    real reused deterministic graders first, then the real reused judge
-    methodology for each case's fuzzy question.
+    """The real Task 5 completion proof: a real, representative SAMPLE of
+    the real diagnostic golden cases (`eval/golden/diagnostic_v1.jsonl`,
+    `_CI_SAMPLE_CASE_IDS` above -- reduced from the full 6 for real
+    CI-wall-clock-budget reasons, see that constant's own comment) is run
+    through the REAL `diagnose_ticket` against the real live stack (real
+    local-qwen3 via LiteLLM/Ollama -- no mocking anywhere in this path),
+    graded honestly via real reused deterministic graders first, then the
+    real reused judge methodology for each case's fuzzy question.
 
     Two different pass bars, deliberately (see `diagnostic_eval.
     grade_diagnostic_case`'s docstring for the full real-evidence-backed
@@ -75,7 +103,10 @@ def test_diagnostic_eval_suite_real_end_to_end_against_live_stack(raw_db_session
        not a harness defect to paper over with a lower assertion bar on
        safety.
     """
-    cases = load_diagnostic_cases()
+    cases = [case for case in load_diagnostic_cases() if case.case_id in _CI_SAMPLE_CASE_IDS]
+    assert len(cases) == len(_CI_SAMPLE_CASE_IDS), (
+        f"expected every sampled case id to exist in the real golden file, got: {[c.case_id for c in cases]!r}"
+    )
     outcomes = run_diagnostic_eval_suite(raw_db_session, tracer, cases)
 
     assert len(outcomes) == len(cases)

@@ -32,7 +32,23 @@ jobs:
     # measured runtime after that fix, without the 90+ minutes a
     # full-volume fix would have needed. See docs/DECISION_LOG.md's
     # 2026-09-11 entry for the full investigation.
-    timeout-minutes: 50
+    # Bumped from 50 to 75 for Phase 13 Task 6: the first-ever CI push of
+    # this phase's real ADK diagnostic-specialist tests (run
+    # 40660503138) was killed at the 50-minute mark mid-`pytest` --
+    # real, non-mocked `diagnose_ticket` end-to-end calls (each up to
+    # `_MAX_LLM_CALLS=60` real sequential model turns worst-case) across
+    # 5 single-call tests plus a 6-case eval suite add substantially more
+    # real-generation surface area than Phase 10 ever budgeted for. Fixed
+    # the same way Phase 10 did (reduce real call volume, not just
+    # inflate the timeout) -- `test_diagnostic_eval.py`'s own
+    # `_CI_SAMPLE_CASE_IDS` cuts that suite's 6 cases to 2 -- but even
+    # with that reduction, 5 remaining full real diagnose_ticket calls at
+    # this runner's observed ~10-20s-per-generate-call pace (vs ~1-3s
+    # locally with a warm GPU) need real headroom above 50 minutes for a
+    # worst-case multi-turn run, not a second blind guess. See
+    # `docs/DECISION_LOG.md`'s Phase 13 Task 6 entry for the full
+    # investigation and the real per-call timing evidence.
+    timeout-minutes: 75
     services:
       postgres:
         image: pgvector/pgvector:pg16
