@@ -166,10 +166,18 @@ _FIXED_TIME = "2026-10-21T00:00:00+00:00"
 
 # See this module's docstring: qwen3:14b was observed to need up to 36 real
 # model turns (re-invoking the already-answered tool) before producing a
-# final answer, in two independent real runs. 40 is a generous-but-finite
-# real safety cap (google.adk.agents.run_config.RunConfig.max_llm_calls),
-# not an arbitrary guess.
-_MAX_LLM_CALLS = 40
+# final answer, in two independent real runs. 40 was chosen as a
+# generous-but-finite real safety cap (google.adk.agents.run_config.
+# RunConfig.max_llm_calls), not an arbitrary guess -- but a real CI run
+# (Phase 13 Task 6, run 40746184421) genuinely exceeded even that: a real
+# `LlmCallsLimitExceededError: Max number of llm calls limit of 40
+# exceeded`, on GitHub's CPU-only runner, for this exact trivial
+# single-tool spike. This is new, real evidence that this qwen3:14b
+# behavior's real worst case is wider than the original two local runs
+# suggested, not a harness bug -- raised to 60 (matching the production
+# diagnostic specialist's own real, already-reasoned cap -- ADR 0004
+# Finding 5) rather than a second narrow guess.
+_MAX_LLM_CALLS = 60
 
 
 def get_current_server_time() -> str:
