@@ -48,7 +48,20 @@ jobs:
     # worst-case multi-turn run, not a second blind guess. See
     # `docs/DECISION_LOG.md`'s Phase 13 Task 6 entry for the full
     # investigation and the real per-call timing evidence.
-    timeout-minutes: 75
+    # Bumped from 75 to 100 (Phase 13 Task 6, final real-data-driven
+    # pass): even after ALSO adding a test-only `_MAX_LLM_CALLS` 60->15
+    # reduction (`apps/api/tests/conftest.py`) and cutting the eval
+    # suite's sample from 2 to 1 case, real CI run 40733219506's own log
+    # showed real per-call latency has a genuine fat tail on this
+    # CPU-only runner (individual `/api/generate` calls ranging from
+    # ~10s to 1-2+ minutes) -- the 5 real diagnostic end-to-end tests
+    # measured in that run alone cost ~44 real minutes combined (test
+    # timestamps: 14m39s, 6m4s, 9m12s, 13m55s for just 4 of them), on top
+    # of ~17 minutes of real setup (uv sync --extra reranker, model pull,
+    # migration, LiteLLM start) before pytest's first test even runs.
+    # 100 minutes gives real margin for this measured cost plus the
+    # remaining ~280 other real tests, without guessing a third time.
+    timeout-minutes: 100
     services:
       postgres:
         image: pgvector/pgvector:pg16

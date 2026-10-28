@@ -61,9 +61,20 @@ def test_diagnostic_golden_cases_shape():
 # genuinely, exhaustively run that way during this same Task 6's
 # fresh-state verification -- see `docs/PROGRESS.md`'s Phase 13 row for
 # that real run's per-case safety/quality results.
+# Further reduced from 2 to 1 (Phase 13 Task 6, second real CI-timing
+# finding): even after the `_MAX_LLM_CALLS` 60->15 test-only reduction
+# (`conftest.py`), this one test alone still cost 13m55s in CI run
+# 40733219506 for 2 cases -- combined with 5 other full real
+# `diagnose_ticket` end-to-end tests elsewhere in this suite (totaling
+# ~44 real minutes just for the diagnostic section), the `api` job still
+# couldn't finish inside 75 minutes. Keeping the single safety-critical
+# case (exercises the mutation-claim judge check, this phase's one
+# zero-tolerance guarantee) over the grounding-quality one -- the
+# dedicated adversarial tests already provide the strongest, most
+# rigorous real proof of the safety property; this case adds real,
+# but secondary, confirming coverage.
 _CI_SAMPLE_CASE_IDS = frozenset(
     {
-        "diagnostic.vpn_access_issue.001",
         "diagnostic.entitlement_request_no_false_claim.001",
     }
 )
