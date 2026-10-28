@@ -671,18 +671,26 @@ def run_diagnostic_eval_suite(
     real, unhandled `ValueError` from ADK's own internals
     (`google.adk.flows.llm_flows.functions`: "Function diagnostic_summary
     is not found in the tools_dict") -- the real model hallucinated a call
-    to a tool name that was never registered, and `diagnose_ticket`'s own
-    `async for event in runner.run_async(...)` loop does not currently
-    catch that. This is a genuine Task 3/4-level robustness gap in
-    `diagnostic_agent.diagnose_ticket` itself, out of THIS fix's scope to
-    repair (it is unrelated to mutation-claim grading, the subject of this
-    amendment) -- but mirrors `eval_worker.py`'s own already-established
-    "per-case failure isolation" convention exactly (see that module's
-    docstring): ONE case's real execution failure must never silently
-    discard every other already-computed case's result. A failed case is
-    graded `passed=False`/`safety_passed=False` (never silently skipped or
-    vacuously passed -- an execution failure is not evidence of safety)
-    with the real exception captured in `details["execution_error"]`.
+    to a tool name that was never registered. **Phase 13 Task 6 update**:
+    this exact robustness gap reproduced again, more broadly, during this
+    task's own fresh-state verification against a genuinely empty,
+    freshly-migrated database (a NEW hallucinated name,
+    "diagnostic_specialist" -- matching the agent's own `name` -- crashing
+    5 real tests, not just the one golden case above), and has now been
+    fixed at the source: `diagnostic_agent.diagnose_ticket`'s own `async
+    for event in runner.run_async(...)` loop catches this exact,
+    stably-worded ADK-internal `ValueError` and degrades to whatever real
+    state the run had already gathered, rather than crashing. This
+    per-case isolation is kept anyway, defensively, as a second layer (it
+    also still isolates a genuinely different real execution failure, e.g.
+    a DB/network error) -- it mirrors `eval_worker.py`'s own
+    already-established "per-case failure isolation" convention exactly
+    (see that module's docstring): ONE case's real execution failure must
+    never silently discard every other already-computed case's result. A
+    failed case is graded `passed=False`/`safety_passed=False` (never
+    silently skipped or vacuously passed -- an execution failure is not
+    evidence of safety) with the real exception captured in
+    `details["execution_error"]`.
     """
     cases = cases if cases is not None else load_diagnostic_cases()
     outcomes: list[DiagnosticCaseOutcome] = []

@@ -218,6 +218,27 @@ class DiagnosisResult:
     # event this is parsed from, and why only `retrieve_ticket_kb_evidence`'s
     # real tool results are eligible evidence).
     cited_chunks: list[dict] = field(default_factory=list)
+    # Real, Task 6 fresh-state-verification finding (the robustness gap ADR
+    # 0005's "fourth follow-up" flagged but deliberately left unfixed at the
+    # time): `True` when this run's own ADK `Runner.run_async` loop had to be
+    # stopped early because the model hallucinated a call to a tool name that
+    # was never registered (confirmed real and reproducible against a
+    # genuinely empty, freshly-migrated database -- not a one-off; observed
+    # names include both "diagnostic_summary", ADR 0005's original finding,
+    # and "diagnostic_specialist", a NEW variant this task's own fresh-state
+    # run newly observed, matching the agent's own `name` -- i.e. qwen3:14b
+    # sometimes tries to "submit" its final answer as a fake tool call
+    # instead of plain final text). `summary` reflects a real, earlier,
+    # genuine final-response event's `final_text` if one was already set
+    # before the hallucination; otherwise it falls back to the hallucinated
+    # call's own "summary" argument (real model output recovered through the
+    # wrong structural envelope -- confirmed safe since none of this
+    # specialist's 4 real registered tools take a "summary" parameter), or
+    # "" if even that is absent. `cited_chunks` is unaffected either way --
+    # citation verification/stripping still runs on whatever `summary` ends
+    # up being, so a hallucination-recovered summary can never carry an
+    # unverified `[chunk:<id>]` marker either.
+    hallucinated_tool_call: bool = False
 
 
 class _ModelCallLoggingPlugin(BasePlugin):
@@ -441,42 +462,98 @@ async def diagnose_ticket(
         "diagnostic summary for the analyst."
     )
 
-    async for event in runner.run_async(
-        user_id=str(principal.employee_id),
-        session_id=adk_session.id,
-        new_message=types.Content(role="user", parts=[types.Part(text=prompt)]),
-        run_config=RunConfig(max_llm_calls=_MAX_LLM_CALLS),
-    ):
-        if event.content and event.content.parts:
-            for part in event.content.parts:
-                if part.function_call is not None:
-                    turn_count += 1
-                    tool_calls_made.append(part.function_call.name)
-                # Real, empirically-confirmed shape (see this function's
-                # docstring): since `retrieve_ticket_kb_evidence` already
-                # returns a real `dict`, ADK's own `__build_response_event`
-                # (google.adk.flows.llm_flows.functions, read directly from
-                # the installed `google-adk==1.14.1` source) uses that dict
-                # AS-IS as `function_response.response` -- never wraps it
-                # under a `{"result": ...}` key the way it would for a
-                # non-dict return value. `.get(...)` throughout (never bare
-                # indexing): a `{"error": ...}` result (the authz-denial/
-                # not-found degrade `_curry_tool` produces) has no "chunks"
-                # key at all, and must not raise here.
-                response = part.function_response
-                if response is not None and response.name == _KB_EVIDENCE_TOOL_NAME:
-                    chunks = (response.response or {}).get("chunks") or []
-                    for chunk in chunks:
-                        chunk_id = chunk.get("chunk_id")
-                        if chunk_id is not None:
-                            evidence_chunks[chunk_id] = {
-                                "chunk_id": chunk_id,
-                                "document_title": chunk.get("document_title", ""),
-                            }
-        if event.is_final_response() and event.content and event.content.parts:
-            text_parts = [part.text for part in event.content.parts if part.text]
-            if text_parts:
-                final_text = "".join(text_parts)
+    hallucinated_tool_call = False
+    # Real Task 6 finding (see the `except ValueError` branch below): when
+    # qwen3:14b hallucinates a call to an unregistered tool name, the call's
+    # own `args` have been observed to contain exactly the model's real
+    # intended final answer, under a "summary" key (e.g.
+    # `{"summary": "Ticket #43 (...) is an open incident..."}`) -- the model
+    # tried to "submit" its answer via a fake tool call instead of plain
+    # final text. None of this agent's 4 REAL registered tools take a
+    # "summary" parameter (confirmed: `find_similar_tickets`/`get_employee_
+    # entitlements`/`retrieve_ticket_kb_evidence`/`get_ticket_state_and_
+    # history`'s real signatures, `diagnostic_tools.py`), so capturing this
+    # is safe and specific to the hallucination case, never a generic
+    # "any tool arg named summary is an answer" rule. Used ONLY as a
+    # fallback (below, after the loop) when the run is caught as
+    # hallucinated AND no real `final_text` was ever set by a genuine
+    # final-response event -- this is real model output recovered through
+    # the wrong structural envelope, not a fabrication.
+    candidate_summary_text: str | None = None
+    try:
+        async for event in runner.run_async(
+            user_id=str(principal.employee_id),
+            session_id=adk_session.id,
+            new_message=types.Content(role="user", parts=[types.Part(text=prompt)]),
+            run_config=RunConfig(max_llm_calls=_MAX_LLM_CALLS),
+        ):
+            if event.content and event.content.parts:
+                for part in event.content.parts:
+                    if part.function_call is not None:
+                        turn_count += 1
+                        tool_calls_made.append(part.function_call.name)
+                        call_args = part.function_call.args or {}
+                        if isinstance(call_args.get("summary"), str):
+                            candidate_summary_text = call_args["summary"]
+                    # Real, empirically-confirmed shape (see this function's
+                    # docstring): since `retrieve_ticket_kb_evidence` already
+                    # returns a real `dict`, ADK's own `__build_response_event`
+                    # (google.adk.flows.llm_flows.functions, read directly from
+                    # the installed `google-adk==1.14.1` source) uses that dict
+                    # AS-IS as `function_response.response` -- never wraps it
+                    # under a `{"result": ...}` key the way it would for a
+                    # non-dict return value. `.get(...)` throughout (never bare
+                    # indexing): a `{"error": ...}` result (the authz-denial/
+                    # not-found degrade `_curry_tool` produces) has no "chunks"
+                    # key at all, and must not raise here.
+                    response = part.function_response
+                    if response is not None and response.name == _KB_EVIDENCE_TOOL_NAME:
+                        chunks = (response.response or {}).get("chunks") or []
+                        for chunk in chunks:
+                            chunk_id = chunk.get("chunk_id")
+                            if chunk_id is not None:
+                                evidence_chunks[chunk_id] = {
+                                    "chunk_id": chunk_id,
+                                    "document_title": chunk.get("document_title", ""),
+                                }
+            if event.is_final_response() and event.content and event.content.parts:
+                text_parts = [part.text for part in event.content.parts if part.text]
+                if text_parts:
+                    final_text = "".join(text_parts)
+    except ValueError as exc:
+        # Real, previously-flagged-but-unfixed ADK robustness gap (ADR
+        # 0005's "fourth follow-up"), now root-caused and fixed here: when
+        # qwen3:14b hallucinates a call to a tool name that was never
+        # registered (observed real names: "diagnostic_summary", ADR 0005's
+        # original finding, and "diagnostic_specialist" -- matching this
+        # agent's OWN `name`, i.e. the model sometimes tries to "submit" its
+        # final answer as a fake tool call instead of plain final text),
+        # ADK's own internal `_get_tool_and_context`
+        # (google.adk.flows.llm_flows.functions) raises a bare,
+        # undifferentiated `ValueError` ("Function <name> is not found in
+        # the tools_dict.") that would otherwise propagate out of this
+        # function, crash the whole diagnostic run, and surface as a real
+        # 502 to the analyst -- reproduced for real against a genuinely
+        # empty, freshly-migrated database during this phase's Task 6
+        # fresh-state verification (not a one-off). Caught narrowly, by this
+        # exact, stable ADK-internal message substring -- never a blanket
+        # `except ValueError`, since `Runner.run_async` could in principle
+        # raise an unrelated `ValueError` this must NOT silently swallow.
+        # Degrades to whatever real state this run had already legitimately
+        # gathered (`tool_calls_made`/`turn_count`/`evidence_chunks`, and any
+        # real `final_text` already captured from an earlier, genuine
+        # final-response event); if no genuine `final_text` was ever set,
+        # falls back to `candidate_summary_text` (above) -- the hallucinated
+        # call's OWN real "summary" argument, recovered because this phase's
+        # own real, reproduced observation is that it genuinely is the
+        # model's real intended answer, delivered through the wrong
+        # structural envelope, not an unrelated/adversarial value. This is
+        # real model output read correctly, not a fabrication.
+        if "is not found in the tools_dict" not in str(exc):
+            raise
+        hallucinated_tool_call = True
+        if final_text is None:
+            final_text = candidate_summary_text
 
     # Citation verification/stripping (Phase 13 Task 4): the exact same
     # real, deterministic check `/chat`'s `verify_citations_node` applies
@@ -503,4 +580,5 @@ async def diagnose_ticket(
         turn_count=turn_count,
         model_calls_logged=plugin.logged_count,
         cited_chunks=cited_chunks,
+        hallucinated_tool_call=hallucinated_tool_call,
     )

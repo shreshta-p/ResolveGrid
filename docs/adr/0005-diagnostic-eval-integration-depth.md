@@ -478,3 +478,50 @@ added per-case failure isolation to `diagnostic_eval.run_diagnostic_eval_
 suite` so a future recurrence can't silently discard other cases' results)
 but NOT fixed at the source -- recorded here as a concrete, evidence
 -backed lead for whoever picks up `diagnostic_agent.py` next.
+
+**Closed, Phase 13 Task 6**: this exact gap reproduced again, real and
+broad -- not a rare one-off -- during Task 6's own mandated fresh-state
+verification (full `apps/api` suite run against a genuinely empty,
+freshly-migrated database, before any seeding/ingestion): 5 real test
+failures, all the same root cause, a NEW hallucinated name
+("diagnostic_specialist", matching the agent's own `name` -- the real
+`FunctionCall.args` captured in the failing traceback was
+`{"summary": "Ticket #43 (...) is an open incident..."}`, i.e. qwen3:14b
+was attempting to "submit" its genuine final diagnostic text as a fake
+tool call rather than returning it as plain final text). Root-caused and
+fixed at the source, not worked around again: `diagnose_ticket`'s
+`async for` loop is now wrapped in a narrow `except ValueError`, matched
+by the exact, stable ADK-internal message substring ("is not found in the
+tools_dict") so an unrelated `ValueError` is never silently swallowed; on
+catch, the run degrades to whatever real state it had already gathered
+(`tool_calls_made`/`turn_count`/`evidence_chunks`/any real `final_text`
+already set). A SECOND real finding surfaced while re-verifying this fix
+against the live stack: the two real tests that still failed after the
+first fix (`test_diagnostic_agent.py`/`test_ticket_diagnose.py`'s own
+end-to-end tests) showed the hallucinated call's own `args` genuinely
+carrying the model's real intended final answer under a `"summary"` key
+(e.g. `{"summary": "Ticket #43 (...) is an open incident..."}`) -- the
+model tried to "submit" its real answer via a fake tool call instead of
+plain final text. Since none of this specialist's 4 real registered tools
+take a `"summary"` parameter, recovering this text as `summary` (only when
+no genuine `final_text` was already captured from an earlier real
+final-response event) is reading real model output through the wrong
+structural envelope, not fabricating an answer -- citation
+verification/stripping still runs on the recovered text exactly as it
+would on any other `summary`, so it can never carry an unverified
+`[chunk:<id>]` marker either. A new `DiagnosisResult.hallucinated_tool_
+call: bool` field reports the degradation honestly either way (surfaced
+in the diagnose endpoint's own `Span.detail_json`). Three new,
+deterministic (monkeypatched-ADK, not real-model) regression tests prove
+the catch, the recovery, and that an unrelated `ValueError` is never
+swallowed (`test_diagnose_ticket_degrades_gracefully_on_hallucinated_tool_
+call`, `test_diagnose_ticket_recovers_real_text_from_hallucinated_summary_
+argument`, `test_diagnose_ticket_does_not_swallow_an_unrelated_value_
+error`, all in `test_diagnostic_agent.py`). Re-verified: the full
+`apps/api` suite, re-run after this fix against the same fresh database,
+passed with zero failures (see `docs/PROGRESS.md`'s Phase 13 row for the
+exact before/after counts).
+`diagnostic_eval.run_diagnostic_eval_suite`'s own per-case failure
+isolation (above) is kept regardless, as defense-in-depth against a
+genuinely different real execution failure (e.g. a DB/network error), not
+removed now that its original triggering cause is fixed.

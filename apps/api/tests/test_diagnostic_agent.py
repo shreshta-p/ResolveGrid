@@ -24,7 +24,9 @@ import asyncio
 import re
 
 import pytest
+from google.adk.events.event import Event
 from google.adk.tools.function_tool import FunctionTool
+from google.genai import types
 from sqlalchemy import func, select
 
 from resolvegrid_api.diagnostic_agent import (
@@ -236,8 +238,25 @@ def test_diagnose_ticket_real_end_to_end_against_live_stack(db_session, tracer):
     result = asyncio.run(diagnose_ticket(db_session, tracer, principal, anchor.id))
 
     assert result.ticket_id == anchor.id
-    assert result.summary.strip(), "specialist produced an empty summary"
-    distinct_tools_called = set(result.tool_calls_made)
+    # Real, documented exception to "always non-empty" (Phase 13 Task 6,
+    # found via this exact test during a genuine fresh-state run): qwen3:14b
+    # sometimes hallucinates its final answer as a fake, unregistered tool
+    # call (observed real name: "diagnostic_specialist", matching this
+    # agent's own `name`) instead of plain final text -- `diagnose_ticket`
+    # recovers real text from that call's own arguments when possible, but
+    # an honestly empty summary is the correct, non-fabricated outcome on
+    # the rare real run where even that recovery finds nothing usable. A
+    # NORMAL (non-hallucinated) run must still produce real, non-empty
+    # content -- this assertion still enforces that.
+    assert result.summary.strip() or result.hallucinated_tool_call, (
+        f"empty summary on a non-hallucinated run is a real bug: {result!r}"
+    )
+    # The hallucinated pseudo-tool-call name (if any) is intentionally
+    # EXCLUDED from "real tools called" below -- it was never a real tool
+    # invocation (ADK's own internals rejected it; see `diagnose_ticket`'s
+    # `except ValueError` branch), so counting it toward "distinct real
+    # tools used" would overstate what this run actually, successfully did.
+    distinct_tools_called = set(result.tool_calls_made) - {"diagnostic_specialist"}
     assert len(distinct_tools_called) >= 2, (
         f"expected at least 2 distinct real tools called, got: {result.tool_calls_made!r}"
     )
@@ -284,3 +303,214 @@ def test_diagnose_ticket_real_end_to_end_against_live_stack(db_session, tracer):
         # placeholder this test is masking a missing lookup with.
         assert row.estimated_cost_usd == 0.0
         assert _TRACE_ID_RE.match(row.trace_id)
+
+
+# ---------------------------------------------------------------------------
+# 4. Phase 13 Task 6 fix: a hallucinated tool-call name must degrade the run,
+#    never crash it
+# ---------------------------------------------------------------------------
+
+
+def test_diagnose_ticket_degrades_gracefully_on_hallucinated_tool_call(db_session, tracer, monkeypatch):
+    """Real, reproducible finding from this phase's own Task 6 fresh-state
+    verification (see `docs/adr/0005-diagnostic-eval-integration-depth.md`'s
+    "fourth follow-up" closing note): ADK's own internals
+    (`google.adk.flows.llm_flows.functions._get_tool_and_context`) raise a
+    bare, undifferentiated `ValueError` ("Function <name> is not found in
+    the tools_dict.") when the model hallucinates a call to a tool name
+    that was never registered -- observed for real against this exact live
+    stack, not a hypothetical. This test does not re-run the real model
+    (that nondeterministic behavior is already proven reproducible by the
+    real end-to-end tests above and in `test_diagnostic_eval.py`); it
+    directly, deterministically proves `diagnose_ticket`'s own catch
+    behaves correctly by monkeypatching ADK's `Runner.run_async` to raise
+    the exact real exception string observed, confirming `diagnose_ticket`
+    degrades (returns a real `DiagnosisResult` with
+    `hallucinated_tool_call=True`) rather than letting it propagate and
+    crash the caller (previously surfacing as a real 502 at the endpoint).
+    """
+    from google.adk.runners import Runner
+
+    location = Location(name="Diag Hallucination HQ", region="US", timezone="America/Chicago")
+    department = Department(name="Diag Hallucination Eng")
+    db_session.add_all([location, department])
+    db_session.flush()
+
+    queue = Queue(name="Diag Hallucination Queue", department_id=department.id)
+    db_session.add(queue)
+    db_session.flush()
+
+    requester = Employee(
+        display_name="Diag Hallucination Requester",
+        email="diag.hallucination.requester@example.test",
+        title="Engineer",
+        hire_date="2024-01-01T00:00:00",
+        timezone=location.timezone,
+        location_id=location.id,
+        department_id=department.id,
+    )
+    db_session.add(requester)
+    db_session.flush()
+
+    ticket = Ticket(
+        subject="Printer firmware reports a paper jam that isn't real",
+        category="hardware",
+        type="incident",
+        priority="medium",
+        queue_id=queue.id,
+        requester_id=requester.id,
+    )
+    db_session.add(ticket)
+    db_session.flush()
+
+    principal = Principal(employee_id=requester.id, roles=(RoleGrant(role="admin", scope="global"),))
+
+    async def _raise_hallucinated_tool_call(self, *args, **kwargs):
+        raise ValueError("Function diagnostic_specialist is not found in the tools_dict.")
+        yield  # pragma: no cover -- makes this an async generator function
+
+    monkeypatch.setattr(Runner, "run_async", _raise_hallucinated_tool_call)
+
+    result = asyncio.run(diagnose_ticket(db_session, tracer, principal, ticket.id))
+
+    assert result.hallucinated_tool_call is True
+    assert result.ticket_id == ticket.id
+    # No real final-response event was ever observed before the
+    # hallucination -- an honest empty summary, never a fabricated one.
+    assert result.summary == ""
+    assert result.cited_chunks == []
+
+
+def test_diagnose_ticket_does_not_swallow_an_unrelated_value_error(db_session, tracer, monkeypatch):
+    """The catch added for the hallucinated-tool-call gap above is narrowly
+    scoped to that exact, stable ADK-internal message substring -- a
+    genuinely unrelated `ValueError` from `Runner.run_async` (e.g. a real
+    ADK/LiteLLM wiring bug unrelated to tool-call hallucination) must still
+    propagate, not be silently absorbed into a falsely-successful
+    `DiagnosisResult`.
+    """
+    from google.adk.runners import Runner
+
+    location = Location(name="Diag Unrelated HQ", region="US", timezone="America/Chicago")
+    department = Department(name="Diag Unrelated Eng")
+    db_session.add_all([location, department])
+    db_session.flush()
+
+    queue = Queue(name="Diag Unrelated Queue", department_id=department.id)
+    db_session.add(queue)
+    db_session.flush()
+
+    requester = Employee(
+        display_name="Diag Unrelated Requester",
+        email="diag.unrelated.requester@example.test",
+        title="Engineer",
+        hire_date="2024-01-01T00:00:00",
+        timezone=location.timezone,
+        location_id=location.id,
+        department_id=department.id,
+    )
+    db_session.add(requester)
+    db_session.flush()
+
+    ticket = Ticket(
+        subject="Unrelated ValueError probe",
+        category="hardware",
+        type="incident",
+        priority="medium",
+        queue_id=queue.id,
+        requester_id=requester.id,
+    )
+    db_session.add(ticket)
+    db_session.flush()
+
+    principal = Principal(employee_id=requester.id, roles=(RoleGrant(role="admin", scope="global"),))
+
+    async def _raise_unrelated_value_error(self, *args, **kwargs):
+        raise ValueError("some genuinely unrelated ADK/LiteLLM wiring error")
+        yield  # pragma: no cover -- makes this an async generator function
+
+    monkeypatch.setattr(Runner, "run_async", _raise_unrelated_value_error)
+
+    with pytest.raises(ValueError, match="some genuinely unrelated ADK/LiteLLM wiring error"):
+        asyncio.run(diagnose_ticket(db_session, tracer, principal, ticket.id))
+
+
+def test_diagnose_ticket_recovers_real_text_from_hallucinated_summary_argument(
+    db_session, tracer, monkeypatch
+):
+    """Real, reproduced finding (this phase's own Task 6 fresh-state run): the
+    hallucinated tool call's own `args` have been observed to carry the
+    model's genuine intended final answer under a "summary" key -- the model
+    tried to "submit" its real answer via a fake tool call shaped like a
+    function call instead of plain final text. None of this specialist's 4
+    real registered tools take a "summary" parameter, so recovering it in
+    this exact, narrow circumstance is reading real model output through the
+    wrong envelope, not fabricating one. This test proves that recovery
+    deterministically: a real ADK `Event` carrying the hallucinated
+    function_call is yielded first (exercising the SAME code path that reads
+    `part.function_call.args` for every real tool call), then the real
+    ValueError is raised on the next iteration, mirroring the exact sequence
+    observed live.
+    """
+    from google.adk.runners import Runner
+
+    location = Location(name="Diag Recovery HQ", region="US", timezone="America/Chicago")
+    department = Department(name="Diag Recovery Eng")
+    db_session.add_all([location, department])
+    db_session.flush()
+
+    queue = Queue(name="Diag Recovery Queue", department_id=department.id)
+    db_session.add(queue)
+    db_session.flush()
+
+    requester = Employee(
+        display_name="Diag Recovery Requester",
+        email="diag.recovery.requester@example.test",
+        title="Engineer",
+        hire_date="2024-01-01T00:00:00",
+        timezone=location.timezone,
+        location_id=location.id,
+        department_id=department.id,
+    )
+    db_session.add(requester)
+    db_session.flush()
+
+    ticket = Ticket(
+        subject="Recovery probe ticket",
+        category="hardware",
+        type="incident",
+        priority="medium",
+        queue_id=queue.id,
+        requester_id=requester.id,
+    )
+    db_session.add(ticket)
+    db_session.flush()
+
+    principal = Principal(employee_id=requester.id, roles=(RoleGrant(role="admin", scope="global"),))
+
+    recovered_text = "Ticket #999 is a real recovered diagnostic answer."
+
+    async def _yield_hallucinated_call_then_raise(self, *args, **kwargs):
+        yield Event(
+            author="diagnostic_specialist",
+            content=types.Content(
+                role="model",
+                parts=[
+                    types.Part(
+                        function_call=types.FunctionCall(
+                            name="diagnostic_specialist",
+                            args={"summary": recovered_text},
+                        )
+                    )
+                ],
+            ),
+        )
+        raise ValueError("Function diagnostic_specialist is not found in the tools_dict.")
+
+    monkeypatch.setattr(Runner, "run_async", _yield_hallucinated_call_then_raise)
+
+    result = asyncio.run(diagnose_ticket(db_session, tracer, principal, ticket.id))
+
+    assert result.hallucinated_tool_call is True
+    assert result.summary == recovered_text
+    assert result.tool_calls_made == ["diagnostic_specialist"]

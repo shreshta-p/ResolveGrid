@@ -360,6 +360,7 @@ async def diagnose_ticket_endpoint(
                     "tool_calls_made": result.tool_calls_made,
                     "turn_count": result.turn_count,
                     "model_calls_logged": result.model_calls_logged,
+                    "hallucinated_tool_call": result.hallucinated_tool_call,
                 }
             ),
         )
@@ -371,4 +372,12 @@ async def diagnose_ticket_endpoint(
         "citations": result.cited_chunks,
         "tool_calls_made": result.tool_calls_made,
         "thread_id": agent_run.thread_id,
+        # Real, honest signal (Phase 13 Task 6): a real, reproducible
+        # qwen3:14b behavior sometimes hallucinates its final answer as a
+        # fake tool call instead of plain final text (see `diagnostic_
+        # agent.diagnose_ticket`'s docstring) -- this run still completes
+        # cleanly (200, never a 502) either way, but the UI/caller can use
+        # this to show an honest "degraded run" indicator rather than
+        # silently treating every 200 as equally content-complete.
+        "hallucinated_tool_call": result.hallucinated_tool_call,
     }
