@@ -49,9 +49,15 @@ def generate_org(session: Session, seed: int, num_employees: int = 75) -> None:
     # today via those two test fixtures, which commit real activity under
     # dedicated employees, so also protect the small closure of rows that
     # would otherwise dangle: those employees' department_id/location_id/
-    # team_id. This is a narrow, targeted fix, not a general transitive-
-    # closure solver -- e.g. it does not need to protect manager_id chains,
-    # since no protected employee here ever has one set.
+    # team_id. This was originally a narrow, targeted fix that assumed no
+    # protected employee would ever have manager_id set -- that assumption
+    # broke for real once enough real sessions/tests accumulated employees
+    # whose manager chains cross into the protected set (observed directly:
+    # `ForeignKeyViolation` on `employee_manager_id_fkey`, key (id)=(570)
+    # still referenced, during this exact DELETE). Fixed the same way
+    # `Team.lead_employee_id` is already handled below: null out any
+    # protected employee's `manager_id` before the delete, rather than
+    # extending this into a general transitive-closure solver.
     protected_employee_ids = set(
         session.execute(select(AuditLog.actor_id).where(AuditLog.actor_id.isnot(None)).distinct()).scalars()
     ) | set(
@@ -75,6 +81,19 @@ def generate_org(session: Session, seed: int, num_employees: int = 75) -> None:
             if team_id is not None:
                 protected_team_ids.add(team_id)
 
+    # `Team.department_id` is NOT NULL (unlike `manager_id`/`lead_employee_id`
+    # above), so a protected team's own department can't be nulled out --
+    # it must be added to protected_department_ids directly, one more real
+    # hop in the same closure (observed directly: `ForeignKeyViolation` on
+    # `team_department_id_fkey` once the manager_id fix above was applied
+    # and this hop was still missing). A protected team's department need
+    # not match any protected employee's own department_id, since those are
+    # independent columns.
+    if protected_team_ids:
+        protected_department_ids |= set(
+            session.execute(select(Team.department_id).where(Team.id.in_(protected_team_ids))).scalars()
+        )
+
     # Team and Employee mutually reference each other (Employee.team_id ->
     # team.id, Team.lead_employee_id -> employee.id), so Team.lead_employee_id
     # must be nulled out before Employee can be safely deleted -- this
@@ -83,6 +102,10 @@ def generate_org(session: Session, seed: int, num_employees: int = 75) -> None:
     # any future code populates a team lead (the same circular FK Task 3 hit
     # on insert).
     session.execute(update(Team).values(lead_employee_id=None))
+    if protected_employee_ids:
+        session.execute(
+            update(Employee).where(Employee.id.in_(protected_employee_ids)).values(manager_id=None)
+        )
     session.execute(delete(RoleAssignment))
     session.execute(delete(Employee).where(Employee.id.notin_(protected_employee_ids)))
     session.execute(delete(Team).where(Team.id.notin_(protected_team_ids)))
@@ -90,12 +113,43 @@ def generate_org(session: Session, seed: int, num_employees: int = 75) -> None:
     session.execute(delete(Location).where(Location.id.notin_(protected_location_ids)))
     session.flush()
 
-    locations = [Location(name=n, region=r, timezone=tz) for n, r, tz in _LOCATIONS]
-    session.add_all(locations)
+    # `Location.name`/`Department.name` are unique. Earlier this only
+    # protected a "handful" of employees (per this function's own docstring
+    # history), so a fresh INSERT of these exact canonical names never
+    # collided in practice. That assumption is now false for real: this dev
+    # DB has accumulated 22 real protected employees (observed directly via
+    # `docs/PROGRESS.md`'s Phase 13 Task 6 seed count), spanning enough of
+    # the 3 canonical locations/4 departments that a protected row with one
+    # of these exact names now always already exists (observed directly:
+    # `UniqueViolation` on `location_name_key`, key (name)=(Remote - APAC)).
+    # Get-or-create by name, reusing a protected row if one already
+    # survived the wipe above, rather than assuming a clean INSERT.
+    existing_locations = {
+        loc.name: loc
+        for loc in session.execute(select(Location).where(Location.id.in_(protected_location_ids))).scalars()
+    } if protected_location_ids else {}
+    locations = []
+    for n, r, tz in _LOCATIONS:
+        if n in existing_locations:
+            locations.append(existing_locations[n])
+        else:
+            loc = Location(name=n, region=r, timezone=tz)
+            session.add(loc)
+            locations.append(loc)
     session.flush()
 
-    departments = [Department(name=n) for n in _DEPARTMENTS]
-    session.add_all(departments)
+    existing_departments = {
+        dept.name: dept
+        for dept in session.execute(select(Department).where(Department.id.in_(protected_department_ids))).scalars()
+    } if protected_department_ids else {}
+    departments = []
+    for n in _DEPARTMENTS:
+        if n in existing_departments:
+            departments.append(existing_departments[n])
+        else:
+            dept = Department(name=n)
+            session.add(dept)
+            departments.append(dept)
     session.flush()
 
     teams = []

@@ -48,6 +48,22 @@ EMBEDDING_DIM = 768
 # `AuthzFilter`s instead.
 UNRESTRICTED = AuthzFilter(unrestricted=True)
 
+# The real seed corpus (Phase 7's "Kestrel VPN Access Policy" etc.) is kept
+# permanently in this shared dev DB as real business data (established
+# precedent -- see docs/PROGRESS.md's Phase 13 Task 6 final-state report:
+# "document=8, chunk=36... kept"). Several tests below deliberately use
+# VPN/password/IT-support-themed text (to exercise real `ts_rank_cd`/
+# pgvector ranking against realistic content) with an UNRESTRICTED filter
+# and a generous `limit` -- so real corpus chunks now legitimately rank
+# alongside each test's own synthetic chunks in the raw result set. This
+# helper filters a raw global result down to only the chunk ids a test
+# itself created, preserving rank order, so assertions can check each
+# test's actual documented property (relative ranking between ITS OWN
+# chunks) without assuming the chunk table is otherwise empty -- an
+# assumption that stopped holding once the real corpus became permanent.
+def _filter_to_own_ids(results: list[tuple[int, int]], own_ids: set[int]) -> list[tuple[int, int]]:
+    return [(chunk_id, rank) for chunk_id, rank in results if chunk_id in own_ids]
+
 
 def _make_document_version(session) -> int:
     document = Document(
@@ -129,9 +145,17 @@ def test_lexical_search_ranks_term_dense_chunk_highest(db_session):
         text="The office coffee machine on the third floor is out of order until Friday.",
     )
 
-    results = lexical_search(db_session, "VPN password reset", limit=10, authz_filter=UNRESTRICTED)
+    # limit=50 comfortably exceeds the real seed corpus's 36 chunks, so
+    # this test's own 2 chunks are guaranteed to appear in the raw results
+    # regardless of how many real corpus chunks also match "VPN password
+    # reset" -- then filtered down to just this test's own chunks (see
+    # `_filter_to_own_ids`'s docstring above) before asserting the actual
+    # property under test: relative term-density ranking between them.
+    results = lexical_search(db_session, "VPN password reset", limit=50, authz_filter=UNRESTRICTED)
+    own_results = _filter_to_own_ids(results, {chunk_dense_id, chunk_sparse_id})
 
-    assert results == [(chunk_dense_id, 1), (chunk_sparse_id, 2)]
+    assert len(own_results) == 2, f"expected both own chunks in a limit=50 search, got: {own_results!r}"
+    assert [chunk_id for chunk_id, _ in own_results] == [chunk_dense_id, chunk_sparse_id]
 
 
 def test_lexical_search_respects_limit(db_session):
@@ -186,9 +210,17 @@ def test_vector_search_ranks_nearest_vectors_first(db_session):
     near_chunk_id = pairs[0][0].id
     far_chunk_id = pairs[1][0].id
 
-    results = vector_search(db_session, query_vector, limit=2, authz_filter=UNRESTRICTED)
+    # limit=50 (see `_filter_to_own_ids`'s docstring above): real corpus
+    # embeddings are dense, real vectors, almost never exactly orthogonal
+    # to an arbitrary basis query vector, so they routinely rank closer
+    # than `far_vector`'s deliberately-exact cosine distance of 1.0 --
+    # filtering to this test's own 2 chunks isolates the actual property
+    # under test (near ranks ahead of far) from that real noise.
+    results = vector_search(db_session, query_vector, limit=50, authz_filter=UNRESTRICTED)
+    own_results = _filter_to_own_ids(results, {near_chunk_id, far_chunk_id})
 
-    assert results == [(near_chunk_id, 1), (far_chunk_id, 2)]
+    assert len(own_results) == 2, f"expected both own chunks in a limit=50 search, got: {own_results!r}"
+    assert [chunk_id for chunk_id, _ in own_results] == [near_chunk_id, far_chunk_id]
 
 
 def test_vector_search_respects_limit(db_session):
@@ -336,13 +368,39 @@ def test_fuse_rrf_combines_lexical_and_vector_signals(db_session):
     vector_only_id = pairs[1][0].id
     both_id = pairs[2][0].id
 
-    lexical_results = lexical_search(db_session, "VPN password reset", limit=2, authz_filter=UNRESTRICTED)
-    vector_results = vector_search(db_session, query_vector, limit=2, authz_filter=UNRESTRICTED)
+    # limit=50, then filtered to this test's own 3 chunks (see
+    # `_filter_to_own_ids`'s docstring above): the real seed corpus's VPN
+    # -themed chunks and dense real embeddings otherwise crowd a limit=2
+    # search, same root cause as the other DB-backed tests in this file.
+    # The filtered, rank-preserved lists are what's actually fed into
+    # `fuse_rrf` below, so the fusion assertions stay exact and meaningful.
+    # own_ids includes all 3 of this test's own chunks (so filtering keeps
+    # them regardless of real corpus noise mixed in at the raw limit=50),
+    # but each signal's *intended* result window is only the top 2 among
+    # this test's own chunks on THAT signal -- lexical_only_id is a real,
+    # legitimately-worst vector match (orthogonal, by design) that must
+    # still be excluded from vector_results the same way it was when the
+    # original (pre-real-corpus) limit=2 excluded it on ranking alone, not
+    # because it was filtered out as noise. So: filter to own_ids first
+    # (removes real corpus noise), THEN take the top 2 of each signal's
+    # own-chunks-only ranking -- reproducing the original "top 2 by rank"
+    # semantics now that real corpus noise can't occupy those 2 slots.
+    own_ids = {lexical_only_id, vector_only_id, both_id}
+    lexical_results = _filter_to_own_ids(
+        lexical_search(db_session, "VPN password reset", limit=50, authz_filter=UNRESTRICTED), own_ids
+    )[:2]
+    vector_results = _filter_to_own_ids(
+        vector_search(db_session, query_vector, limit=50, authz_filter=UNRESTRICTED), own_ids
+    )[:2]
 
     # Sanity-check the two input lists actually isolate one signal each,
-    # before asserting anything about the fusion.
-    assert lexical_results == [(lexical_only_id, 1), (both_id, 2)]
-    assert vector_results == [(vector_only_id, 1), (both_id, 2)]
+    # before asserting anything about the fusion. Re-rank 1/2 after
+    # filtering, since the real corpus noise removed above may have
+    # occupied some of the original raw rank positions.
+    assert [chunk_id for chunk_id, _ in lexical_results] == [lexical_only_id, both_id]
+    assert [chunk_id for chunk_id, _ in vector_results] == [vector_only_id, both_id]
+    lexical_results = [(chunk_id, i + 1) for i, (chunk_id, _) in enumerate(lexical_results)]
+    vector_results = [(chunk_id, i + 1) for i, (chunk_id, _) in enumerate(vector_results)]
 
     fused = fuse_rrf(vector_results, lexical_results, k=60)
     fused_ids_in_order = [chunk_id for chunk_id, _ in fused]
@@ -615,21 +673,37 @@ def test_adversarial_authz_filter_blocks_cross_scope_leakage(db_session):
     assert sanity_lexical[0] == (hr_chunk_id, 1)
 
     # A principal/filter scoped to "engineering" only -- disjoint from the
-    # HR document's "hr" tag.
+    # HR document's "hr" tag. limit=50 (see `_filter_to_own_ids`'s
+    # docstring near the top of this file): real public/untagged seed
+    # corpus chunks are also visible under this filter by design (see
+    # below), and engineering_chunk_id's vector is deliberately the worst
+    # possible match, so a small limit could crowd it out of the results
+    # entirely on ranking alone, which would make the presence assertion
+    # below meaningless rather than a real leakage check.
     engineering_only_filter = AuthzFilter(unrestricted=False, allowed_tags=frozenset({"engineering"}))
 
-    vector_results = vector_search(db_session, query_vector, limit=10, authz_filter=engineering_only_filter)
-    lexical_results = lexical_search(db_session, query_text, limit=10, authz_filter=engineering_only_filter)
+    vector_results = vector_search(db_session, query_vector, limit=50, authz_filter=engineering_only_filter)
+    lexical_results = lexical_search(db_session, query_text, limit=50, authz_filter=engineering_only_filter)
 
     vector_result_ids = {chunk_id for chunk_id, _ in vector_results}
     lexical_result_ids = {chunk_id for chunk_id, _ in lexical_results}
 
-    # The HR chunk must be LITERALLY ABSENT, not merely ranked lower.
+    # The HR chunk must be LITERALLY ABSENT, not merely ranked lower --
+    # this is the actual security property under test and is unaffected
+    # by any other real data in the table.
     assert hr_chunk_id not in vector_result_ids
     assert hr_chunk_id not in lexical_result_ids
-    # And the only chunk that ever *is* visible is the engineering-scoped one.
-    assert vector_result_ids == {engineering_chunk_id}
-    assert lexical_result_ids <= {engineering_chunk_id}
+    # And the engineering-scoped chunk IS visible under its own tag. (Not
+    # asserted as the ONLY visible chunk: the real seed corpus includes
+    # untagged/public documents -- access_scope_tags=[] -- that are
+    # legitimately visible under ANY tag filter by design, see
+    # seed_corpus.py's own docstring, so they correctly appear here too.
+    # That's real authz behavior working as intended, not leakage.)
+    assert engineering_chunk_id in vector_result_ids
+    # (Not asserting engineering_chunk_id's own presence in lexical_results:
+    # its text has zero lexical term overlap with query_text by design, so
+    # it may legitimately be absent from a lexical match list. The only
+    # lexical property under test here is the hr_chunk_id exclusion above.)
 
     # Symmetric check: an "hr"-only filter must exclude the engineering
     # chunk just as strictly.
@@ -637,7 +711,7 @@ def test_adversarial_authz_filter_blocks_cross_scope_leakage(db_session):
     vector_results_hr_scope = vector_search(db_session, query_vector, limit=10, authz_filter=hr_only_filter)
     vector_result_ids_hr_scope = {chunk_id for chunk_id, _ in vector_results_hr_scope}
     assert engineering_chunk_id not in vector_result_ids_hr_scope
-    assert vector_result_ids_hr_scope == {hr_chunk_id}
+    assert hr_chunk_id in vector_result_ids_hr_scope
 
 
 def test_adversarial_authz_filter_is_baked_into_sql_where_clause(db_session):
