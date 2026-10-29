@@ -10,6 +10,7 @@ from resolvegrid_api.models.knowledge import (
     IngestionRun,
     SemanticResponseCache,
 )
+from resolvegrid_api.models.load_test import LoadTestRun
 from resolvegrid_api.models.org import (
     AccessGroup,
     Department,
@@ -44,6 +45,7 @@ __all__ = [
     "EvalRun",
     "IngestionRun",
     "Location",
+    "LoadTestRun",
     "ModelCall",
     "PricingVersion",
     "Queue",
