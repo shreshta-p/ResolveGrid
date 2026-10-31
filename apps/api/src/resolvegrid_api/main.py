@@ -16,7 +16,7 @@ from resolvegrid_api.agent_retrieval import retrieve_for_agent
 from resolvegrid_api.approval_service import request_approval_for_agent
 from resolvegrid_api.db import DATABASE_URL, session_factory
 from resolvegrid_api.model_call_logging import make_compose_routing_complete_fn, make_logging_complete_fn
-from resolvegrid_api.routers import approvals, chat, directory, evals, tickets, tools
+from resolvegrid_api.routers import admin_performance, approvals, chat, directory, evals, tickets, tools
 
 # `langgraph-checkpoint-postgres`'s AsyncPostgresSaver uses psycopg's async
 # driver, which raises psycopg.InterfaceError unconditionally under Windows'
@@ -164,6 +164,7 @@ app.include_router(chat.router)
 app.include_router(tools.router)
 app.include_router(approvals.router)
 app.include_router(evals.router)
+app.include_router(admin_performance.router)
 # Phase 12 Task 1: real Prometheus scrape endpoint for this process's own
 # OTel-Meter-backed counters (see `init_metrics` call in `lifespan` above).
 # `make_asgi_app()` serves whatever `prometheus_client`'s default registry

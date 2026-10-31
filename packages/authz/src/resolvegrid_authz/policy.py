@@ -70,6 +70,13 @@ _STAFF_ONLY_ACTIONS = {
     "approval.decide",
     "eval.view",
     "ticket.diagnose",
+    # Phase 14 Task 3: the admin performance dashboard aggregates
+    # AgentRun/Span/ModelCall rows across every employee's activity
+    # (latency, cache hits, token/cost totals) -- never a single
+    # employee's own resource -- so a plain employee with no
+    # admin/department-scoped analyst-or-approver grant is denied
+    # outright, mirroring "eval.view"'s identical precedent above.
+    "performance.view",
 }
 
 _KNOWN_ACTIONS = _SELF_SCOPED_ACTIONS | _STAFF_ONLY_ACTIONS
