@@ -159,6 +159,29 @@ def generate_org(session: Session, seed: int, num_employees: int = 75) -> None:
     session.add_all(teams)
     session.flush()
 
+    # `fake.unique.email()` only guarantees uniqueness WITHIN this Faker
+    # instance's own generation history -- it has no idea a real protected
+    # employee (see the wipe logic above) might already hold that exact
+    # email in the DB. This was never hit in practice while the protected
+    # set stayed small, but a real load test (Phase 14 Task 2) exercised
+    # real endpoints under most of this org's employees, growing the
+    # protected set large enough that a real `UniqueViolation` on
+    # `employee_email_key` was observed directly. Re-roll (bounded) on a
+    # collision against a real protected email instead of assuming
+    # `fake.unique` already accounts for rows it has never seen.
+    protected_emails: set[str] = set()
+    if protected_employee_ids:
+        protected_emails = set(
+            session.execute(select(Employee.email).where(Employee.id.in_(protected_employee_ids))).scalars()
+        )
+
+    def _unique_email() -> str:
+        for _ in range(50):
+            candidate = fake.unique.email()
+            if candidate not in protected_emails:
+                return candidate
+        raise RuntimeError("could not generate an email not already held by a protected employee")
+
     employees: list[Employee] = []
     for i in range(num_employees):
         dept = departments[i % len(departments)]
@@ -167,7 +190,7 @@ def generate_org(session: Session, seed: int, num_employees: int = 75) -> None:
         employees.append(
             Employee(
                 display_name=fake.name(),
-                email=fake.unique.email(),
+                email=_unique_email(),
                 title=fake.job(),
                 employment_status="active",
                 hire_date=fake.date_time_this_decade(),

@@ -80,7 +80,7 @@ import httpx
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from resolvegrid_api.models import Employee, LoadTestRun, Queue, Ticket
+from resolvegrid_api.models import Employee, LoadTestRun, Queue, RoleAssignment, Ticket
 
 _REPO_ROOT = Path(__file__).resolve().parents[4]
 
@@ -363,6 +363,43 @@ def fetch_real_queue_ids(session: Session) -> list[int]:
     return ids
 
 
+def fetch_real_diagnose_capable_employee_ids(session: Session) -> list[int]:
+    """Real `Employee.id` values that can actually pass `packages/authz`'s
+    `authorize(principal, "ticket.diagnose")` check -- a real gap found
+    while running this harness against the live stack (Task 2): `ticket.
+    diagnose` is in `_STAFF_ONLY_ACTIONS` (`policy.py`), denied outright
+    for a principal with no global-admin or department-scoped analyst/
+    approver grant. The original `build_workload_mix` drew EVERY kind's
+    `employee_id` (including "diagnose") from `fetch_real_employee_ids`'s
+    full active-employee pool -- realistic for "chat"/"create_ticket"
+    (any employee may ask a question or file a ticket) but not for
+    "diagnose" (only IT staff run ticket diagnosis in this product), and
+    in practice meant ~90% of sampled "diagnose" calls would 403 against
+    this seeded org (6 of 58 active employees hold any role grant).
+    Restricted here to global admins (`role="admin", scope="global"`,
+    which `_is_global_admin`/`authorize()` let diagnose ANY ticket
+    regardless of department) -- the smallest real pool that reliably
+    reflects actual product usage without depending on which specific
+    ticket's queue/department a department-scoped analyst grant happens
+    to cover. Raises if none exist, exactly like the other `fetch_real_*`
+    helpers: a load test must never fabricate a fake staff id.
+    """
+    ids = list(
+        session.scalars(
+            select(RoleAssignment.employee_id).where(
+                RoleAssignment.role == "admin", RoleAssignment.scope == "global"
+            )
+        ).all()
+    )
+    if not ids:
+        raise ValueError(
+            "no global-admin RoleAssignment rows found -- a load test including "
+            "'diagnose' needs at least one real employee who can pass the "
+            "ticket.diagnose staff-only authz check"
+        )
+    return sorted(set(ids))
+
+
 def fetch_real_ticket_ids(session: Session) -> list[int]:
     """Real `Ticket.id` values currently in the DB, if any. Empty is a
     valid, expected answer in a freshly seeded dev DB (tickets only exist
@@ -413,6 +450,13 @@ def build_workload_mix(
     queue_ids = fetch_real_queue_ids(session) if "create_ticket" in effective_mix else []
     chat_questions = load_real_chat_questions() if "chat" in effective_mix else []
     ticket_descriptions = load_real_ticket_descriptions() if "create_ticket" in effective_mix else []
+    # "diagnose" needs its OWN employee pool, not `employee_ids` -- see
+    # `fetch_real_diagnose_capable_employee_ids`'s docstring for why most
+    # of the general active-employee pool would 403 against the real
+    # ticket.diagnose staff-only authz check.
+    diagnose_employee_ids = (
+        fetch_real_diagnose_capable_employee_ids(session) if "diagnose" in effective_mix else []
+    )
 
     kinds = list(effective_mix.keys())
     weights = list(effective_mix.values())
@@ -420,12 +464,11 @@ def build_workload_mix(
     items: list[WorkloadItem] = []
     for _ in range(size):
         kind = rng.choices(kinds, weights=weights, k=1)[0]
-        employee_id = rng.choice(employee_ids)
         if kind == "chat":
             items.append(
                 WorkloadItem(
                     kind="chat",
-                    employee_id=employee_id,
+                    employee_id=rng.choice(employee_ids),
                     payload={"message": rng.choice(chat_questions)},
                 )
             )
@@ -434,7 +477,7 @@ def build_workload_mix(
             items.append(
                 WorkloadItem(
                     kind="create_ticket",
-                    employee_id=employee_id,
+                    employee_id=rng.choice(employee_ids),
                     payload={
                         "subject": text[:200],
                         "body": text,
@@ -448,7 +491,7 @@ def build_workload_mix(
             items.append(
                 WorkloadItem(
                     kind="diagnose",
-                    employee_id=employee_id,
+                    employee_id=rng.choice(diagnose_employee_ids),
                     path_params={"ticket_id": rng.choice(ticket_ids)},
                 )
             )

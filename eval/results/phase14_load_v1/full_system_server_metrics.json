@@ -1,0 +1,218 @@
+{
+  "label": "full_system",
+  "run_id": 16,
+  "git_commit": "2402a2a397d779b1f346cd9555727348ae84e9cf",
+  "client_summary": {
+    "total_requests": 1151,
+    "actual_wall_clock_seconds": 3206.2584067001007,
+    "client_throughput_rps": 0.3589854135258598,
+    "overall": {
+      "count": 1151,
+      "p50_latency_s": 0.03616060013882816,
+      "p95_latency_s": 55.84734467985108,
+      "p99_latency_s": 68.81634931602512,
+      "mean_latency_s": 14.068376386985507,
+      "transport_error_count": 6,
+      "non_2xx_count": 7,
+      "status_code_counts": {
+        "200": 731,
+        "201": 407,
+        "502": 7,
+        "None": 6
+      }
+    },
+    "by_kind": {
+      "create_ticket": {
+        "count": 407,
+        "p50_latency_s": 0.01852579996921122,
+        "p95_latency_s": 0.03694726007524877,
+        "p99_latency_s": 0.07878135018050669,
+        "mean_latency_s": 0.030303009830904937,
+        "transport_error_count": 0,
+        "non_2xx_count": 0,
+        "status_code_counts": {
+          "201": 407
+        }
+      },
+      "chat": {
+        "count": 580,
+        "p50_latency_s": 11.486379700014368,
+        "p95_latency_s": 48.40409039001679,
+        "p99_latency_s": 60.812580426160714,
+        "mean_latency_s": 15.267113615685256,
+        "transport_error_count": 0,
+        "non_2xx_count": 7,
+        "status_code_counts": {
+          "200": 573,
+          "502": 7
+        }
+      },
+      "diagnose": {
+        "count": 164,
+        "p50_latency_s": 44.79466805001721,
+        "p95_latency_s": 71.39866317012348,
+        "p99_latency_s": 91.12554731200225,
+        "mean_latency_s": 45.82931481645431,
+        "transport_error_count": 6,
+        "non_2xx_count": 0,
+        "status_code_counts": {
+          "200": 158,
+          "None": 6
+        }
+      }
+    },
+    "429_count_create_ticket": 0,
+    "redis_keyspace_hits_delta": 1037,
+    "redis_keyspace_misses_delta": 546
+  },
+  "server_metrics": {
+    "window_start": "2026-10-29T18:41:29.338074",
+    "window_end": "2026-10-29T19:36:55.596492",
+    "agent_run": {
+      "total": 724,
+      "status_counts": {
+        "completed": 717,
+        "error": 7
+      },
+      "cache_hit_count": 261,
+      "cache_hit_rate": 0.36049723756906077,
+      "cache_hit_kind_counts": {
+        "exact": 261
+      },
+      "latency_ms_percentiles": {
+        "p50": 19362.39,
+        "p95": 61061.99759999997,
+        "p99": 96456.87124000042,
+        "mean": 22280.77071827057
+      }
+    },
+    "agent_run_by_classification": {
+      "chat": {
+        "n": 553,
+        "p50_ms": 7503.412,
+        "p95_ms": 45577.68099999999,
+        "p99_ms": 59700.12600000002,
+        "mean_ms": 14290.014019891501
+      },
+      "diagnose": {
+        "n": 164,
+        "p50_ms": 45270.4375,
+        "p95_ms": 84508.57029999995,
+        "p99_ms": 141440.14694,
+        "mean_ms": 49225.212512195125
+      }
+    },
+    "span_by_stage": {
+      "classify_intent": {
+        "p50_ms": 1503.0,
+        "p95_ms": 28316.599999999988,
+        "p99_ms": 43220.04000000005,
+        "mean_ms": 7123.215189873417,
+        "n": 553
+      },
+      "compose_response": {
+        "p50_ms": 3198.0,
+        "p95_ms": 22486.399999999998,
+        "p99_ms": 36532.04,
+        "mean_ms": 6513.605786618445,
+        "n": 553
+      },
+      "diagnose_ticket": {
+        "p50_ms": 45328.5,
+        "p95_ms": 84393.69999999995,
+        "p99_ms": 141462.94,
+        "mean_ms": 49225.78048780488,
+        "n": 164
+      },
+      "finalize": {
+        "p50_ms": 0.0,
+        "p95_ms": 0.0,
+        "p99_ms": 0.0,
+        "mean_ms": 0.0,
+        "n": 553
+      },
+      "retrieve": {
+        "p50_ms": 4.0,
+        "p95_ms": 1461.1999999999998,
+        "p99_ms": 1778.1200000000008,
+        "mean_ms": 438.6401446654611,
+        "n": 553
+      }
+    },
+    "model_call_by_purpose": [
+      {
+        "purpose": "diagnostic.specialist_turn",
+        "provider": "ollama",
+        "model": "local-qwen3",
+        "n": 476,
+        "input_tokens": 1000300,
+        "output_tokens": 40435,
+        "cost_usd": 0.0,
+        "mean_latency_ms": "16936.163865546218",
+        "error_count": 0
+      },
+      {
+        "purpose": "chat.classify_intent",
+        "provider": "ollama",
+        "model": "local-qwen3",
+        "n": 317,
+        "input_tokens": 26289,
+        "output_tokens": 4650,
+        "cost_usd": 0.0,
+        "mean_latency_ms": "13070.659305993691",
+        "error_count": 7
+      },
+      {
+        "purpose": "chat.compose_response",
+        "provider": "ollama",
+        "model": "local-qwen3",
+        "n": 274,
+        "input_tokens": 372157,
+        "output_tokens": 12637,
+        "cost_usd": 0.0,
+        "mean_latency_ms": "13107.532846715328",
+        "error_count": 0
+      },
+      {
+        "purpose": "chat.cache_hit",
+        "provider": "ollama",
+        "model": "local-qwen3",
+        "n": 239,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cost_usd": 0.0,
+        "mean_latency_ms": "0E-20",
+        "error_count": 0
+      },
+      {
+        "purpose": "chat.compose_response",
+        "provider": "anthropic",
+        "model": "cloud-primary",
+        "n": 36,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cost_usd": 0.0,
+        "mean_latency_ms": "0E-20",
+        "error_count": 36
+      },
+      {
+        "purpose": "chat.cache_hit",
+        "provider": "anthropic",
+        "model": "cloud-primary",
+        "n": 24,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cost_usd": 0.0,
+        "mean_latency_ms": "0E-20",
+        "error_count": 0
+      }
+    ],
+    "model_call_totals": {
+      "total_cost_usd": 0.0,
+      "total_calls": 1366
+    }
+  },
+  "cost_per_request_usd": 0.0,
+  "cost_per_successful_task_usd": 0.0,
+  "redis_keyspace_hit_rate_delta": 0.655085281111813
+}

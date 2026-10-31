@@ -1,0 +1,152 @@
+{
+  "label": "baseline",
+  "run_id": 17,
+  "git_commit": "2402a2a397d779b1f346cd9555727348ae84e9cf",
+  "client_summary": {
+    "total_requests": 1151,
+    "actual_wall_clock_seconds": 2242.6058777999133,
+    "client_throughput_rps": 0.513242211390785,
+    "overall": {
+      "count": 1151,
+      "p50_latency_s": 10.539043699856848,
+      "p95_latency_s": 24.72233999997843,
+      "p99_latency_s": 29.512918050051667,
+      "mean_latency_s": 9.214123013377963,
+      "transport_error_count": 0,
+      "non_2xx_count": 0,
+      "status_code_counts": {
+        "200": 694,
+        "201": 457
+      }
+    },
+    "by_kind": {
+      "create_ticket": {
+        "count": 457,
+        "p50_latency_s": 0.01851120009087026,
+        "p95_latency_s": 0.035656779911369084,
+        "p99_latency_s": 0.04889476789161563,
+        "mean_latency_s": 0.02069602910372178,
+        "transport_error_count": 0,
+        "non_2xx_count": 0,
+        "status_code_counts": {
+          "201": 457
+        }
+      },
+      "chat": {
+        "count": 694,
+        "p50_latency_s": 13.860571099910885,
+        "p95_latency_s": 27.110581184935292,
+        "p99_latency_s": 30.628550464808956,
+        "mean_latency_s": 15.268007929535496,
+        "transport_error_count": 0,
+        "non_2xx_count": 0,
+        "status_code_counts": {
+          "200": 694
+        }
+      }
+    },
+    "429_count_create_ticket": 0,
+    "redis_keyspace_hits_delta": 694,
+    "redis_keyspace_misses_delta": 0
+  },
+  "server_metrics": {
+    "window_start": "2026-10-29T19:40:02.598799",
+    "window_end": "2026-10-29T20:19:25.204684",
+    "agent_run": {
+      "total": 674,
+      "status_counts": {
+        "completed": 674
+      },
+      "cache_hit_count": 0,
+      "cache_hit_rate": 0.0,
+      "cache_hit_kind_counts": {},
+      "latency_ms_percentiles": {
+        "p50": 13845.7045,
+        "p95": 27232.275550000002,
+        "p99": 30630.072969999994,
+        "mean": 15226.955066765579
+      }
+    },
+    "agent_run_by_classification": {
+      "chat": {
+        "n": 674,
+        "p50_ms": 13845.7045,
+        "p95_ms": 27232.275550000002,
+        "p99_ms": 30630.072969999994,
+        "mean_ms": 15226.955066765579
+      }
+    },
+    "span_by_stage": {
+      "classify_intent": {
+        "p50_ms": 5498.5,
+        "p95_ms": 16480.350000000002,
+        "p99_ms": 22043.339999999997,
+        "mean_ms": 6800.89762611276,
+        "n": 674
+      },
+      "compose_response": {
+        "p50_ms": 6406.0,
+        "p95_ms": 17664.45,
+        "p99_ms": 23578.389999999992,
+        "mean_ms": 8050.584569732938,
+        "n": 674
+      },
+      "finalize": {
+        "p50_ms": 0.0,
+        "p95_ms": 0.0,
+        "p99_ms": 0.0,
+        "mean_ms": 0.0,
+        "n": 674
+      },
+      "retrieve": {
+        "p50_ms": 57.0,
+        "p95_ms": 76.0,
+        "p99_ms": 92.0,
+        "mean_ms": 59.989614243323444,
+        "n": 674
+      }
+    },
+    "model_call_by_purpose": [
+      {
+        "purpose": "chat.classify_intent",
+        "provider": "ollama",
+        "model": "local-qwen3",
+        "n": 696,
+        "input_tokens": 58986,
+        "output_tokens": 10440,
+        "cost_usd": 0.0,
+        "mean_latency_ms": "6776.0086206896551724",
+        "error_count": 0
+      },
+      {
+        "purpose": "chat.compose_response",
+        "provider": "ollama",
+        "model": "local-qwen3",
+        "n": 612,
+        "input_tokens": 832167,
+        "output_tokens": 28254,
+        "cost_usd": 0.0,
+        "mean_latency_ms": "8329.8937908496732026",
+        "error_count": 0
+      },
+      {
+        "purpose": "chat.compose_response",
+        "provider": "anthropic",
+        "model": "cloud-primary",
+        "n": 84,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cost_usd": 0.0,
+        "mean_latency_ms": "0E-20",
+        "error_count": 84
+      }
+    ],
+    "model_call_totals": {
+      "total_cost_usd": 0.0,
+      "total_calls": 1392
+    }
+  },
+  "cost_per_request_usd": 0.0,
+  "cost_per_successful_task_usd": 0.0,
+  "redis_keyspace_hit_rate_delta": 1.0
+}

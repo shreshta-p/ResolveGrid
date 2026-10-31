@@ -1,3 +1,4 @@
+import os
 import time
 from datetime import datetime, timezone
 from uuid import uuid4
@@ -38,6 +39,22 @@ tracer = trace.get_tracer(__name__)
 # `build_graph`'s real node count) and for why their latency_ms values are
 # now genuinely measured per-node, not a split placeholder.
 _STAGE_NAMES = ("classify_intent", "retrieve", "compose_response", "finalize")
+
+# Phase 14 Task 2: real config toggles for the baseline (pre-Phase-12
+# caching) load-test condition -- same module-level os.environ.get
+# convention as db.py/cache.py, read once at process start. See
+# agent_retrieval.py's matching `_RERANK_ENABLED`/`_RETRIEVAL_CACHE_
+# ENABLED` for the reranker/retrieval-cache half of this same toggle set.
+_RESPONSE_CACHE_ENABLED = os.environ.get("RESOLVEGRID_RESPONSE_CACHE_ENABLED", "true").lower() not in (
+    "0",
+    "false",
+    "no",
+)
+_SEMANTIC_CACHE_ENABLED = os.environ.get("RESOLVEGRID_SEMANTIC_CACHE_ENABLED", "true").lower() not in (
+    "0",
+    "false",
+    "no",
+)
 
 # Shown when retrieval ran but found nothing sufficient to cite -- a real
 # knowledge base exists (Phase 7), so this is no longer "no KB yet" (that
@@ -193,12 +210,16 @@ async def chat(
     with tracer.start_as_current_span("chat.cache_lookup") as cache_span:
         cache_span.set_attribute("resolvegrid.thread_id", thread_id)
         cache_lookup_start = time.monotonic()
-        cached_response = lookup_cached_response(
-            message_text=payload.message,
-            kb_version=kb_version,
-            scope_sig=scope_sig,
-            prompt_template_version=PROMPT_TEMPLATE_VERSION,
-            redis_client=redis_client,
+        cached_response = (
+            lookup_cached_response(
+                message_text=payload.message,
+                kb_version=kb_version,
+                scope_sig=scope_sig,
+                prompt_template_version=PROMPT_TEMPLATE_VERSION,
+                redis_client=redis_client,
+            )
+            if _RESPONSE_CACHE_ENABLED
+            else None
         )
         cache_lookup_latency_ms = int((time.monotonic() - cache_lookup_start) * 1000)
         cache_span.set_attribute("resolvegrid.cache_hit", cached_response is not None)
@@ -265,30 +286,35 @@ async def chat(
     # real graph still runs and still answers the question.
     query_embedding: list[float] | None = None
     semantic_cached_response: dict | None = None
-    with tracer.start_as_current_span("chat.semantic_cache_lookup") as semantic_cache_span:
-        semantic_cache_span.set_attribute("resolvegrid.thread_id", thread_id)
-        semantic_lookup_start = time.monotonic()
-        try:
-            query_embedding = get_or_compute_embeddings(
-                [payload.message],
-                model=DEFAULT_EMBEDDING_MODEL,
-                redis_client=redis_client,
-                embed_fn=embed_texts,
-            )[0]
-        except EmbeddingError:
-            query_embedding = None
+    if _SEMANTIC_CACHE_ENABLED:
+        with tracer.start_as_current_span("chat.semantic_cache_lookup") as semantic_cache_span:
+            semantic_cache_span.set_attribute("resolvegrid.thread_id", thread_id)
+            semantic_lookup_start = time.monotonic()
+            try:
+                query_embedding = get_or_compute_embeddings(
+                    [payload.message],
+                    model=DEFAULT_EMBEDDING_MODEL,
+                    redis_client=redis_client,
+                    embed_fn=embed_texts,
+                )[0]
+            except EmbeddingError:
+                query_embedding = None
 
-        if query_embedding is not None:
-            semantic_cached_response = lookup_semantic_cache(
-                session,
-                query_embedding=query_embedding,
-                scope_sig=scope_sig,
-                kb_version=kb_version,
+            if query_embedding is not None:
+                semantic_cached_response = lookup_semantic_cache(
+                    session,
+                    query_embedding=query_embedding,
+                    scope_sig=scope_sig,
+                    kb_version=kb_version,
+                )
+            semantic_lookup_latency_ms = int((time.monotonic() - semantic_lookup_start) * 1000)
+            semantic_cache_span.set_attribute(
+                "resolvegrid.cache_hit", semantic_cached_response is not None
             )
-        semantic_lookup_latency_ms = int((time.monotonic() - semantic_lookup_start) * 1000)
-        semantic_cache_span.set_attribute(
-            "resolvegrid.cache_hit", semantic_cached_response is not None
-        )
+    # Phase 14 Task 2 baseline condition: `RESOLVEGRID_SEMANTIC_CACHE_
+    # ENABLED=false` skips this block entirely -- `query_embedding` stays
+    # `None` and `semantic_cached_response` stays `None`, so the real graph
+    # always runs and the semantic cache is never read OR written below.
 
     if semantic_cached_response is not None:
         # SEMANTIC CACHE HIT: same real-row contract as the exact-cache-hit
@@ -453,20 +479,21 @@ async def chat(
     # task's key-shape correction -- see response_cache.py's module
     # docstring): a future cache HIT reads them back from here instead of
     # ever needing to re-run classify_intent to know them.
-    store_cached_response(
-        message_text=payload.message,
-        kb_version=kb_version,
-        scope_sig=scope_sig,
-        prompt_template_version=PROMPT_TEMPLATE_VERSION,
-        redis_client=redis_client,
-        value={
-            "answer": output_text,
-            "citations": citations,
-            "caption": caption,
-            "intent": final_state.get("intent") or "unclear",
-            "risk_level": final_state.get("risk_level") or "low",
-        },
-    )
+    if _RESPONSE_CACHE_ENABLED:
+        store_cached_response(
+            message_text=payload.message,
+            kb_version=kb_version,
+            scope_sig=scope_sig,
+            prompt_template_version=PROMPT_TEMPLATE_VERSION,
+            redis_client=redis_client,
+            value={
+                "answer": output_text,
+                "citations": citations,
+                "caption": caption,
+                "intent": final_state.get("intent") or "unclear",
+                "risk_level": final_state.get("risk_level") or "low",
+            },
+        )
 
     # Phase 12 Task 5: also populate the semantic cache for a future
     # semantically-similar (not necessarily byte-identical) question within
@@ -475,7 +502,7 @@ async def chat(
     # Skipped (not an error) if that earlier embedding call degraded to
     # `None` (a real EmbeddingError) -- there is nothing to index without a
     # real query embedding.
-    if query_embedding is not None:
+    if _SEMANTIC_CACHE_ENABLED and query_embedding is not None:
         store_semantic_cache_entry(
             session,
             query_embedding=query_embedding,

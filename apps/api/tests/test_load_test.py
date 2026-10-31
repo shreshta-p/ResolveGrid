@@ -315,6 +315,82 @@ def test_build_workload_mix_is_deterministic_given_the_same_rng_seed(db_session)
     assert items_a == items_b
 
 
+def test_fetch_real_diagnose_capable_employee_ids_matches_real_global_admin_policy(db_session):
+    """Phase 14 Task 2 code-review follow-up: proves `fetch_real_diagnose_
+    capable_employee_ids` returns EXACTLY the set of employees who are real
+    global admins per `packages/authz/src/resolvegrid_authz/policy.py`'s
+    own `_is_global_admin` logic (`role == "admin" and scope == "global"`,
+    "admin dominates") -- not a stale/wrong role filter (e.g. matching on
+    `role == "admin"` alone regardless of scope, or including department
+    -scoped grants).
+
+    Deliberately does NOT assert this equals "every employee `authorize(
+    principal, 'ticket.diagnose')` would allow" -- this live DB also seeds
+    4 real department-scoped `analyst` grants (confirmed via `docker exec
+    ... psql ... select role, scope, count(*) from role_assignment group
+    by role, scope`), and `authorize()`'s department-scoped branch DOES
+    allow those employees to diagnose tickets in their own department.
+    `fetch_real_diagnose_capable_employee_ids`'s own docstring explains why
+    it deliberately narrows to global admins ONLY, not every
+    diagnose-authorized employee: a department-scoped analyst can only
+    diagnose tickets inside their own department, but this harness samples
+    a `ticket_id` uniformly from ALL seeded tickets, so only a global admin
+    (who may diagnose any ticket regardless of department) is guaranteed
+    not to 403 against an arbitrarily-sampled ticket. Testing against the
+    narrower, exact `_is_global_admin` definition is therefore the correct
+    bar here, not the broader `authorize()` check.
+
+    Imports the real private `_is_global_admin` helper directly (rather
+    than reimplementing "role == admin and scope == global" a second time
+    in this test) so a future change to that helper's own logic is
+    automatically reflected here too, instead of this test silently
+    drifting out of sync with the real policy it's supposed to guard.
+    """
+    from sqlalchemy import select
+
+    from resolvegrid_api.load_test import fetch_real_diagnose_capable_employee_ids
+    from resolvegrid_api.models import RoleAssignment
+    from resolvegrid_authz import Principal, RoleGrant
+    from resolvegrid_authz.policy import _is_global_admin
+
+    # Every employee_id with at least one real RoleAssignment row (anyone
+    # with zero rows trivially fails `_is_global_admin` -- no need to
+    # build a Principal for them at all).
+    granted_employee_ids = set(db_session.scalars(select(RoleAssignment.employee_id)).all())
+
+    def _real_principal(employee_id: int) -> Principal:
+        grants = db_session.scalars(
+            select(RoleAssignment).where(RoleAssignment.employee_id == employee_id)
+        ).all()
+        roles = tuple(RoleGrant(role=g.role, scope=g.scope, scope_id=g.scope_id) for g in grants)
+        return Principal(employee_id=employee_id, roles=roles)
+
+    real_global_admin_ids = {
+        employee_id for employee_id in granted_employee_ids if _is_global_admin(_real_principal(employee_id))
+    }
+    assert real_global_admin_ids, "expected at least one real global-admin RoleAssignment row in this seeded DB"
+
+    diagnose_capable_ids = set(fetch_real_diagnose_capable_employee_ids(db_session))
+
+    # Exact match, both directions -- no false positives (a non-admin
+    # sneaking in via a wrong/stale filter) and no false negatives (a real
+    # global admin silently excluded).
+    assert diagnose_capable_ids == real_global_admin_ids
+
+    # Sanity the test isn't vacuously trivial: this live DB's real
+    # department-scoped analyst grants must NOT have been swept in by a
+    # too-broad filter (e.g. `role == "admin"` without the scope check).
+    department_scoped_analyst_ids = set(
+        db_session.scalars(
+            select(RoleAssignment.employee_id).where(
+                RoleAssignment.role == "analyst", RoleAssignment.scope == "department"
+            )
+        ).all()
+    )
+    assert department_scoped_analyst_ids, "expected real department-scoped analyst grants in this seeded DB"
+    assert department_scoped_analyst_ids.isdisjoint(diagnose_capable_ids)
+
+
 def test_build_workload_mix_only_fetches_data_sources_the_requested_mix_needs(db_session, monkeypatch):
     """Code-review fix: `build_workload_mix` used to unconditionally fetch
     real `Queue`/`Ticket` ids and both golden-set text files regardless of

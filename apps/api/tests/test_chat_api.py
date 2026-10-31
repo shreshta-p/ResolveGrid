@@ -1,3 +1,4 @@
+import importlib
 import re
 import time
 from unittest.mock import patch
@@ -12,6 +13,7 @@ from resolvegrid_api.ingestion_worker import run_seed_corpus_ingestion
 from resolvegrid_api.llm_gateway import CompletionResult
 from resolvegrid_api.main import app
 from resolvegrid_api.models import AgentRun, Department, Employee, Location, ModelCall, Span
+from resolvegrid_api.routers import chat as chat_module
 from resolvegrid_api.models.knowledge import (
     Chunk,
     Document,
@@ -1171,3 +1173,184 @@ def test_chat_semantic_cache_degrades_to_real_graph_on_postgres_outage():
     finally:
         unreachable_session.close()
         unreachable_engine.dispose()
+
+
+# ---------------------------------------------------------------------------
+# Phase 14 Task 2 code-review follow-up: real config toggles
+# (RESOLVEGRID_RESPONSE_CACHE_ENABLED / RESOLVEGRID_SEMANTIC_CACHE_ENABLED)
+# shipped with no automated test coverage. Mirrors test_agent_retrieval.py's
+# two-part approach for the matching RERANK/RETRIEVAL_CACHE toggles there:
+# (1) the real os.environ.get(...) parsing itself, via importlib.reload
+#     (harmless here: reloading chat.py does not affect the ALREADY-
+#     mounted FastAPI route this file's `client` fixture built -- that
+#     route's handler is a specific function OBJECT captured once by
+#     main.py's app.include_router() at import time, not a live link to
+#     "whatever chat.py currently defines" -- so this is safe to run
+#     without disturbing `client`, and is restored via a second reload in
+#     a `finally` regardless);
+# (2) the real DISABLED code path actually taken inside the live `/chat`
+#     endpoint, proven by monkeypatching the already-imported module's
+#     `_RESPONSE_CACHE_ENABLED`/`_SEMANTIC_CACHE_ENABLED` attributes
+#     directly -- the registered endpoint function's `__globals__` IS
+#     `chat_module.__dict__` (the same object this monkeypatch mutates),
+#     so this reaches the real running handler on the very next request
+#     through `client`, not a reimplementation of the toggle.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "env_var_name, module_attr",
+    [
+        ("RESOLVEGRID_RESPONSE_CACHE_ENABLED", "_RESPONSE_CACHE_ENABLED"),
+        ("RESOLVEGRID_SEMANTIC_CACHE_ENABLED", "_SEMANTIC_CACHE_ENABLED"),
+    ],
+)
+@pytest.mark.parametrize("false_value", ["0", "false", "no", "FALSE", "No"])
+def test_cache_toggle_env_var_parses_false_like_values_to_disabled(
+    monkeypatch, env_var_name, module_attr, false_value
+):
+    monkeypatch.setenv(env_var_name, false_value)
+    try:
+        importlib.reload(chat_module)
+        assert getattr(chat_module, module_attr) is False
+    finally:
+        monkeypatch.delenv(env_var_name, raising=False)
+        importlib.reload(chat_module)  # restore the real default for later tests
+
+
+@pytest.mark.parametrize(
+    "env_var_name, module_attr",
+    [
+        ("RESOLVEGRID_RESPONSE_CACHE_ENABLED", "_RESPONSE_CACHE_ENABLED"),
+        ("RESOLVEGRID_SEMANTIC_CACHE_ENABLED", "_SEMANTIC_CACHE_ENABLED"),
+    ],
+)
+def test_cache_toggle_env_var_default_unset_is_enabled(monkeypatch, env_var_name, module_attr):
+    """The real default (env var genuinely unset -- e.g. this very test
+    suite) must preserve the exact prior behavior: enabled. The rest of
+    this file's pre-existing cache-hit tests (`test_chat_second_identical_
+    call_is_a_real_cache_hit_and_skips_the_graph`, `test_chat_differently_
+    worded_but_similar_question_hits_semantic_cache`) already run under
+    this exact default and already prove the full behavioral contract
+    holds under it -- this test only pins down the toggle's own value
+    directly, as a fast, explicit regression guard for that default.
+    """
+    monkeypatch.delenv(env_var_name, raising=False)
+    importlib.reload(chat_module)
+    assert getattr(chat_module, module_attr) is True
+
+
+def test_chat_response_cache_disabled_toggle_never_hits_or_writes_the_cache(
+    chat_fixtures, raw_db_session, client, monkeypatch
+):
+    """`RESOLVEGRID_RESPONSE_CACHE_ENABLED=false`'s real contract: a second,
+    byte-identical call must NOT be served from cache (unlike `test_chat_
+    second_identical_call_is_a_real_cache_hit_and_skips_the_graph`'s default
+    -enabled proof) -- the real graph, and the real completion function,
+    must run again. Proven with a real call-counting spy on the SECOND
+    call (would be skipped entirely by a real cache hit).
+
+    Also disables the SEMANTIC cache for this test only, to isolate the
+    exact-cache toggle as the one variable under test: a byte-identical
+    second message is *also* a guaranteed semantic-cache hit (cosine
+    distance 0) when that cache is left at its own default-enabled state,
+    which would mask this test's actual claim behind a different cache
+    tier entirely (confirmed empirically -- without this, `mock_complete_2`
+    measured 0 calls, not because the exact-cache toggle failed, but
+    because the still-enabled semantic cache caught the identical text).
+    """
+    monkeypatch.setattr(chat_module, "_RESPONSE_CACHE_ENABLED", False)
+    monkeypatch.setattr(chat_module, "_SEMANTIC_CACHE_ENABLED", False)
+    requester = chat_fixtures
+    message = "What does the response-cache-disabled toggle test ask about VPNs?"
+
+    with patch(
+        _COMPLETE_PATCH_TARGET,
+        side_effect=[_classification_result(), _answer_result("A VPN is a Virtual Private Network.")],
+    ) as mock_complete_1:
+        response_1 = client.post(
+            "/chat", json={"message": message}, headers={"X-Debug-Employee-Id": str(requester.id)},
+        )
+    assert response_1.status_code == 200
+    assert mock_complete_1.call_count == 2
+
+    # With the toggle enabled (default), this second identical call would
+    # be a real cache hit and `mock_complete_2` would never be reached --
+    # see the sibling default-enabled test above. With the toggle
+    # disabled, the real graph must run again instead.
+    with patch(
+        _COMPLETE_PATCH_TARGET,
+        side_effect=[_classification_result(), _answer_result("A VPN is a Virtual Private Network.")],
+    ) as mock_complete_2:
+        response_2 = client.post(
+            "/chat", json={"message": message}, headers={"X-Debug-Employee-Id": str(requester.id)},
+        )
+    assert response_2.status_code == 200
+    assert mock_complete_2.call_count == 2  # real graph ran again -- no cache hit
+
+    run_2 = raw_db_session.scalar(select(AgentRun).where(AgentRun.thread_id == response_2.json()["thread_id"]))
+    assert run_2 is not None
+    assert run_2.cache_hit is False
+    assert run_2.cache_hit_kind is None
+
+    # Never written either -- a later real-enabled run must not find a
+    # stale entry this disabled run was never supposed to populate.
+    redis_client = redis.Redis.from_url(REDIS_URL)
+    assert list(redis_client.scan_iter(match="cache:response:*")) == []
+
+
+def test_chat_semantic_cache_disabled_toggle_never_hits_or_writes_the_cache(
+    chat_fixtures, raw_db_session, client, monkeypatch
+):
+    """`RESOLVEGRID_SEMANTIC_CACHE_ENABLED=false`'s real contract: a
+    second, differently-worded-but-semantically-equivalent question must
+    NOT hit the semantic cache (unlike `test_chat_differently_worded_but_
+    similar_question_hits_semantic_cache`'s default-enabled proof) -- the
+    real graph must run again for it too. Proven with a real call
+    -counting spy on the second call.
+    """
+    monkeypatch.setattr(chat_module, "_SEMANTIC_CACHE_ENABLED", False)
+    requester = chat_fixtures
+    message_1 = "What is a VPN, for the semantic-cache-disabled toggle test?"
+    message_2 = "Could you explain what a VPN is, for the semantic-cache-disabled toggle test?"
+
+    before_max_semantic_cache_id = (
+        raw_db_session.scalar(select(func.max(SemanticResponseCache.id))) or 0
+    )
+
+    with patch(
+        _COMPLETE_PATCH_TARGET,
+        side_effect=[_classification_result(), _answer_result("A VPN is a Virtual Private Network.")],
+    ) as mock_complete_1:
+        response_1 = client.post(
+            "/chat", json={"message": message_1}, headers={"X-Debug-Employee-Id": str(requester.id)},
+        )
+    assert response_1.status_code == 200
+    assert mock_complete_1.call_count == 2
+
+    # With the toggle enabled (default), this near-duplicate second
+    # question would be a real semantic-cache hit and `mock_complete_2`
+    # would never be reached -- see the sibling default-enabled test
+    # above. With the toggle disabled, the real graph must run again.
+    with patch(
+        _COMPLETE_PATCH_TARGET,
+        side_effect=[_classification_result(), _answer_result("A VPN is a Virtual Private Network, take 2.")],
+    ) as mock_complete_2:
+        response_2 = client.post(
+            "/chat", json={"message": message_2}, headers={"X-Debug-Employee-Id": str(requester.id)},
+        )
+    assert response_2.status_code == 200
+    assert mock_complete_2.call_count == 2  # real graph ran again -- no semantic-cache hit
+
+    run_2 = raw_db_session.scalar(select(AgentRun).where(AgentRun.thread_id == response_2.json()["thread_id"]))
+    assert run_2 is not None
+    assert run_2.cache_hit is False
+    assert run_2.cache_hit_kind is None
+
+    # Never written either (the query embedding is never even computed
+    # with this toggle off -- see chat.py's module docstring) -- no new
+    # `semantic_response_cache` row from either call.
+    after_max_semantic_cache_id = (
+        raw_db_session.scalar(select(func.max(SemanticResponseCache.id))) or 0
+    )
+    assert after_max_semantic_cache_id == before_max_semantic_cache_id

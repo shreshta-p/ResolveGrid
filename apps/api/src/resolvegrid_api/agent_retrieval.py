@@ -80,6 +80,8 @@ order:
   model was actually shown," not an outdated larger set.
 """
 
+import os
+
 from sqlalchemy import select
 
 from resolvegrid_api.cache import get_or_compute_embeddings, get_redis_client
@@ -99,6 +101,20 @@ from resolvegrid_retrieval.status_adjustment import apply_status_adjustment
 # exercising RRF with real overlap/depth to fuse over, and
 # `eval_retrieval.py`'s `DEFAULT_SEARCH_LIMIT`.
 _SEARCH_LIMIT = 10
+
+# Phase 14 Task 2: real config toggles for the baseline (pre-Phase-8/
+# pre-Phase-12) load-test condition -- read once at process start (same
+# module-level os.environ.get convention as db.py's DATABASE_URL /
+# cache.py's REDIS_URL), so a baseline run is started as a *separate*
+# `uvicorn` process with these set to "false", never flipped mid-process.
+# Default "true" preserves the real current-default behavior for every
+# other caller (tests, normal dev server) that never sets these.
+_RERANK_ENABLED = os.environ.get("RESOLVEGRID_RERANK_ENABLED", "true").lower() not in ("0", "false", "no")
+_RETRIEVAL_CACHE_ENABLED = os.environ.get("RESOLVEGRID_RETRIEVAL_CACHE_ENABLED", "true").lower() not in (
+    "0",
+    "false",
+    "no",
+)
 
 
 def _authz_filter_from_scope(scope: dict | None) -> AuthzFilter:
@@ -129,6 +145,18 @@ def _rerank_or_degrade(query_text: str, candidates: list[tuple[int, str]]) -> li
     """
     if not candidates:
         return []
+    if not _RERANK_ENABLED:
+        # Phase 14 Task 2 baseline condition: reranking disabled via real
+        # config (`RESOLVEGRID_RERANK_ENABLED=false`). Reuses the exact
+        # same degrade-to-fused-order logic the `RerankError` branch below
+        # already uses for a broken/missing reranker -- "disabled" and
+        # "unavailable" should produce the identical, already-proven-safe
+        # fallback shape, not a second bespoke code path.
+        text_by_id = dict(candidates)
+        return [
+            (chunk_id, text_by_id[chunk_id], float(len(candidates) - position))
+            for position, (chunk_id, _text) in enumerate(candidates)
+        ]
     try:
         reranked = rerank(query_text, candidates)
     except RerankError:
@@ -262,6 +290,15 @@ def retrieve_for_agent(query_text: str, scope: dict | None) -> dict:
                 "sufficient": sufficiency.sufficient,
                 "context_block": context.text,
             }
+
+        if not _RETRIEVAL_CACHE_ENABLED:
+            # Phase 14 Task 2 baseline condition: retrieval caching
+            # disabled via real config (`RESOLVEGRID_RETRIEVAL_CACHE_
+            # ENABLED=false`) -- bypasses `get_or_compute_retrieval`
+            # entirely so every call genuinely re-runs the full vector/
+            # lexical/rerank/budget pipeline, never reading or writing the
+            # Redis-backed cache.
+            return _compute_retrieval()
 
         return get_or_compute_retrieval(
             query_text=query_text,
