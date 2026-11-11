@@ -1,0 +1,346 @@
+Phase 14 Task 5 -- flat KB text export for the manual-lookup condition
+=======================================================================
+
+WHY THIS FILE EXISTS (read this first): as of 2026-11-11, ResolveGrid's
+actual product has NO non-AI knowledge-base search or browse UI/endpoint.
+Grepping the API routers (apps/api/src/resolvegrid_api/routers/*.py) turns
+up only: tickets, chat (AI RAG), directory, approvals, evals,
+admin_performance, tools. There is no "/documents", "/kb", or "/search"
+route anywhere, and apps/web has no KB page. The ONLY ways to reach KB
+content today are AI-assisted: POST /chat (RAG) or POST /tickets/{id}/
+diagnose (the ADK specialist). Neither is allowed in the manual-lookup
+condition.
+
+This file is a verbatim, read-only export (via docker exec psql against
+`document`/`chunk`/`document_version`) of every chunk of every KB document
+that exists in the dev DB right now -- the real content, not summarized or
+altered. It stands in for "the company wiki" an analyst would normally
+Ctrl+F or browse. Using it (reading/searching this plain text file by eye)
+is the sanctioned manual-lookup method for this benchmark, and is explicitly
+documented in protocol.md as a limitation: a real new analyst would use an
+actual search tool, not scroll a flat text dump, so this may make manual
+lookup slower (or, by surfacing everything in one file with no noise/other
+irrelevant results to wade through, arguably faster) than a true baseline.
+Exported 2026-11-11, same moment as the 5 benchmark tickets were created --
+frozen for the duration of this benchmark.
+
+=======================================================================
+[document 267] Kestrel VPN Access Policy (v1, deprecated) -- status: SUPERSEDED
+=======================================================================
+# Kestrel VPN Access Policy (v1, deprecated)
+
+This document is the **original** Kestrel Corp remote-access VPN policy. It
+has been superseded by "Kestrel VPN Access Policy (v2)" and is retained
+here only for historical reference. Do not follow these instructions for
+current VPN setup.
+
+## Original Client Software
+
+Employees were required to install the legacy "KestrelConnect Classic"
+VPN client, version 3.x, available from the internal software portal.
+Passwords were reset by emailing the Security team's shared inbox and
+waiting up to two business days for a manual reset.
+
+## Original Password Rules
+
+VPN passwords under this policy were valid for 180 days and had no
+minimum length requirement beyond 8 characters. Multi-factor
+authentication was optional, not required, for standard employees.
+
+## Why This Policy Was Retired
+
+The 180-day rotation window and optional MFA were flagged in a 2024
+internal security review as insufficient for a remote-access system with
+access to production infrastructure. See the v2 policy for the current
+rules, which shortened the rotation window, made MFA mandatory, and moved
+password resets to a self-service flow.
+
+=======================================================================
+[document 268] Kestrel VPN Access Policy (v2) -- status: ACTIVE
+=======================================================================
+# Kestrel VPN Access Policy (v2)
+
+This is the **current** Kestrel Corp remote-access VPN policy, effective
+2025-06-01. It supersedes "Kestrel VPN Access Policy (v1, deprecated)" in
+full. All employees connecting to internal systems remotely must follow
+these rules.
+
+## Client Software
+
+Install "KestrelConnect" (current major version, distributed through the
+internal software portal) on any device used for remote access. The
+legacy "KestrelConnect Classic" client is no longer supported and will be
+blocked from connecting after its end-of-life date.
+
+## Password Reset
+
+To reset your VPN password, open the KestrelConnect client and select
+"Forgot Password" on the sign-in screen. This sends a one-time reset link
+to your Kestrel email address; the self-service flow completes in
+minutes, replacing the old email-the-Security-team process. If you no
+longer have access to your Kestrel email, contact the IT Support desk for
+identity verification.
+
+## Password and MFA Rules
+
+VPN passwords must be at least 12 characters and are rotated every 90
+days. Multi-factor authentication (a push notification to the Kestrel
+Authenticator app) is mandatory for every VPN session, with no
+opt-out, for all employees and contractors.
+
+## Access Scope
+
+VPN access grants routes only to the internal systems a given role
+requires (least-privilege routing), not a flat connection to the entire
+corporate network. Access scope is tied to your department and any
+project-specific grants your manager has approved.
+
+=======================================================================
+[document 269] Kestrel Laptop Provisioning and Offboarding Policy -- status: ACTIVE
+=======================================================================
+# Kestrel Laptop Provisioning and Offboarding Policy
+
+This policy covers how the IT Support team issues, images, and reclaims
+Kestrel Corp laptops for employees and contractors.
+
+## New Hire Provisioning
+
+IT Support images a new laptop with the standard Kestrel software bundle
+(OS, endpoint security agent, KestrelConnect VPN client, and
+department-specific tooling) before an employee's start date. New hires
+pick up their laptop from the Austin HQ IT desk, or receive it by courier
+for remote hires, no later than their first day.
+
+## Loaner Devices
+
+A loaner laptop is available from the IT desk for employees whose primary
+device is being repaired. Loaners are pre-imaged with the same standard
+bundle and must be returned within 10 business days or the request must
+be renewed with a manager's approval.
+
+## Offboarding and Device Return
+
+When an employee leaves Kestrel Corp, IT Support disables their device's
+VPN and single sign-on access on their last working day. The laptop must
+be returned to IT Support (in person or by prepaid courier for remote
+employees) within 5 business days of departure. Devices not returned
+within 30 days are reported to Security as a potential asset-recovery
+issue.
+
+## Support Requests
+
+For laptop hardware issues, software installation requests, or questions
+about this policy, open a ticket with the IT Support queue rather than
+contacting individual technicians directly, so requests are tracked and
+prioritized consistently.
+
+=======================================================================
+[document 270] Kestrel Platform Engineering On-Call Escalation Policy -- status: ACTIVE
+=======================================================================
+# Kestrel Platform Engineering On-Call Escalation Policy
+
+This policy defines how production incidents are escalated within the
+Platform Engineering department.
+
+## On-Call Rotation
+
+Platform Engineering maintains a weekly on-call rotation. The primary
+on-call engineer is the first responder for every paging alert; a
+secondary on-call engineer is paged automatically if the primary does not
+acknowledge within 10 minutes.
+
+## Severity Levels and Response Times
+
+Sev-1 incidents (full service outage) require acknowledgment within 5
+minutes and an initial status update within 15 minutes. Sev-2 incidents
+(significant degradation, partial outage) require acknowledgment within
+15 minutes. Sev-3 incidents (minor, non-customer-facing issues) are
+handled during normal business hours and do not page the on-call
+rotation.
+
+## Escalation Path
+
+If a Sev-1 incident is not mitigated within 30 minutes, the on-call
+engineer escalates to the Platform Engineering duty manager, who can pull
+in additional engineers or declare a formal incident bridge. Incidents
+touching authentication or data integrity are escalated to Security in
+parallel, regardless of severity level.
+
+## Postmortems
+
+Every Sev-1 and Sev-2 incident requires a written postmortem within 5
+business days, covering root cause, timeline, and follow-up action items.
+Postmortems are blameless and are reviewed in the department's weekly
+engineering sync.
+
+=======================================================================
+[document 271] Kestrel People Ops Time-Off Request Policy -- status: ACTIVE
+=======================================================================
+# Kestrel People Ops Time-Off Request Policy
+
+This policy explains how Kestrel Corp employees request and track paid
+time off (PTO) through People Ops.
+
+## Requesting Time Off
+
+Submit a time-off request through the internal HR portal at least 5
+business days before the requested start date for planned leave. Requests
+under 3 days are auto-approved once your manager acknowledges the
+request; longer requests require explicit manager sign-off before they
+are confirmed.
+
+## PTO Accrual
+
+Full-time employees accrue PTO at a fixed rate per pay period based on
+tenure, up to an annual cap. Unused PTO up to 40 hours carries over into
+the next calendar year; any balance above that is forfeited at year-end
+unless local law requires otherwise.
+
+## Sick Leave and Emergency Leave
+
+Sick leave is tracked separately from PTO and does not require advance
+notice, only notification to your manager as soon as practical. Emergency
+leave requests (bereavement, family emergencies) are handled the same
+way; People Ops can backfill the paperwork after the fact.
+
+## Questions and Disputes
+
+Direct questions about accrual balances, denied requests, or policy
+exceptions to the People Ops queue rather than to your manager directly,
+so there is a consistent record of how exceptions are handled.
+
+=======================================================================
+[document 272] What Is a VPN (Public Reference) -- status: ACTIVE
+=======================================================================
+# What Is a VPN
+
+A virtual private network (VPN) is a technology that creates an encrypted
+connection, often called a tunnel, between a device and a private
+network over the public internet. Traffic sent through the tunnel is
+encrypted, so an observer on the intervening network path sees only
+opaque encrypted packets rather than the underlying data.
+
+## Why Organizations Use VPNs
+
+Organizations commonly use VPNs to let remote employees reach internal
+systems, such as file servers or internal applications, as though they
+were physically on the corporate network. A VPN client authenticates the
+user (often combined with multi-factor authentication) before granting
+access to the tunnel.
+
+## Common VPN Protocols
+
+Widely used VPN protocols include IPsec, OpenVPN, and WireGuard. They
+differ in performance characteristics and cryptographic design, but all
+serve the same basic purpose: authenticating a connection and encrypting
+the traffic that flows through it.
+
+## Split Tunneling
+
+Some VPN configurations use "split tunneling," where only traffic bound
+for the private network goes through the encrypted tunnel and other
+internet traffic goes directly out the user's normal connection. This
+improves performance for general browsing but must be configured
+carefully so sensitive traffic is not accidentally routed outside the
+tunnel.
+
+=======================================================================
+[document 273] What Is Multi-Factor Authentication (Public Reference) -- status: ACTIVE
+=======================================================================
+# What Is Multi-Factor Authentication
+
+Multi-factor authentication (MFA) requires a user to present two or more
+independent pieces of evidence, called factors, to prove their identity
+before being granted access to a system. This is stronger than a
+password alone, which is a single factor that can be stolen, guessed, or
+reused across sites.
+
+## The Three Factor Categories
+
+Authentication factors generally fall into three categories: something
+you know (a password or PIN), something you have (a phone, hardware
+security key, or authenticator app), and something you are (a
+fingerprint or other biometric). MFA combines factors from at least two
+of these categories.
+
+## Common MFA Methods
+
+Common MFA methods include time-based one-time codes generated by an
+authenticator app, push notifications sent to a registered device asking
+the user to approve or deny a sign-in attempt, and physical hardware
+security keys that use public-key cryptography to prove possession of
+the key without transmitting a shared secret.
+
+## Why MFA Matters
+
+Because a stolen or leaked password alone is not enough to sign in when
+MFA is enabled, MFA substantially reduces the impact of common attacks
+such as password reuse, phishing of a plain password, and credential-
+stuffing attempts that try leaked username/password pairs against many
+services.
+
+=======================================================================
+[document 274] What Is a Service-Level Agreement (Public Reference) -- status: ACTIVE
+=======================================================================
+# What Is a Service-Level Agreement (SLA)
+
+A service-level agreement (SLA) is a documented commitment between a
+service provider and a customer that defines the expected level of
+service, typically expressed as measurable targets such as uptime
+percentage, response time, or resolution time.
+
+## Common SLA Metrics
+
+Frequent SLA metrics include availability (often expressed as "three
+nines," 99.9% uptime, or higher), first-response time for a support
+request, and time-to-resolution for incidents of a given severity.
+Availability targets are usually measured over a rolling window, such as
+a calendar month.
+
+## Severity-Based Response Targets
+
+Many SLAs tier their response and resolution targets by incident
+severity: a full outage typically carries the tightest response-time
+commitment, while a minor cosmetic issue carries a much longer one. This
+lets a provider allocate urgency proportionally to customer impact rather
+than treating every report identically.
+
+## SLA Credits and Remedies
+
+When a provider misses an SLA target, the agreement often specifies a
+remedy, commonly a service credit proportional to the severity and
+duration of the miss. SLA credits are a contractual remedy, not a
+substitute for actually fixing the underlying reliability problem that
+caused the miss.
+
+=======================================================================
+[document 552] VPN Password Reset Reconnect Guide 53a183d6 -- status: ACTIVE
+(seeded alongside benchmark ticket #1457, 2026-11-11, same real fixture
+builder Task 4's diagnostic eval uses -- resolvegrid_api.diagnostic_eval.
+_build_vpn_access_issue)
+=======================================================================
+Kestrel VPN Password-Reset Reconnect Guide: after a corporate password
+reset, the VPN client's cached session must be cleared before
+reconnecting -- otherwise the client will hang on 'authenticating' and
+eventually time out. Clear the cached credentials in the VPN client's
+connection settings, then reconnect with the new password.
+
+=======================================================================
+[document 553] Email Account Lockout Policy a142acce -- status: ACTIVE
+(seeded alongside benchmark ticket #1461, 2026-11-11, same real fixture
+builder Task 4's diagnostic eval uses -- resolvegrid_api.diagnostic_eval.
+_build_email_password_reset_categorization)
+=======================================================================
+Corporate Email Inbox Lockout and Account-Recovery Policy: after 5 failed
+email login attempts, the email inbox is locked for 30 minutes. An
+account-recovery message is sent to the employee's separate recovery
+email address on file, never to the locked corporate inbox itself -- if
+the recovery message for a locked email inbox does not arrive, check the
+recovery email address on file, not the locked inbox.
+
+=======================================================================
+NOTE: documents 552/553 titles include a random hex suffix because they
+were generated by a uuid4()-suffixed fixture builder (so repeated runs of
+the underlying diagnostic eval never collide). This is cosmetic only --
+the policy content itself is real and unmodified from what the eval
+harness seeds and what the AI-assisted condition will retrieve against.
