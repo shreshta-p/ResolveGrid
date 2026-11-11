@@ -226,3 +226,112 @@ Redis, mirroring `test_ingestion_worker.py`'s identical precedent.
   on independent sessions, because the existing graph-adapter modules (`agent_retrieval.py`,
   `approval_service.py`, `agent_mutation_execution.py`) already open and commit their own
   sessions per call — an architectural constraint from before this phase, not a new choice.
+
+## Phase 14 Task 4: defining "task-completion accuracy" (plan.md claims 3 and 4), written before running anything
+
+This section is written and committed to disk **before** the baseline-vs-full-system comparison
+run below is executed, specifically so the definition cannot be shaped by having already seen the
+numbers — the standing project rule against inventing metrics post hoc to hit a target.
+
+**The two claims being tested** (`plan.md`'s Outcomes section, reproduced verbatim):
+- Claim 3: "end-to-end task-completion accuracy improving from ~60% to ~85%."
+- Claim 4: "relative evaluation pass-rate improvement of ~50% (e.g. 56% → 84%)."
+
+**Neither term exists as a field anywhere in this schema today.** Both must be composed from the
+real `EvalCaseResult.passed` booleans this harness already produces — nothing new is added to
+`EvalCase`, `EvalRun`, or `EvalCaseResult` for this task.
+
+### The composite metric
+
+For a given real `EvalRun` (produced by `run_eval_suite`, one row per graded case in
+`EvalCaseResult`):
+
+```
+task_completion_accuracy(run) =
+    count(EvalCaseResult WHERE eval_run_id = run.id
+                           AND dimension IN ('chat','retrieval','tool','approval')
+                           AND passed = true)
+    -----------------------------------------------------------------------------
+    count(EvalCaseResult WHERE eval_run_id = run.id
+                           AND dimension IN ('chat','retrieval','tool','approval'))
+```
+
+i.e. a single **pooled** pass rate (not a per-dimension average) across the four dimensions whose
+cases each represent one real, checkable way the system can complete a user's actual task:
+chat (did it classify intent/risk correctly — the entry point to acting on a request at all),
+retrieval (did it find the correct grounding evidence an answer depends on), tool (did it select
+and call the correct tool with correct parameters — the actual "doing" of a task), approval (did
+it correctly gate/resolve an approval-required action end to end). Pooling (not per-dimension
+weighting) is deliberate: the four dimensions have very different case counts in the current
+golden set (chat 18, retrieval 18, tool 1, approval 2 — see below), and choosing dimension weights
+after the fact is exactly the "invented post hoc to hit 85%" failure mode `plan.md` warns against.
+An unweighted pool over every real case is the one construction that cannot be tuned toward a
+target number.
+
+**Two dimensions are deliberately excluded from this composite, for stated reasons, not silently
+dropped:**
+
+- **`adversarial` (10 cases, always included in every `run_eval_suite` call regardless of
+  `dataset_version`)** is excluded because this document's own "critical distinction" section
+  above already establishes that the batch runner's adversarial grading is a **structural
+  pass-through** — `actions_taken` is always empty in this harness's own execution, so
+  `grade_forbidden_actions` passes near-tautologically. Folding a near-100%, not-really-measuring-
+  anything dimension into the composite would inflate it without reflecting any real capability.
+- **`diagnostic` (6 cases, `eval/golden/diagnostic_v1.jsonl`, Phase 13's ADK specialist)** is
+  excluded from the **paired baseline-vs-full-system delta** used for claims 3/4, for a different
+  reason than adversarial: per ADR 0005, `diagnostic` cases are not wired into `EvalRun`/
+  `EvalCaseResult` at all (no `EvalRun` row is produced for them — they run via the standalone
+  `diagnostic_eval.run_diagnostic_eval_suite`), and more importantly, **the ADK diagnostic
+  specialist has no real "disable" toggle** — unlike response/semantic/retrieval caching and
+  reranking (Task 2's real env-var flags), it simply did not exist before Phase 13, and this
+  phase's reconstructed baseline condition (plan.md's "ticket-creation + `/chat` RAG path as it
+  existed after Phase 7/8") is a state in which the diagnostic specialist is structurally absent,
+  not merely switched off. Inventing a synthetic "ADK off" condition to force a paired number here
+  would be fabricating a baseline that never existed, which the project's standing rule forbids.
+  `diagnostic`'s pass rate is still measured and reported (full-system only), as a clearly
+  separate, non-paired, descriptive data point — never folded into the claim-3/4 composite.
+
+### Mapping onto claims 3 and 4
+
+Both claims are read as two framings of the **same** underlying composite metric, not two
+different metrics (plan.md gives no separate definition for "evaluation pass-rate" vs
+"task-completion accuracy", and this project's precedent is to avoid inventing a second parallel
+mechanism when one already covers the question — see this doc's "two adversarial-grading
+mechanisms" section for the exact failure mode being avoided):
+
+- **Claim 3** = `task_completion_accuracy(baseline_run)` vs `task_completion_accuracy(full_system_run)`,
+  compared against the absolute target (~60% → ~85%).
+- **Claim 4** = the **relative** change of that same pair,
+  `(full_system - baseline) / baseline`, compared against the ~50% relative-improvement target
+  (plan.md's own worked example, 56% → 84%, is a 50.0% relative increase).
+
+### Protocol (fixed per `PLAN_APPROVED.md` §12: same dataset, same seed, only the variable under test changes)
+
+- Dataset: `eval/golden/v2/*.jsonl` + `eval/adversarial/v1.jsonl`, `dataset_version="v2"` (the
+  harness's own default — unchanged between runs).
+- Judge model: `qwen3:14b` via the live Ollama container (unchanged between runs).
+- Variable under test: Task 2's four real env-var toggles only —
+  `RESOLVEGRID_RESPONSE_CACHE_ENABLED`, `RESOLVEGRID_SEMANTIC_CACHE_ENABLED` (`routers/chat.py`),
+  `RESOLVEGRID_RETRIEVAL_CACHE_ENABLED`, `RESOLVEGRID_RERANK_ENABLED` (`agent_retrieval.py`).
+  Because these are read once at module-import time (not re-checked per request), each condition
+  is run as its own fresh OS process invoking
+  `uv run --package resolvegrid-api python -m resolvegrid_api.eval_worker`
+  — baseline with all four set `false`, full-system with all four left unset (real default
+  `true`) — never flipped mid-process, exactly mirroring Task 2's own precedent.
+- Same git commit for both runs (recorded on each `EvalRun.git_commit` automatically).
+- Both runs produce one real, committed `EvalRun` + its `EvalCaseResult` rows in Postgres; raw
+  per-case JSON exports and a comparison report are stored under
+  `eval/results/phase14_eval_v1/`.
+
+### A reasoning note on what this comparison can and cannot show
+
+Because the only variable under test is caching/reranking (not the presence of RAG/tool-calling
+itself — both conditions still run the full Phase 6-9 chat graph with real retrieval, tool calls,
+and approval gating; only whether results are cached and whether retrieval is reranked differs),
+this comparison is a materially *weaker* "before" than plan.md's original claims 3/4 likely
+intended (which read, in context, as comparing against a pre-AI/manual process, not against an
+already-fully-agentic system with two optional optimizations switched off). A small or even zero
+measured delta here would not be surprising, and should not be read as evidence the project's
+overall before/after improvement is small — only that *this specific, honestly-reconstructable*
+slice of "before" (cache/rerank off) is a narrow one. This is stated here, before running
+anything, precisely so a small-delta result cannot later be read as a surprise or explained away.
